@@ -60,47 +60,24 @@ class Conversation(BaseModel):
     messages: list[Message]
 
 
-class NTState(BaseModel):
+class NTLevel(BaseModel):
     """
-    A snapshot of Eugene's neurotransmitter state. v0.1 wires this through
-    the schemas but does not modulate behavior on it — the framework
-    passes a static neutral state. Drives, plasticity, and modulation
-    come in v0.2+.
-
-    Values are in [0, 1]. 0.5 represents a baseline / neutral level.
+    Per-NT level + its baseline + per-second decay rate. The level
+    decays toward baseline at `decay` units per second between
+    observations; observations push it up or down based on the
+    orchestrator's observation→NT mapping (see orchestrator spec).
 
     """
 
-    serotonin: float | None = Field(
-        None,
-        description='Mood / satiation tone. High = content / patient.',
-        ge=0.0,
-        le=1.0,
+    level: float = Field(
+        ..., description='Current instantaneous value.', ge=0.0, le=1.0
     )
-    dopamine: float | None = Field(
-        None,
-        description='Reward prediction / motivation. High = engaged / curious.',
-        ge=0.0,
-        le=1.0,
+    baseline: float = Field(
+        ..., description='Resting-state target the level decays toward.', ge=0.0, le=1.0
     )
-    norepinephrine: float | None = Field(
-        None,
-        description='Arousal / vigilance. High = alert / focused under load.',
-        ge=0.0,
-        le=1.0,
-    )
-    acetylcholine: float | None = Field(
-        None,
-        description='Attention / encoding gain. High = sharp focus, fast learning.',
-        ge=0.0,
-        le=1.0,
-    )
-    gaba: float | None = Field(
-        None, description='Inhibitory tone. High = calm / restrained.', ge=0.0, le=1.0
-    )
-    glutamate: float | None = Field(
-        None,
-        description='Excitatory drive. High = active / responsive.',
+    decay: float = Field(
+        ...,
+        description='Per-second decay rate toward baseline. Larger values =\nfaster return to baseline after a stimulus.\n',
         ge=0.0,
         le=1.0,
     )
@@ -342,6 +319,416 @@ class ConfigTestResult(BaseModel):
     )
 
 
+class SecurityMode(StrEnum):
+    """
+    Operator's choice for how the watchdog handles its master key
+    between restarts. Set during the wizard's security screen; can
+    be changed later from the Config page.
+
+    * `prompt_on_startup` — passphrase required at every watchdog
+      start. Master key lives only in process memory. Best for
+      shared environments, sensitive conversations, security-
+      conscious operators. A power outage means Eugene stays
+      offline until the operator re-enters the passphrase.
+    * `os_keyring` — master key stored in the OS secret store
+      (Windows Credential Manager / macOS Keychain / Linux Secret
+      Service via the `keyring` Python lib). OS unlocks tied to
+      user login; Eugene auto-recovers from restarts. Best for
+      home / personal-use installs and anyone who wants minimum
+      friction. Anyone with the OS account can also start Eugene.
+
+    """
+
+    prompt_on_startup = 'prompt_on_startup'
+    os_keyring = 'os_keyring'
+
+
+class AuthLoginRequest(BaseModel):
+    """
+    Login request body sent by the UI to `POST /v1/auth/login` on
+    the watchdog. The passphrase is the same one the operator set
+    in the wizard. The watchdog bcrypt-compares it; on match,
+    issues a session token.
+
+    """
+
+    passphrase: str = Field(..., min_length=1)
+
+
+class AuthLoginResponse(BaseModel):
+    """
+    Issued on successful login. The UI stores `sessionToken` as a
+    Secure / HttpOnly / SameSite=Strict cookie or in memory; every
+    subsequent proxy request includes it as
+    `Authorization: Bearer <token>`.
+
+    """
+
+    sessionToken: str = Field(
+        ...,
+        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`.\n',
+    )
+    expiresAt: AwareDatetime
+    operatorName: str | None = Field(
+        None,
+        description='The operator\'s display name from the constitution\n(typically "operator" or whatever the operator set).\nEchoed for UI welcome strings.\n',
+    )
+
+
+class Alg(StrEnum):
+    """
+    Encryption algorithm identifier.
+    """
+
+    secretbox_xsalsa20poly1305 = 'secretbox-xsalsa20poly1305'
+
+
+class MasterKeyEnvelope(BaseModel):
+    """
+    Encrypted-at-rest envelope for sensitive config fields. The
+    on-disk YAML for fields marked `sensitive: true` is stored as
+    this envelope when v0.2 security is enabled; the component
+    decrypts using the master key passed in by the watchdog at
+    spawn time (env var `EUGENE_PLEXUS_<KIND>_MASTER_KEY`,
+    base64-encoded).
+
+    Algorithm: libsodium secretbox (XSalsa20-Poly1305). The nonce
+    is generated per-encryption and stored alongside the
+    ciphertext. The master key is 32 bytes derived from the
+    operator's passphrase via Argon2id with parameters chosen at
+    first-run time and persisted in the watchdog's state.
+
+    Components MAY accept plaintext values in PATCH requests
+    (current behavior); on persist, they encrypt to this envelope
+    if the master key is available. GET requests continue to
+    return `"<redacted>"` for sensitive fields regardless of
+    envelope-vs-plaintext on disk.
+
+    """
+
+    alg: Alg = Field(..., description='Encryption algorithm identifier.')
+    nonce: str = Field(
+        ...,
+        description='Base64-encoded 24-byte nonce. Generated per-encryption,\nnever reused with the same key.\n',
+    )
+    ciphertext: str = Field(..., description='Base64-encoded ciphertext + auth tag.')
+
+
+class PersonRef(BaseModel):
+    """
+    Reference to a person Eugene knows. The `personId` is the
+    identity component's stable key (UUID). Each person has zero
+    or more platform aliases linking external IDs back to this
+    person; the operator approves aliasing via the pending-links
+    flow.
+
+    v0.2 distinguishes between the operator (always known, defined
+    by the wizard) and other persons (introduced via connector
+    adapters). The operator's `personId` is special-cased in some
+    endpoints — e.g. the UI's chat surface always sends as the
+    operator.
+
+    """
+
+    personId: UUID
+    displayName: str | None = Field(
+        None, description='Operator-supplied or auto-from-platform display name.'
+    )
+    isOperator: bool | None = Field(
+        False, description="True iff this person is the install's operator."
+    )
+
+
+class PlatformAlias(BaseModel):
+    """
+    One external-platform identity that maps to a person. The
+    union of (platform, accountId) is globally unique. Created
+    when the operator approves a pending identity link.
+
+    """
+
+    platform: str = Field(
+        ...,
+        description='Platform identifier (e.g. `"discord"`, `"slack"`,\n`"matrix"`, `"ui"`). The `ui` platform is reserved for\nthe local UI session; the operator is always\n`(platform=ui, accountId=operator)`.\n',
+    )
+    accountId: str = Field(
+        ...,
+        description="Platform-stable account identifier (Discord user ID,\nMatrix MXID, Slack member ID, etc.). MUST be the\nplatform's immutable id, not a mutable handle.\n",
+    )
+    handle: str | None = Field(
+        None, description='Username / handle on the platform (mutable).'
+    )
+    displayName: str | None = Field(
+        None, description='Platform display name (mutable).'
+    )
+    avatarUrl: AnyUrl | None = Field(
+        None, description='Avatar image URL on the platform.'
+    )
+    linkedAt: AwareDatetime
+
+
+class Status1(StrEnum):
+    pending = 'pending'
+    approved = 'approved'
+    rejected = 'rejected'
+
+
+class PendingIdentityLink(BaseModel):
+    """
+    An unknown identity that wants to interact with Eugene. The
+    connector adapter creates these when a new platform user
+    @mentions Eugene or DMs for the first time. The operator
+    approves or rejects from the UI; until then the identity has
+    no relationship context and Eugene treats it as a stranger.
+
+    Universal fields only — every plausible future platform
+    (Slack, Matrix, Telegram, Gmail, Signal) supplies these.
+    Platform-specific extras live in `adapterPrivate` and are
+    NOT promoted to the operator-facing UI unless the operator
+    drills in.
+
+    """
+
+    linkId: UUID
+    platform: str
+    accountId: str
+    displayName: str | None = None
+    handle: str | None = None
+    avatarUrl: AnyUrl | None = None
+    firstSeen: AwareDatetime
+    triggeringMessage: str = Field(
+        ...,
+        description='The text of the message that triggered the link request,\ntruncated. Gives the operator context for the approval\ndecision.\n',
+    )
+    status: Status1
+    adapterPrivate: dict[str, Any] | None = Field(
+        None,
+        description='Platform-specific metadata the adapter stored alongside\nthis link. UI may render this in a drill-down view but\ndoes not promote it to the main approval surface. Use\nfor things like Teams UPN/tenant, Slack workspace,\nMatrix homeserver.\n',
+    )
+
+
+class LinkApprovalRequest(BaseModel):
+    """
+    Operator action on a pending identity link. To link the
+    unknown identity to an existing person (typically the
+    operator themselves or a known third party), supply
+    `linkAsPersonId`. To create a new person record for this
+    identity, omit `linkAsPersonId` and supply `displayName`
+    and optionally `relationshipNote`.
+
+    """
+
+    linkAsPersonId: UUID | None = Field(
+        None,
+        description='Existing person to alias this identity onto. Mutually\nexclusive with `displayName` / `relationshipNote`.\n',
+    )
+    displayName: str | None = Field(
+        None,
+        description='Display name for the new person record. Required when\n`linkAsPersonId` is omitted.\n',
+    )
+    relationshipNote: str | None = Field(
+        None,
+        description='Optional initial relationship context for the new person\n(e.g. "my wife", "Discord regular"). Only used when\n`linkAsPersonId` is omitted.\n',
+    )
+
+
+class Constitution(BaseModel):
+    """
+    The immutable / declarative half of Eugene's identity — the
+    "I am Eugene" facts. Operator-editable from the UI; Eugene
+    cannot modify this. Anatomically: medial prefrontal cortex
+    (mPFC) node of the Default Mode Network.
+
+    v0.2 reserves three structured keys (`name`, `pronouns`,
+    `coreValues`) that the orchestrator reads programmatically
+    when constructing hemisphere prompts. The `freeText` field is
+    operator-owned free-form context (markdown / YAML / plain)
+    that's included verbatim in every prompt. Future versions
+    may promote stable patterns out of `freeText` into structured
+    fields, but the operator-flexibility-first design choice was
+    deliberate (we can't enumerate all immutable identity data
+    yet).
+
+    """
+
+    name: str = Field(
+        ...,
+        description="Eugene's name. Operator may rename (e.g. if they want\ntheir consciousness called something else). Used in\nevery hemisphere system prompt and in UI chrome.\n",
+        min_length=1,
+    )
+    pronouns: str | None = Field(
+        None,
+        description='Eugene\'s pronouns (e.g. "he/him", "they/them"). Used\nin hemisphere prompts for self-reference consistency.\n',
+    )
+    coreValues: list[str] | None = Field(
+        None,
+        description='Short list of operator-supplied core values. Each is a\nshort phrase ("honesty", "intellectual humility",\n"patience with confusion"). Included in every\nhemisphere prompt.\n',
+    )
+    freeText: str | None = Field(
+        None,
+        description="Operator-owned free-form context — markdown or plain\ntext. Included verbatim in every hemisphere prompt\nafter the structured fields. Use for backstory, voice\nguidance, anything that doesn't fit a structured field\nyet.\n",
+    )
+
+
+class SelfModelEntry(BaseModel):
+    """
+    One entry in Eugene's self-model — the autobiographical
+    / mutable half of identity. Anatomically: posterior cingulate
+    cortex (PCC) / precuneus node of the Default Mode Network.
+
+    Self-model entries are written by Eugene's reflection process
+    (v0.2: manually triggered via `POST /v1/identity/self-model/reflect`;
+    v0.3: autonomous when NT state is in reflection mode).
+    They're queried by topic relevance and injected into
+    hemisphere prompts when relevant.
+
+    """
+
+    id: UUID
+    topic: str = Field(
+        ...,
+        description='Short topic key for retrieval (e.g. "creative-tasks",\n"user-troy", "uncertainty-handling").\n',
+    )
+    content: str = Field(
+        ...,
+        description="The reflection itself. Free-form prose written by\nEugene's reflection process. Typically 1-3 sentences.\n",
+    )
+    relatedPersonIds: list[UUID] | None = Field(
+        None, description='Persons this reflection involves, if any.\n'
+    )
+    createdAt: AwareDatetime
+    sourceConversationIds: list[UUID] | None = Field(
+        None,
+        description='Conversation ids that fed into this reflection. Lets the\nUI offer "show me the conversations that produced this\nself-model entry" drill-down.\n',
+    )
+
+
+class MemoryBackendKind(StrEnum):
+    """
+    Which storage backend the memory component is using. Set in
+    the memory component's config. v0.2 ships one option; future
+    versions add adapters following the same pattern as
+    `hemisphere-driver`'s provider registry.
+
+    """
+
+    local_sqlite = 'local_sqlite'
+
+
+class MemoryEmbeddingSource(StrEnum):
+    """
+    How the memory component generates embeddings for similarity
+    search. `local` uses sentence-transformers (offline, ~100MB
+    model download on first install). `api` calls a vendor
+    (OpenAI / Voyage / Cohere) and requires network + an API
+    key. Lives inside `local_sqlite`'s adapter-specific config.
+
+    """
+
+    local = 'local'
+    api = 'api'
+
+
+class MemorySearchRequest(BaseModel):
+    """
+    Reactive memory search. Called by the orchestrator when its
+    topic-shift detector (v0.3) flags that the current
+    conversation references something outside recent history,
+    or when the operator explicitly requests retrieval. v0.2
+    ships the endpoint; the trigger is v0.3.
+
+    """
+
+    query: str = Field(..., description='Free-form query text to embed and search.')
+    personId: UUID | None = Field(
+        None,
+        description='Optionally restrict search to entries involving this\nperson.\n',
+    )
+    conversationId: UUID | None = Field(
+        None, description='Optionally restrict search to a specific conversation.\n'
+    )
+    limit: int | None = Field(10, ge=1, le=100)
+    minScore: float | None = Field(
+        None,
+        description='Minimum similarity score to include. Backends define\ntheir own scoring scale; 0.5 is a reasonable default\nfor cosine-similarity embedding backends.\n',
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class AdapterKind(StrEnum):
+    """
+    Which external platform adapter is configured. v0.2 ships
+    one; later versions add slack, matrix, telegram, gmail, etc.
+
+    """
+
+    discord = 'discord'
+
+
+class AdapterEntry(BaseModel):
+    """
+    One configured platform adapter inside the connector. Like
+    hemisphere-driver's `drivers` config but for outbound
+    platforms. Each entry runs its own adapter loop (Discord
+    Gateway WS connection, Slack RTM, etc.) and bridges
+    incoming/outgoing messages between the platform and the
+    orchestrator.
+
+    """
+
+    name: str = Field(
+        ...,
+        description='Operator-supplied label (e.g. `"work-discord"`,\n`"family-slack"`). Used in logs and the UI.\n',
+        min_length=1,
+    )
+    kind: AdapterKind
+    adapterConfig: dict[str, Any] | None = Field(
+        None,
+        description="Adapter-specific config (bot token, channel allowlist,\netc.). Schema is adapter-defined; the connector's\n`GET /v1/adapters/{name}/config/schema` returns the\nschema for the current adapter so the UI can render\nan editor.\n",
+    )
+    enabled: bool | None = True
+
+
+class MessageSource(BaseModel):
+    """
+    Where a message came from. Lets the orchestrator and UI
+    distinguish "operator typing in the local UI" from
+    "Discord channel mention" without needing
+    adapter-specific code paths.
+
+    """
+
+    platform: str = Field(
+        ...,
+        description='Same identifiers used in `PlatformAlias.platform`\n(`"ui"`, `"discord"`, etc.).\n',
+    )
+    channelId: str | None = Field(
+        None,
+        description="Platform channel identifier (Discord channel id,\nSlack channel id, Matrix room id, etc.). Omitted for\nDMs or where the platform doesn't expose channels.\n",
+    )
+    channelName: str | None = Field(
+        None, description='Human-readable channel name (mutable).'
+    )
+    isDirectMessage: bool | None = False
+
+
+class ChannelContextEntry(BaseModel):
+    """
+    One message from the channel that precedes Eugene's
+    invocation. Used by adapters to provide grounding context
+    for channel mentions. Not persisted to memory.
+
+    """
+
+    author: str = Field(
+        ...,
+        description="Platform display name of the speaker. Free-form;\nEugene doesn't try to resolve to known persons (would\nrequire trust-establishing flows that v0.2 doesn't\nhave for non-mention authors).\n",
+    )
+    content: str
+    timestamp: AwareDatetime
+
+
 class RestartResult(BaseModel):
     """
     Acknowledgement returned by `POST /v1/admin/restart`. The
@@ -422,33 +809,37 @@ class DriverInfo(BaseModel):
     version: str | None = Field(None, description='hemisphere-driver semver.')
 
 
-class GenerateRequest(BaseModel):
-    messages: list[Message] = Field(
+class NTState(BaseModel):
+    """
+    A snapshot of Eugene's neurotransmitter state. v0.2 introduces real
+    modulation: the orchestrator updates this from observations each
+    chat turn, and the bicameral loop reads it to set `max_passes`,
+    `temperature`, and blend weights. CLLM-inspired anxiety-driven
+    termination is the load-bearing behavior.
+
+    Six NTs in v0.2 (cortisol replaces v0.1's glutamate — cortisol is
+    directly observable from chat patterns like sustained divergence
+    and time pressure; glutamate's lower-level activation modeling
+    waits for v0.3). All values in [0, 1]; `level` carries the current
+    instantaneous value, `baseline` the resting state the field decays
+    toward, `decay` the per-second decay rate.
+
+    v0.3+ adds: full 12-NT shape (oxytocin, endorphins, melatonin,
+    adenosine, histamine, orexin), per-driver NT modulation, drives
+    feeding NT, NT-driven autonomous-thinking triggers.
+
+    """
+
+    lastUpdated: AwareDatetime = Field(
         ...,
-        description='Full prompt as an ordered conversation. The orchestrator is\nresponsible for inserting any NT-conditioning system message,\npersona, etc. The driver does not modify this.\n',
+        description='When NT levels were last updated. Used by the orchestrator\nto compute elapsed-time decay on the next tick.\n',
     )
-    ntState: NTState | None = None
-    passIndex: int | None = Field(
-        None,
-        description="Zero-based bicameral pass index. The driver itself does not\ncondition on this; it's logged for observability so a UI can\ntell which pass produced which hemisphere output.\n",
-        ge=0,
-    )
-    maxTokens: int | None = Field(
-        None,
-        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(typically the orchestrator) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
-        ge=1,
-    )
-    temperature: float | None = Field(
-        None,
-        description="Sampling temperature. Backend-clamped. Owned by the caller\n(typically the orchestrator, where it will eventually be\nmodulated by the NT system) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
-        ge=0.0,
-        le=2.0,
-    )
-    stop: list[str] | None = Field(None, description='Optional stop sequences.')
-    requestId: UUID | None = Field(
-        None,
-        description='Caller-supplied id for log correlation. Echoed in the response.',
-    )
+    dopamine: NTLevel
+    serotonin: NTLevel
+    norepinephrine: NTLevel
+    gaba: NTLevel
+    cortisol: NTLevel
+    acetylcholine: NTLevel
 
 
 class ConfigField(BaseModel):
@@ -476,6 +867,10 @@ class ConfigField(BaseModel):
     )
     enumValues: list[str] | None = Field(
         None, description='Allowed values when `valueType == enum`.'
+    )
+    suggestions: list[str] | None = Field(
+        None,
+        description="Discovery-time hints — values the operator might want\nbut which AREN'T enforced by validation. UIs render\nstring-typed fields with non-empty `suggestions` as a\ncombobox (free-text input with a dropdown of suggestions)\nrather than a strict dropdown. Use when the set of\nvalid values is large, partially-discoverable, or\nextends beyond what the component knows at the moment\n(e.g. local LLM model lists that update when the operator\npulls a new model). Distinct from `enumValues`:\nsuggestions are advisory, enumValues are mandatory.\n",
     )
     enumLabels: list[str] | None = Field(
         None,
@@ -527,6 +922,118 @@ class ConfigSchema(BaseModel):
     )
 
 
+class Person(BaseModel):
+    """
+    Full record of a known person. The identity component owns
+    these. `aliases` lists all platform identities that have been
+    approved as belonging to this person. The relationship summary
+    is rebuilt on-demand by the memory component from raw turns
+    in v0.2; v0.3 adds reactive synthesis via the topic-shift
+    detector.
+
+    """
+
+    personId: UUID
+    displayName: str
+    isOperator: bool | None = False
+    createdAt: AwareDatetime
+    aliases: list[PlatformAlias] | None = None
+    relationshipNote: str | None = Field(
+        None,
+        description='Optional free-form operator-supplied note about who this\nperson is to Eugene (e.g. "my wife", "the dev-banter\nchannel regular"). Surfaced into hemisphere prompts as\ntop-level relationship context.\n',
+    )
+
+
+class MemoryEntry(BaseModel):
+    """
+    One stored message + the cognitive metadata it was produced
+    with. Memory writes typically happen at the end of each
+    bicameral turn: the user's message and Eugene's final
+    response each become entries. Hemisphere intermediate
+    outputs are NOT persisted by default — they're debug
+    artifacts.
+
+    """
+
+    entryId: UUID
+    personId: UUID = Field(
+        ...,
+        description="The person this entry is *with* (the user side of the\nexchange, even for Eugene's responses — they're\nresponses to that person).\n",
+    )
+    conversationId: UUID
+    role: Role
+    content: str
+    timestamp: AwareDatetime
+    ntStateSnapshot: NTState | None = Field(
+        None,
+        description="Eugene's NT state at the time this entry was produced.\nLets later analysis correlate output style with NT\nstate. Optional — not all entries carry one.\n",
+    )
+    hemisphereAttribution: str | None = Field(
+        None,
+        description='For Eugene\'s responses: which hemisphere(s) produced\nthis. Free-form (e.g. "left-only", "blended", or a\ndriver name). Omitted for user messages.\n',
+    )
+
+
+class MemorySearchHit(BaseModel):
+    entry: MemoryEntry
+    score: float = Field(
+        ...,
+        description="Backend-defined similarity score. Higher = more\nrelevant. Scale depends on the backend; for\n`local_sqlite` it's cosine similarity in [0, 1].\n",
+    )
+
+
+class RelationshipSummary(BaseModel):
+    """
+    Per-person context the orchestrator injects into hemisphere
+    prompts so Eugene speaks differently to different people.
+    v0.2: built on-demand from raw recent turns with this person
+    (skip-extraction approach). v0.3: synthesized via reactive
+    memory extraction.
+
+    """
+
+    personId: UUID
+    summary: str | None = Field(
+        None,
+        description='Short paragraph Eugene\'s hemispheres see before each\nturn (e.g. "Sarah is your wife. You talk about 3\ntimes a day, mostly casual, frequent jokes. She works\nin product."). Omitted when there\'s no synthesized\nsummary; the orchestrator will then build context\nfrom raw recent turns.\n',
+    )
+    turnCount: int | None = Field(
+        None,
+        description='How many turns Eugene has shared with this person.\nSurfaced in UI to give the operator a sense of how\nwell Eugene knows them.\n',
+        ge=0,
+    )
+    lastUpdated: AwareDatetime
+    recentTurns: list[MemoryEntry] | None = Field(
+        None,
+        description="Raw recent turns with this person, included alongside\n(or instead of) the synthesized summary. v0.2's\ndefault mode is recentTurns-only; v0.3 fills in\n`summary` reactively.\n",
+    )
+
+
+class IncomingMessage(BaseModel):
+    """
+    Normalized message shape an adapter posts to the
+    orchestrator's `POST /v1/chat`. Adapter-specific platform
+    details collapse to this universal shape; the orchestrator
+    never sees Discord-specific or Slack-specific fields.
+
+    """
+
+    personId: UUID = Field(
+        ...,
+        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not call `/v1/chat` — Eugene only responds to\nknown people.\n",
+    )
+    conversationId: UUID | None = Field(
+        None,
+        description='Conversation thread id. Adapters maintain a stable\nmapping from (platform_channel_id, platform_thread_id)\n→ conversationId. Omitted starts a new conversation.\n',
+    )
+    content: str
+    source: MessageSource
+    channelContext: list[ChannelContextEntry] | None = Field(
+        None,
+        description="For channel-mention adapters (Discord channel\nmentions, Slack channels): recent platform messages\npreceding the mention, included for conversational\ngrounding. The orchestrator may surface these to\nhemispheres as ambient context, but only the actual\nmention/reply gets persisted to memory (privacy\ndefault: don't store messages from people who didn't\ninvoke Eugene).\n",
+    )
+
+
 class GenerateResponse(BaseModel):
     content: str = Field(..., description='The generated assistant text.')
     finishReason: FinishReason
@@ -540,3 +1047,40 @@ class GenerateResponse(BaseModel):
     latencyMs: int | None = Field(
         None, description='End-to-end driver-side latency in milliseconds.'
     )
+
+
+class GenerateRequest(BaseModel):
+    messages: list[Message] = Field(
+        ...,
+        description='Full prompt as an ordered conversation. The orchestrator is\nresponsible for inserting any NT-conditioning system message,\npersona, etc. The driver does not modify this.\n',
+    )
+    ntState: NTState | None = None
+    passIndex: int | None = Field(
+        None,
+        description="Zero-based bicameral pass index. The driver itself does not\ncondition on this; it's logged for observability so a UI can\ntell which pass produced which hemisphere output.\n",
+        ge=0,
+    )
+    maxTokens: int | None = Field(
+        None,
+        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(typically the orchestrator) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description="Sampling temperature. Backend-clamped. Owned by the caller\n(typically the orchestrator, where it will eventually be\nmodulated by the NT system) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
+        ge=0.0,
+        le=2.0,
+    )
+    stop: list[str] | None = Field(None, description='Optional stop sequences.')
+    requestId: UUID | None = Field(
+        None,
+        description='Caller-supplied id for log correlation. Echoed in the response.',
+    )
+
+
+class MemorySearchResult(BaseModel):
+    """
+    Ranked list of matching memory entries.
+    """
+
+    entries: list[MemorySearchHit]
