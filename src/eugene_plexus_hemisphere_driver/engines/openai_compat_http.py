@@ -42,6 +42,7 @@ from .._generated.models import (
     Usage,
 )
 from ._subprocess import CliError
+from ._thinking import apply_thinking_mode, strip_thinking_blocks
 
 # Default deny pattern for OpenAI proper (`provider: openai` →
 # OpenAiCompatibleHttpEngine + this pattern). Catches every gpt-5 family
@@ -136,9 +137,12 @@ class OpenAiCompatibleHttpEngine:
         timeout_seconds: float = 120.0,
         deny_pattern: re.Pattern[str] | None = None,
         backend_kind: BackendKind = BackendKind.openai_api,
+        thinking_mode: str = "auto",
+        auth_required: bool = True,
+        filter_models: bool = True,
     ) -> None:
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not resolved_key:
+        if auth_required and not resolved_key:
             raise CliError(
                 "openai_compat_http engine has no API key — set `apiKey` in "
                 "config or export OPENAI_API_KEY in the environment."
@@ -161,6 +165,8 @@ class OpenAiCompatibleHttpEngine:
         self._timeout_seconds = timeout_seconds
         self._deny_pattern = deny_pattern
         self.backend_kind = backend_kind
+        self._thinking_mode = thinking_mode or "auto"
+        self._filter_models = filter_models
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -196,6 +202,8 @@ class OpenAiCompatibleHttpEngine:
         default_base_url: str | None,
         deny_pattern: re.Pattern[str] | None,
         backend_kind: BackendKind,
+        auth_required: bool = True,
+        filter_models: bool = True,
     ) -> OpenAiCompatibleHttpEngine:
         # User's `baseUrl` wins (set only for openai_compat_custom);
         # otherwise the provider's default applies.
@@ -213,12 +221,20 @@ class OpenAiCompatibleHttpEngine:
             timeout_seconds=float(get("requestTimeoutSeconds") or 120),
             deny_pattern=deny_pattern,
             backend_kind=backend_kind,
+            thinking_mode=str(get("thinkingMode") or "auto"),
+            auth_required=auth_required,
+            filter_models=filter_models,
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        # Apply the operator's thinkingMode by mutating the system
+        # message before role-coercion. See engines/_thinking.py for
+        # the per-mode directives — `off` is the one that suppresses
+        # inline `<think>` blocks leaking into chat responses.
+        messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         payload: dict[str, Any] = {
             "model": self._model_id,
-            "messages": _to_openai_messages(list(request.messages)),
+            "messages": _to_openai_messages(messages),
         }
         if request.maxTokens is not None:
             payload[_max_tokens_field_for(self._base_url)] = request.maxTokens
@@ -265,6 +281,11 @@ class OpenAiCompatibleHttpEngine:
         content = message.get("content")
         if not isinstance(content, str):
             raise CliError(f"openai_compat_http response missing string content: {body!r}")
+        # Defensive strip of <think>...</think> when the operator opted
+        # out of thinking but the model emitted tags anyway. See
+        # _thinking.strip_thinking_blocks for the why.
+        if self._thinking_mode == "off":
+            content = strip_thinking_blocks(content)
 
         return GenerateResponse(
             content=content,
@@ -298,18 +319,15 @@ class OpenAiCompatibleHttpEngine:
         Returns `[]` on transport / parse failure so the schema endpoint
         can fall back to free-text input. Driver stays up either way.
         """
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         try:
             async with httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(15.0, connect=5.0),
             ) as client:
-                response = await client.get(
-                    "/v1/models",
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Accept": "application/json",
-                    },
-                )
+                response = await client.get("/v1/models", headers=headers)
             if response.status_code >= 400:
                 return []
             body = response.json()
@@ -325,7 +343,14 @@ class OpenAiCompatibleHttpEngine:
             mid = entry.get("id")
             if not isinstance(mid, str):
                 continue
-            if not _is_plausible_chat_model(mid):
+            # Local providers (Ollama, LM Studio) list ONLY what the
+            # operator explicitly pulled — model ids include publisher
+            # prefixes like `huihui_ai/dolphin3-abliterated:8b-...` that
+            # the chat-prefix heuristic rejects. Skip filtering for
+            # those; trust the operator's choice. The deny-pattern still
+            # applies because temperature compatibility is a wire-level
+            # concern, not a discovery one.
+            if self._filter_models and not _is_plausible_chat_model(mid):
                 continue
             if self._deny_pattern is not None and self._deny_pattern.match(mid):
                 continue

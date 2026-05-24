@@ -111,6 +111,29 @@ def _common_fields() -> list[ConfigField]:
     """
     return [
         ConfigField(
+            key="thinkingMode",
+            label="Thinking mode",
+            description=(
+                "Controls how much internal reasoning this driver's model "
+                "produces before answering. `auto` defers to the model's "
+                "natural behavior. `off` instructs the model NOT to emit "
+                "`<think>...</think>` blocks or scratchpad reasoning — "
+                "useful for reasoning-tag models (DeepSeek R1, Qwen QwQ, "
+                "Kimi, etc.) where the internal thinking otherwise leaks "
+                "into the response. `low` / `medium` / `high` ask for "
+                "progressively more deliberation. v0.2.x applies this as "
+                "a system-prompt directive; native API budget control "
+                "(Anthropic extended thinking, OpenAI `reasoning_effort`) "
+                "lands in v0.3+."
+            ),
+            category="adapter",
+            valueType=ConfigValueType.enum,
+            default="auto",
+            enumValues=["auto", "off", "low", "medium", "high"],
+            enumLabels=["Auto", "Off", "Low", "Medium", "High"],
+            requiresRestart=True,
+        ),
+        ConfigField(
             key="logLevel",
             label="Log level",
             description=(
@@ -184,20 +207,22 @@ _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 
 def as_schema(*, available_models: list[str] | None = None) -> ConfigSchema:
-    """Return the driver's schema, with `modelId` upgraded to an enum
-    dropdown when the caller supplies a discovered model list.
+    """Return the driver's schema, surfacing discovered models as
+    `suggestions` on the `modelId` field when the caller supplies them.
 
     The list comes from the adapter's `list_models()` (live for
     openai_api, hardcoded for the CLIs) and arrives at the schema
-    endpoint via `app.state.available_models`. When it's missing or
-    empty (degraded mode, unreachable upstream, etc.), `modelId`
-    stays as a free-text `string` input so the operator can still
-    type a value by hand.
+    endpoint via `app.state.available_models`. modelId stays a
+    free-text `string` field either way — the operator can paste a
+    model the driver hasn't fetched yet (just-pulled in Ollama,
+    just-deployed in a custom endpoint) and the validator accepts it.
+    The UI renders the suggestions as a combobox dropdown beside the
+    free-text input.
     """
     fields = list(FIELDS)
     if available_models:
         fields = [
-            _with_model_dropdown(f, available_models) if f.key == "modelId" else f
+            _with_model_suggestions(f, available_models) if f.key == "modelId" else f
             for f in fields
         ]
     return ConfigSchema(
@@ -207,16 +232,13 @@ def as_schema(*, available_models: list[str] | None = None) -> ConfigSchema:
     )
 
 
-def _with_model_dropdown(model_field: ConfigField, models: list[str]) -> ConfigField:
-    """Return a copy of `modelId` re-typed as an enum with the given
-    models as `enumValues`. An empty-string entry is prepended so the
-    UI can offer "(use adapter default)" — preserving the current
-    behavior where leaving modelId unset falls back to the adapter's
-    built-in default model."""
+def _with_model_suggestions(model_field: ConfigField, models: list[str]) -> ConfigField:
+    """Return a copy of `modelId` carrying the given models as
+    discovery-time `suggestions`. valueType stays `string` so the
+    operator can paste an id the driver hasn't fetched yet."""
     return model_field.model_copy(
         update={
-            "valueType": ConfigValueType.enum,
-            "enumValues": ["", *models],
+            "suggestions": list(models),
         }
     )
 

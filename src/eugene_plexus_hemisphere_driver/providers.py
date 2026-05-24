@@ -152,6 +152,16 @@ PROVIDERS: dict[str, Provider] = {
             "default_base_url": "http://127.0.0.1:11434",
             "deny_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
+            # Ollama doesn't require auth on its local endpoint; the
+            # apiKey field exists but is optional. Without this flag,
+            # engine construction fails on a blank key even though the
+            # request would have worked.
+            "auth_required": False,
+            # Ollama only lists what the operator pulled. Disable the
+            # chat-prefix heuristic — model ids like
+            # `huihui_ai/dolphin3-abliterated:...` don't match it and
+            # would be invisibly hidden from the dropdown.
+            "filter_models": False,
         },
     ),
     "lmstudio_local": Provider(
@@ -162,6 +172,8 @@ PROVIDERS: dict[str, Provider] = {
             "default_base_url": "http://127.0.0.1:1234",
             "deny_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
+            "auth_required": False,
+            "filter_models": False,
         },
     ),
     "openai_compat_custom": Provider(

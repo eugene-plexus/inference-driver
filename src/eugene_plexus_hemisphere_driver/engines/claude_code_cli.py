@@ -48,6 +48,7 @@ from .._generated.models import (
 )
 from ._prompt import messages_to_prompt
 from ._subprocess import CliError, run_cli
+from ._thinking import apply_thinking_mode, strip_thinking_blocks
 
 _STOP_REASON_MAP = {
     "end_turn": FinishReason.stop,
@@ -81,10 +82,12 @@ class ClaudeCodeCliEngine:
         binary_path: str = "claude",
         model_id: str | None = None,
         timeout_seconds: float = 120.0,
+        thinking_mode: str = "auto",
     ) -> None:
         self._binary_path = binary_path
         self._model_id = model_id
         self._timeout_seconds = timeout_seconds
+        self._thinking_mode = thinking_mode or "auto"
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -113,16 +116,25 @@ class ClaudeCodeCliEngine:
             binary_path=str(get("claudeCodeCliPath") or "claude"),
             model_id=get("modelId") or None,
             timeout_seconds=float(get("requestTimeoutSeconds") or 120),
+            thinking_mode=str(get("thinkingMode") or "auto"),
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        # Apply the operator's thinkingMode by mutating the system
+        # message before splitting / serialization. Claude Code itself
+        # doesn't emit <think> tags inline (its thinking goes via the
+        # native Messages API extended-thinking field), but routing
+        # the directive through the system prompt is consistent with
+        # the other engines and operators may want to suppress
+        # reasoning emit in special test setups.
+        messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         # Split system messages from the rest. Claude Code's --system-prompt
         # *replaces* its default system prompt entirely (which also disables
         # the "current working directory: ..." injection per the CLI's own
         # docs), giving us closer-to-raw-LLM behavior than passing system
         # text inside the user-message argv.
-        system_messages = [m for m in request.messages if m.role == Role.system]
-        other_messages = [m for m in request.messages if m.role != Role.system]
+        system_messages = [m for m in messages if m.role == Role.system]
+        other_messages = [m for m in messages if m.role != Role.system]
         system_prompt = "\n\n".join(m.content for m in system_messages).strip()
         user_prompt = messages_to_prompt(other_messages)
 
@@ -159,6 +171,8 @@ class ClaudeCodeCliEngine:
         content = data.get("result")
         if not isinstance(content, str):
             raise CliError(f"claude JSON missing string `result`: {data!r}")
+        if self._thinking_mode == "off":
+            content = strip_thinking_blocks(content)
 
         return GenerateResponse(
             content=content,

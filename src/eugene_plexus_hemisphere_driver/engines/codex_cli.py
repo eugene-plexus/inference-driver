@@ -59,6 +59,7 @@ from .._generated.models import (
 )
 from ._prompt import messages_to_prompt
 from ._subprocess import CliError, run_cli
+from ._thinking import apply_thinking_mode, strip_thinking_blocks
 
 # Models that Codex CLI is known to surface to the user. The CLI itself
 # decides which model to call based on its own config and the active
@@ -84,10 +85,12 @@ class CodexCliEngine:
         binary_path: str = "codex",
         model_id: str | None = None,
         timeout_seconds: float = 120.0,
+        thinking_mode: str = "auto",
     ) -> None:
         self._binary_path = binary_path
         self._model_id = model_id
         self._timeout_seconds = timeout_seconds
+        self._thinking_mode = thinking_mode or "auto"
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -115,10 +118,17 @@ class CodexCliEngine:
             binary_path=str(get("codexCliPath") or "codex"),
             model_id=get("modelId") or None,
             timeout_seconds=float(get("requestTimeoutSeconds") or 120),
+            thinking_mode=str(get("thinkingMode") or "auto"),
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
-        argv = self._build_argv(messages_to_prompt(list(request.messages)))
+        # Codex CLI's own system prompt overrides ours (see module
+        # docstring's Persona-override note), but applying the
+        # thinkingMode directive still helps in practice — Codex
+        # follows user-content instructions and reasoning-tag models
+        # surface as Codex backends from time to time.
+        messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
+        argv = self._build_argv(messages_to_prompt(messages))
         result = await run_cli(argv, timeout_seconds=self._timeout_seconds)
 
         if result.returncode != 0:
@@ -160,8 +170,12 @@ class CodexCliEngine:
         if not text_parts:
             raise CliError("codex completed without producing an agent_message")
 
+        content = "".join(text_parts)
+        if self._thinking_mode == "off":
+            content = strip_thinking_blocks(content)
+
         return GenerateResponse(
-            content="".join(text_parts),
+            content=content,
             finishReason=FinishReason.stop,
             usage=_usage_from_codex(usage_event) if usage_event else None,
             requestId=request.requestId,

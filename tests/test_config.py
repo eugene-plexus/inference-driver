@@ -108,20 +108,22 @@ def test_schema_modelid_is_string_when_no_models_discovered(client: TestClient) 
     assert model_field["valueType"] in ("string", "enum")
 
 
-def test_schema_modelid_becomes_enum_when_models_available() -> None:
+def test_schema_modelid_carries_suggestions_when_models_available() -> None:
     """When the lifespan populates `available_models`, the schema
-    endpoint exposes modelId as a dropdown — value type flips to
-    enum, enumValues lists the discovered models, and a leading
-    empty-string entry preserves the 'use adapter default' option."""
+    endpoint exposes modelId as a free-text field WITH discovery
+    suggestions. Validation stays permissive so an operator can paste
+    an id the driver hasn't fetched yet (Ollama just-pulled, custom
+    endpoint, etc.); the UI renders the suggestions as a combobox
+    dropdown next to the input."""
     from eugene_plexus_hemisphere_driver.config import as_schema
 
     schema = as_schema(available_models=["claude-opus-4-7", "claude-sonnet-4-7"])
     model_field = next(f for f in schema.fields if f.key == "modelId")
-    assert model_field.valueType.value == "enum"
-    assert model_field.enumValues is not None
-    assert model_field.enumValues[0] == ""  # "(use adapter default)" sentinel
-    assert "claude-opus-4-7" in model_field.enumValues
-    assert "claude-sonnet-4-7" in model_field.enumValues
+    # valueType stays string so PATCH accepts any pasted id.
+    assert model_field.valueType.value == "string"
+    assert model_field.suggestions is not None
+    assert "claude-opus-4-7" in model_field.suggestions
+    assert "claude-sonnet-4-7" in model_field.suggestions
 
 
 def test_schema_modelid_stays_string_without_models() -> None:
