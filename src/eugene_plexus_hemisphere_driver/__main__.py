@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import uvicorn
@@ -44,12 +45,27 @@ def main() -> None:
 
     port = _resolve_port(bootstrap_store)
 
+    # Wire the application logger to the same level as uvicorn so
+    # `log.warning(...)` calls in our code (the apiKey-decryption
+    # warning is the noisy example) emit with timestamp + level +
+    # logger name. uvicorn only configures its own loggers; the root
+    # logger has no handler by default, so without basicConfig our
+    # warnings arrive bare-message and untimestamped. `force=True`
+    # overrides any prior basicConfig (uvicorn touches logging
+    # before we get here).
+    log_level = str(bootstrap_store.get("logLevel") or "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
     app = create_app(settings)
     uvicorn.run(
         app,
         host=settings.bind_host,
         port=port,
-        log_level=str(bootstrap_store.get("logLevel") or "INFO").lower(),
+        log_level=log_level.lower(),
     )
 
 
