@@ -138,8 +138,12 @@ def _common_fields() -> list[ConfigField]:
             label="Log level",
             description=(
                 "How chatty the driver's terminal output is. `DEBUG` "
-                "prints every backend call (useful when something's "
-                "broken); `INFO` is the normal operating level; "
+                "dumps the full upstream payload going out and the "
+                "full response coming back for every backend call — "
+                "shows you exactly what the LLM saw (post role-"
+                "coercion, post-thinking-directive injection, post-"
+                "CLI flattening), which the orchestrator's copy-trace "
+                "does not. `INFO` is the normal operating level; "
                 "`WARNING` and `ERROR` go progressively quieter."
             ),
             category="logging",

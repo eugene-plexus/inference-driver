@@ -25,10 +25,14 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 from .._generated.models import (
     BackendKind,
@@ -243,6 +247,19 @@ class OpenAiCompatibleHttpEngine:
         if request.stop:
             payload["stop"] = list(request.stop)
 
+        # DEBUG-level full-payload trace. The orchestrator's copy-trace
+        # captures what we sent it; this captures what WE send upstream
+        # (post role-coercion, post-thinking-directive injection,
+        # post-param-shaping). When operators flip to DEBUG to chase
+        # "is the LLM actually seeing what I think it's seeing", this
+        # is the load-bearing log line. Auth header omitted on purpose.
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "openai_compat_http → POST %s/v1/chat/completions\n%s",
+                self._base_url,
+                json.dumps(payload, indent=2, ensure_ascii=False),
+            )
+
         async with httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
@@ -260,6 +277,13 @@ class OpenAiCompatibleHttpEngine:
                 raise CliError(f"openai_compat_http request failed: {e}") from e
 
         if response.status_code >= 400:
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "openai_compat_http ← HTTP %d (%dms) body:\n%s",
+                    response.status_code,
+                    int(response.elapsed.total_seconds() * 1000),
+                    _redact(response.text[:4000]),
+                )
             raise CliError(
                 f"openai_compat_http returned {response.status_code}: "
                 f"{_redact(response.text[:500])}"
@@ -271,6 +295,14 @@ class OpenAiCompatibleHttpEngine:
             raise CliError(
                 f"openai_compat_http returned non-JSON: {response.text[:200]!r}"
             ) from e
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "openai_compat_http ← HTTP %d (%dms) body:\n%s",
+                response.status_code,
+                int(response.elapsed.total_seconds() * 1000),
+                json.dumps(body, indent=2, ensure_ascii=False),
+            )
 
         choices = body.get("choices") or []
         if not choices:

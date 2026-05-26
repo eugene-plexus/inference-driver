@@ -32,8 +32,11 @@ those totals as-is.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from .._generated.models import (
     BackendKind,
@@ -145,11 +148,36 @@ class ClaudeCodeCliEngine:
         # command separator. Pipe via stdin instead. Claude Code reads
         # stdin under --print when no positional prompt is given.
         argv = self._build_argv(system_prompt=system_prompt)
+
+        # DEBUG-level full-payload trace. CLI adapters flatten the
+        # orchestrator's structured message list into a single labeled
+        # transcript string before sending — the operator's copy-trace
+        # shows the pre-flattening shape, this shows what actually
+        # reaches the model.
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "claude_code_cli → argv:\n%s\n--- system prompt ---\n%s\n"
+                "--- user prompt (stdin) ---\n%s",
+                argv,
+                system_prompt or "(empty)",
+                user_prompt,
+            )
+
         result = await run_cli(
             argv,
             timeout_seconds=self._timeout_seconds,
             stdin_input=user_prompt.encode("utf-8"),
         )
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "claude_code_cli ← exit=%d (%dms)\n--- stdout ---\n%s\n"
+                "--- stderr ---\n%s",
+                result.returncode,
+                result.elapsed_ms,
+                result.stdout.decode(errors="replace"),
+                result.stderr.decode(errors="replace") or "(empty)",
+            )
 
         if result.returncode != 0:
             raise CliError(

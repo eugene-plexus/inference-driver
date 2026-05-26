@@ -44,8 +44,11 @@ access is via a Codex-eligible subscription.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from .._generated.models import (
     BackendKind,
@@ -128,8 +131,32 @@ class CodexCliEngine:
         # follows user-content instructions and reasoning-tag models
         # surface as Codex backends from time to time.
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
-        argv = self._build_argv(messages_to_prompt(messages))
+        flattened_prompt = messages_to_prompt(messages)
+        argv = self._build_argv(flattened_prompt)
+
+        # DEBUG-level full-payload trace. CLI adapters flatten the
+        # orchestrator's structured message list into a single labeled
+        # transcript string before sending — the operator's copy-trace
+        # shows the pre-flattening shape, this shows what actually
+        # reaches the model.
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "codex_cli → argv:\n%s\n--- flattened prompt ---\n%s",
+                argv,
+                flattened_prompt,
+            )
+
         result = await run_cli(argv, timeout_seconds=self._timeout_seconds)
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "codex_cli ← exit=%d (%dms)\n--- stdout (JSONL) ---\n%s\n"
+                "--- stderr ---\n%s",
+                result.returncode,
+                result.elapsed_ms,
+                result.stdout.decode(errors="replace"),
+                result.stderr.decode(errors="replace") or "(empty)",
+            )
 
         if result.returncode != 0:
             raise CliError(
