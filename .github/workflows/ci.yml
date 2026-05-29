@@ -98,6 +98,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_ACTOR:-}" == "dependabot[bot]" ]]; then
+            echo "Dependabot commits are exempt from DCO sign-off."
+            exit 0
+          fi
           status=0
           while IFS= read -r sha; do
             [[ -z "$sha" ]] && continue
