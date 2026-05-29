@@ -47,6 +47,17 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
+## Git hooks
+
+We use [pre-commit](https://pre-commit.com/) to auto-format staged files with Ruff before they reach CI. Enable it once per clone:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+After that, `git commit` runs `ruff check --fix` and `ruff format` on staged Python files; if a hook reformats anything, re-stage and commit again.
+
 ## Style
 
 - **Python 3.12+** features are fine. We use `from __future__ import annotations` only where it materially helps; otherwise just use modern syntax.
