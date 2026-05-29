@@ -68,9 +68,7 @@ def test_envelope_to_from_dict_round_trip() -> None:
 
 def test_envelope_from_dict_rejects_wrong_alg() -> None:
     with pytest.raises(ValueError, match="unsupported envelope alg"):
-        security.Envelope.from_dict(
-            {"alg": "aes-gcm", "nonce": "AA==", "ciphertext": "AA=="}
-        )
+        security.Envelope.from_dict({"alg": "aes-gcm", "nonce": "AA==", "ciphertext": "AA=="})
 
 
 def test_is_envelope_discriminator() -> None:
@@ -114,9 +112,7 @@ def test_master_key_writes_apikey_as_envelope_on_disk(tmp_path: Path) -> None:
     store.apply_patch(_patch({"provider": "openai", "apiKey": "sk-secret"}))
 
     raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert security.is_envelope(raw["apiKey"]), (
-        f"apiKey not encrypted on disk: {raw['apiKey']!r}"
-    )
+    assert security.is_envelope(raw["apiKey"]), f"apiKey not encrypted on disk: {raw['apiKey']!r}"
     # The ciphertext must not contain the plaintext.
     assert "sk-secret" not in str(raw["apiKey"])
 

@@ -36,8 +36,6 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from .._generated.models import (
     BackendKind,
     ConfigField,
@@ -52,6 +50,8 @@ from .._generated.models import (
 from ._prompt import messages_to_prompt
 from ._subprocess import CliError, run_cli
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
+
+log = logging.getLogger(__name__)
 
 _STOP_REASON_MAP = {
     "end_turn": FinishReason.stop,
@@ -171,8 +171,7 @@ class ClaudeCodeCliEngine:
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
-                "claude_code_cli ← exit=%d (%dms)\n--- stdout ---\n%s\n"
-                "--- stderr ---\n%s",
+                "claude_code_cli ← exit=%d (%dms)\n--- stdout ---\n%s\n--- stderr ---\n%s",
                 result.returncode,
                 result.elapsed_ms,
                 result.stdout.decode(errors="replace"),

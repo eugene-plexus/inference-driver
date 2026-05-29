@@ -108,4 +108,4 @@ def strip_thinking_blocks(text: str) -> str:
     return cleaned.strip()
 
 
-__all__ = ["apply_thinking_mode", "strip_thinking_blocks", "THINKING_MODE_INSTRUCTIONS"]
+__all__ = ["THINKING_MODE_INSTRUCTIONS", "apply_thinking_mode", "strip_thinking_blocks"]

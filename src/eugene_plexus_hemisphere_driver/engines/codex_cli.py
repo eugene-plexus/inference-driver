@@ -48,8 +48,6 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from .._generated.models import (
     BackendKind,
     ConfigField,
@@ -63,6 +61,8 @@ from .._generated.models import (
 from ._prompt import messages_to_prompt
 from ._subprocess import CliError, run_cli
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
+
+log = logging.getLogger(__name__)
 
 # Models that Codex CLI is known to surface to the user. The CLI itself
 # decides which model to call based on its own config and the active
@@ -150,8 +150,7 @@ class CodexCliEngine:
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
-                "codex_cli ← exit=%d (%dms)\n--- stdout (JSONL) ---\n%s\n"
-                "--- stderr ---\n%s",
+                "codex_cli ← exit=%d (%dms)\n--- stdout (JSONL) ---\n%s\n--- stderr ---\n%s",
                 result.returncode,
                 result.elapsed_ms,
                 result.stdout.decode(errors="replace"),

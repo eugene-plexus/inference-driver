@@ -167,7 +167,9 @@ async def test_openai_adapter_uses_max_completion_tokens_against_openai() -> Non
         return_value=httpx.Response(200, json=OK_BODY)
     )
     adapter = OpenAiCompatibleHttpEngine(api_key="sk-test", model_id="gpt-4o")
-    await adapter.generate(GenerateRequest(messages=[Message(role=Role.user, content="hi")], maxTokens=512))
+    await adapter.generate(
+        GenerateRequest(messages=[Message(role=Role.user, content="hi")], maxTokens=512)
+    )
 
     import json as _json
 
@@ -233,7 +235,9 @@ async def test_openai_adapter_uses_legacy_max_tokens_against_self_hosted() -> No
         base_url="http://127.0.0.1:11434",
         model_id="llama3.1:70b",
     )
-    await adapter.generate(GenerateRequest(messages=[Message(role=Role.user, content="hi")], maxTokens=512))
+    await adapter.generate(
+        GenerateRequest(messages=[Message(role=Role.user, content="hi")], maxTokens=512)
+    )
 
     import json as _json
 

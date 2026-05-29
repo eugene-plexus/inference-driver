@@ -13,9 +13,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 
-def test_restart_returns_202_with_scheduled_payload(
-    client: TestClient, monkeypatch: Any
-) -> None:
+def test_restart_returns_202_with_scheduled_payload(client: TestClient, monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
 
     def fake_call_later(delay: float, callback: Any, *args: Any, **kwargs: Any) -> None:

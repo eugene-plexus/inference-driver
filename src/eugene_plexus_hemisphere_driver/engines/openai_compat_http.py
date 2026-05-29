@@ -23,16 +23,14 @@ read from config (`apiKey`, sensitive) with a fallback to the
 
 from __future__ import annotations
 
-import os
-import re
 import json
 import logging
+import os
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
-
-log = logging.getLogger(__name__)
 
 from .._generated.models import (
     BackendKind,
@@ -47,6 +45,8 @@ from .._generated.models import (
 )
 from ._subprocess import CliError
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
+
+log = logging.getLogger(__name__)
 
 # Default deny pattern for OpenAI proper (`provider: openai` →
 # OpenAiCompatibleHttpEngine + this pattern). Catches every gpt-5 family
@@ -292,9 +292,7 @@ class OpenAiCompatibleHttpEngine:
         try:
             body = response.json()
         except ValueError as e:
-            raise CliError(
-                f"openai_compat_http returned non-JSON: {response.text[:200]!r}"
-            ) from e
+            raise CliError(f"openai_compat_http returned non-JSON: {response.text[:200]!r}") from e
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(

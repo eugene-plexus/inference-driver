@@ -79,9 +79,7 @@ def load_auth_state(
     inconsistent partial-auth configurations — a missing piece is
     almost always a wiring bug we want loud rather than silently 401-y.
     """
-    signing_key = _decode_b64_key(
-        signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY"
-    )
+    signing_key = _decode_b64_key(signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY")
     master_key = _decode_b64_key(master_key_b64, expected_len=32, label="MASTER_KEY")
 
     if signing_key is None:

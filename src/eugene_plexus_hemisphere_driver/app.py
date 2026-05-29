@@ -65,9 +65,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             master_key_b64=settings.master_key,
         )
 
-    store = ConfigStore(
-        settings.config_file, master_key=app.state.auth_state.master_key
-    )
+    store = ConfigStore(settings.config_file, master_key=app.state.auth_state.master_key)
     if settings.safe_mode:
         # Safe mode: skip the on-disk config entirely, leaving the store
         # populated with built-in defaults. PATCH /v1/config still writes

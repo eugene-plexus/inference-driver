@@ -88,8 +88,8 @@ def _modelid_field() -> ConfigField:
         label="Model",
         description=(
             "Which specific model to ask the backend for (e.g. "
-            "\"gpt-4o\", \"claude-opus-4-7\", \"grok-2\", "
-            "\"llama3.1:70b\"). The list below is discovered from the "
+            '"gpt-4o", "claude-opus-4-7", "grok-2", '
+            '"llama3.1:70b"). The list below is discovered from the '
             "selected provider; pick the empty entry to fall back to "
             "the engine's built-in default."
         ),
@@ -194,6 +194,7 @@ def _build_fields() -> list[ConfigField]:
     out.append(_modelid_field())
     out.extend(_common_fields())
     return out
+
 
 # Schema for hemisphere-driver's config surface. Built dynamically from
 # the provider registry — the order here is the order the UI renders.
@@ -367,9 +368,7 @@ class ConfigStore:
             envelope = security.Envelope.from_dict(value)
             return security.open_envelope(envelope, self._master_key)
         except ValueError as e:
-            log.warning(
-                "config field %r failed to decrypt (%s); treating as unset", key, e
-            )
+            log.warning("config field %r failed to decrypt (%s); treating as unset", key, e)
             return None
 
     def as_document(self) -> ConfigDocument:
