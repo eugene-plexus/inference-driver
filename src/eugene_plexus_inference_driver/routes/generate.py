@@ -11,7 +11,7 @@ from .._generated.models import GenerateRequest, GenerateResponse, Problem
 from ..engines._subprocess import CliError
 
 if TYPE_CHECKING:
-    from ..engines.base import HemisphereEngine
+    from ..engines.base import BackendEngine
 
 router = APIRouter(tags=["inference"])
 
@@ -20,20 +20,20 @@ log = logging.getLogger(__name__)
 
 @router.post("/v1/generate", response_model=GenerateResponse)
 async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
-    engine: HemisphereEngine | None = request.app.state.adapter
+    engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         adapter_error = getattr(request.app.state, "adapter_error", None)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/hemisphere-driver#engine-not-configured",
+                type="https://github.com/eugene-plexus/inference-driver#engine-not-configured",
                 title="Engine not configured",
                 status=503,
                 detail=(
                     f"This driver has no working engine. {adapter_error or 'Unknown error.'} "
                     "Update the configuration via PATCH /v1/config and restart the driver."
                 ),
-                component="hemisphere-driver:degraded",
+                component="inference-driver:degraded",
             ).model_dump(exclude_none=True),
         )
     try:
@@ -46,11 +46,11 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=Problem(
-                type="https://github.com/eugene-plexus/hemisphere-driver#backend-error",
+                type="https://github.com/eugene-plexus/inference-driver#backend-error",
                 title="Backend error",
                 status=502,
                 detail=str(e),
-                component=f"hemisphere-driver:{kind_label}",
+                component=f"inference-driver:{kind_label}",
             ).model_dump(exclude_none=True),
         ) from e
 
@@ -60,13 +60,13 @@ async def generate_stream(body: GenerateRequest) -> None:
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail=Problem(
-            type="https://github.com/eugene-plexus/hemisphere-driver#not-implemented",
+            type="https://github.com/eugene-plexus/inference-driver#not-implemented",
             title="Not Implemented",
             status=501,
             detail=(
                 "POST /v1/generate/stream is not yet wired up; will land "
-                "alongside the orchestrator + UI consumers in v0.2."
+                "alongside the gateway + UI consumers in v0.2."
             ),
-            component="hemisphere-driver",
+            component="inference-driver",
         ).model_dump(exclude_none=True),
     )

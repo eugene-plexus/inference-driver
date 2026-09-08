@@ -1,6 +1,6 @@
-# Contributing to Eugene Plexus `hemisphere-driver`
+# Contributing to Eugene Plexus `inference-driver`
 
-Thanks for your interest. This service implements the `hemisphere-driver` OpenAPI contract from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) — please read this before opening a PR.
+Thanks for your interest. This service implements the `inference-driver` OpenAPI contract from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) — please read this before opening a PR.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -40,8 +40,8 @@ PRs to this repo should generally cover one or more of:
 ## Local setup
 
 ```bash
-git clone https://github.com/eugene-plexus/hemisphere-driver
-cd hemisphere-driver
+git clone https://github.com/eugene-plexus/inference-driver
+cd inference-driver
 python -m venv .venv
 . .venv/bin/activate           # or: .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
@@ -79,10 +79,10 @@ git diff --exit-code src/.../_generated/   # codegen freshness
 
 ## Reporting issues
 
-File issues at <https://github.com/eugene-plexus/hemisphere-driver/issues>. Useful issues include:
+File issues at <https://github.com/eugene-plexus/inference-driver/issues>. Useful issues include:
 
 - Concrete adapter failures with reproduction steps.
-- Spec-vs-impl divergence (the impl drifted from `hemisphere-driver.yaml`).
+- Spec-vs-impl divergence (the impl drifted from `inference-driver.yaml`).
 - Performance / latency regressions with measurements.
 
-For broader architectural questions about Eugene Plexus, file the issue on the [orchestrator repo](https://github.com/eugene-plexus/orchestrator) instead.
+For broader architectural questions about Eugene Plexus, file the issue on the [gateway repo](https://github.com/eugene-plexus/gateway) instead.

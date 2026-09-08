@@ -2,7 +2,7 @@
 
 Mocks the upstream HTTP via `respx` so these tests don't hit OpenAI.
 End-to-end verification against a real key is gated behind
-EUGENE_PLEXUS_HD_LIVE_API=1 and skipped by default.
+EUGENE_PLEXUS_DRIVER_LIVE_API=1 and skipped by default.
 """
 
 from __future__ import annotations
@@ -13,15 +13,15 @@ import httpx
 import pytest
 import respx
 
-from eugene_plexus_hemisphere_driver._generated.models import (
+from eugene_plexus_inference_driver._generated.models import (
     BackendKind,
     FinishReason,
     GenerateRequest,
     Message,
     Role,
 )
-from eugene_plexus_hemisphere_driver.engines._subprocess import CliError
-from eugene_plexus_hemisphere_driver.engines.openai_compat_http import (
+from eugene_plexus_inference_driver.engines._subprocess import CliError
+from eugene_plexus_inference_driver.engines.openai_compat_http import (
     OPENAI_DENY_PATTERN,
     OpenAiCompatibleHttpEngine,
 )
@@ -344,10 +344,10 @@ async def test_openai_adapter_list_models_returns_empty_on_transport_error() -> 
 # Live test — opt-in via env var (uses real OpenAI quota)
 # ---------------------------------------------------------------------------
 
-LIVE = os.environ.get("EUGENE_PLEXUS_HD_LIVE_API") == "1"
+LIVE = os.environ.get("EUGENE_PLEXUS_DRIVER_LIVE_API") == "1"
 
 
-@pytest.mark.skipif(not LIVE, reason="set EUGENE_PLEXUS_HD_LIVE_API=1 to run live")
+@pytest.mark.skipif(not LIVE, reason="set EUGENE_PLEXUS_DRIVER_LIVE_API=1 to run live")
 async def test_openai_live_call() -> None:
     adapter = OpenAiCompatibleHttpEngine(timeout_seconds=60.0)
     response = await adapter.generate(

@@ -15,17 +15,17 @@ from typing import Any
 
 import pytest
 
-from eugene_plexus_hemisphere_driver._generated.models import (
+from eugene_plexus_inference_driver._generated.models import (
     BackendKind,
     FinishReason,
     GenerateRequest,
     Message,
     Role,
 )
-from eugene_plexus_hemisphere_driver.engines import _subprocess
-from eugene_plexus_hemisphere_driver.engines._subprocess import CliError, CliResult
-from eugene_plexus_hemisphere_driver.engines.claude_code_cli import ClaudeCodeCliEngine
-from eugene_plexus_hemisphere_driver.engines.codex_cli import CodexCliEngine
+from eugene_plexus_inference_driver.engines import _subprocess
+from eugene_plexus_inference_driver.engines._subprocess import CliError, CliResult
+from eugene_plexus_inference_driver.engines.claude_code_cli import ClaudeCodeCliEngine
+from eugene_plexus_inference_driver.engines.codex_cli import CodexCliEngine
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,11 +62,11 @@ def _patch_run_cli(
     # `from ._subprocess import run_cli` style imports.
     monkeypatch.setattr(_subprocess, "run_cli", _fake_run_cli)
     monkeypatch.setattr(
-        "eugene_plexus_hemisphere_driver.engines.claude_code_cli.run_cli",
+        "eugene_plexus_inference_driver.engines.claude_code_cli.run_cli",
         _fake_run_cli,
     )
     monkeypatch.setattr(
-        "eugene_plexus_hemisphere_driver.engines.codex_cli.run_cli",
+        "eugene_plexus_inference_driver.engines.codex_cli.run_cli",
         _fake_run_cli,
     )
     return captured
@@ -426,17 +426,17 @@ async def test_codex_adapter_list_models_excludes_temperature_uncontrollable() -
 # End-to-end against real binaries — opt-in via env var
 # ---------------------------------------------------------------------------
 
-LIVE = os.environ.get("EUGENE_PLEXUS_HD_LIVE_CLI") == "1"
+LIVE = os.environ.get("EUGENE_PLEXUS_DRIVER_LIVE_CLI") == "1"
 
 
-@pytest.mark.skipif(not LIVE, reason="set EUGENE_PLEXUS_HD_LIVE_CLI=1 to run live")
+@pytest.mark.skipif(not LIVE, reason="set EUGENE_PLEXUS_DRIVER_LIVE_CLI=1 to run live")
 async def test_claude_live_call() -> None:
     adapter = ClaudeCodeCliEngine(timeout_seconds=180.0)
     response = await adapter.generate(_request("Reply with exactly the four characters: PING"))
     assert "PING" in response.content
 
 
-@pytest.mark.skipif(not LIVE, reason="set EUGENE_PLEXUS_HD_LIVE_CLI=1 to run live")
+@pytest.mark.skipif(not LIVE, reason="set EUGENE_PLEXUS_DRIVER_LIVE_CLI=1 to run live")
 async def test_codex_live_call() -> None:
     adapter = CodexCliEngine(timeout_seconds=180.0)
     response = await adapter.generate(_request("Reply with exactly the four characters: PING"))

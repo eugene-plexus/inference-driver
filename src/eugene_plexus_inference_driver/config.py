@@ -104,9 +104,9 @@ def _common_fields() -> list[ConfigField]:
 
     The bind port deliberately is NOT in this list. Ports are owned by
     the watchdog topology (`watchdog.yaml`), passed to spawned children
-    via `EUGENE_PLEXUS_HD_BIND_PORT`. Two sources of truth on `port`
+    via `EUGENE_PLEXUS_DRIVER_BIND_PORT`. Two sources of truth on `port`
     was an OpenClaw-style trap waiting to bite — the watchdog spawns at
-    one port, the driver's own config says another, and the orchestrator
+    one port, the driver's own config says another, and the gateway
     can't reach the driver. Now there's one source.
     """
     return [
@@ -142,7 +142,7 @@ def _common_fields() -> list[ConfigField]:
                 "full response coming back for every backend call — "
                 "shows you exactly what the LLM saw (post role-"
                 "coercion, post-thinking-directive injection, post-"
-                "CLI flattening), which the orchestrator's copy-trace "
+                "CLI flattening), which the gateway's copy-trace "
                 "does not. `INFO` is the normal operating level; "
                 "`WARNING` and `ERROR` go progressively quieter."
             ),
@@ -196,14 +196,14 @@ def _build_fields() -> list[ConfigField]:
     return out
 
 
-# Schema for hemisphere-driver's config surface. Built dynamically from
+# Schema for inference-driver's config surface. Built dynamically from
 # the provider registry — the order here is the order the UI renders.
 FIELDS: list[ConfigField] = _build_fields()
 # NOTE on what's NOT in this schema:
 # Temperature, max-tokens, stop sequences and other parameters that alter
-# LLM output are owned by the *caller* (the orchestrator) and arrive on
+# LLM output are owned by the *caller* (the gateway) and arrive on
 # every `GenerateRequest`. The driver applies what it's given and never
-# substitutes a local default. In v0.2+ the orchestrator's NT system will
+# substitutes a local default. In v0.2+ the gateway's NT system will
 # modulate these per-request — placing defaults here would make that
 # layering invisible and a future NT signal trivially overridable from a
 # config file.
@@ -231,7 +231,7 @@ def as_schema(*, available_models: list[str] | None = None) -> ConfigSchema:
             for f in fields
         ]
     return ConfigSchema(
-        component="hemisphere-driver",
+        component="inference-driver",
         fields=fields,
         categories=CATEGORY_LABELS,
     )

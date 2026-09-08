@@ -1,9 +1,9 @@
 """v0.2 security primitives.
 
-The hemisphere-driver is never the trust root. The watchdog generates
+The inference-driver is never the trust root. The watchdog generates
 the per-restart HMAC signing key and the install-wide master key
 (libsodium secretbox), and distributes both via env vars
-(`EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY`, `EUGENE_PLEXUS_HD_MASTER_KEY`).
+(`EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY`, `EUGENE_PLEXUS_DRIVER_MASTER_KEY`).
 This module exposes:
 
   * JWT decode (verify-only) for inbound bearer token validation —

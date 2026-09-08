@@ -28,9 +28,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from eugene_plexus_hemisphere_driver import security
-from eugene_plexus_hemisphere_driver._generated.models import ConfigUpdateRequest
-from eugene_plexus_hemisphere_driver.config import ConfigStore
+from eugene_plexus_inference_driver import security
+from eugene_plexus_inference_driver._generated.models import ConfigUpdateRequest
+from eugene_plexus_inference_driver.config import ConfigStore
 
 # --------------------------------------------------------------------------- #
 # Primitive: Envelope round-trip

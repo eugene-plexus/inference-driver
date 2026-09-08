@@ -38,6 +38,6 @@ config.yaml
 
 # --- Codegen working dirs ---
 # We commit the resulting generated code under
-# src/eugene_plexus_hemisphere_driver/_generated/, but the
+# src/eugene_plexus_inference_driver/_generated/, but the
 # scratch directory the codegen script downloads into is local-only.
 .codegen-cache/

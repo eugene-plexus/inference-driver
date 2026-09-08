@@ -9,8 +9,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_hemisphere_driver.app import create_app
-from eugene_plexus_hemisphere_driver.settings import Settings
+from eugene_plexus_inference_driver.app import create_app
+from eugene_plexus_inference_driver.settings import Settings
 
 
 @pytest.fixture

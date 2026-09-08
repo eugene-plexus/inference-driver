@@ -10,5 +10,5 @@ def test_healthz_reports_ok(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["component"] == "hemisphere-driver"
+    assert body["component"] == "inference-driver"
     assert body["version"]

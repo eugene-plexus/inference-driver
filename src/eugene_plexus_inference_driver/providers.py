@@ -38,7 +38,7 @@ class Provider:
 
     engine_class: Any
     """Which engine class talks to this provider's backend. Typed as
-    `Any` rather than `type[HemisphereEngine]` because Python Protocol
+    `Any` rather than `type[BackendEngine]` because Python Protocol
     classes are invariant in `type[]` and concrete engine classes
     don't unify under a single Protocol subtype — runtime correctness
     is enforced by the engines all implementing the protocol shape."""

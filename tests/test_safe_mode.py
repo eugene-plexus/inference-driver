@@ -1,7 +1,7 @@
 """Tests for the watchdog safe-mode contract.
 
-Per specs/openapi/hemisphere-driver.yaml: when started with
-`EUGENE_PLEXUS_HD_SAFE_MODE=1` the driver must
+Per specs/openapi/inference-driver.yaml: when started with
+`EUGENE_PLEXUS_DRIVER_SAFE_MODE=1` the driver must
 
   - skip loading its persisted config file (defaults only)
   - still expose /v1/config endpoints (operator can repair via UI)
@@ -20,8 +20,8 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_hemisphere_driver.app import create_app
-from eugene_plexus_hemisphere_driver.settings import Settings
+from eugene_plexus_inference_driver.app import create_app
+from eugene_plexus_inference_driver.settings import Settings
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Eugene Plexus / hemisphere-driver! -->
+<!-- Thanks for contributing to Eugene Plexus / inference-driver! -->
 
 ## Summary
 

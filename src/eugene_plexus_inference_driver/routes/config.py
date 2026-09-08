@@ -69,7 +69,7 @@ async def test_config(
     except Exception as e:
         return ConfigTestResult(
             ok=False,
-            component="hemisphere-driver",
+            component="inference-driver",
             latencyMs=int((time.perf_counter() - start) * 1000),
             error=f"engine construction failed: {e}",
         )
@@ -82,7 +82,7 @@ async def test_config(
     except Exception as e:
         return ConfigTestResult(
             ok=False,
-            component="hemisphere-driver",
+            component="inference-driver",
             latencyMs=int((time.perf_counter() - start) * 1000),
             error=f"{engine.backend_kind.value} generate failed: {e}",
         )
@@ -90,7 +90,7 @@ async def test_config(
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     return ConfigTestResult(
         ok=True,
-        component="hemisphere-driver",
+        component="inference-driver",
         latencyMs=elapsed_ms,
         summary=f"{engine.backend_kind.value} responded in {response.latencyMs or 0}ms.",
         sampleOutput=response.content[:200],

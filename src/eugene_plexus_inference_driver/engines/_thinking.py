@@ -16,7 +16,7 @@ in v0.3+) will read the same `thinkingMode` field and translate to
 their per-request budget knob instead of mutating the prompt.
 
 The directive is appended to the first system message — if the
-orchestrator didn't supply one, we prepend a system message carrying
+gateway didn't supply one, we prepend a system message carrying
 just the directive.
 """
 
@@ -76,7 +76,7 @@ def apply_thinking_mode(messages: list[Message], thinking_mode: str | None) -> l
         return list(messages)
 
     out = list(messages)
-    # Append the directive to the FIRST system message (the orchestrator's
+    # Append the directive to the FIRST system message (the gateway's
     # bicameral preamble lives there). If there's no system message, push
     # one onto the front carrying just the directive.
     for i, msg in enumerate(out):

@@ -17,7 +17,7 @@ text content, and pull the final `usage` from `turn.completed`.
 
 Sandbox is `read-only` and `--ephemeral` so codex doesn't try to mutate the
 working tree or persist session state. `--skip-git-repo-check` allows the
-hemisphere-driver process to run outside a repo.
+inference-driver process to run outside a repo.
 
 ## Known limitations vs the Claude Code adapter
 
@@ -135,7 +135,7 @@ class CodexCliEngine:
         argv = self._build_argv(flattened_prompt)
 
         # DEBUG-level full-payload trace. CLI adapters flatten the
-        # orchestrator's structured message list into a single labeled
+        # gateway's structured message list into a single labeled
         # transcript string before sending — the operator's copy-trace
         # shows the pre-flattening shape, this shows what actually
         # reaches the model.
@@ -212,7 +212,7 @@ class CodexCliEngine:
 
     async def stream(self, request: GenerateRequest) -> AsyncIterator[object]:
         # Codex's --json mode is already a streamable JSONL feed; wiring it
-        # through end-to-end waits on a real consumer (orchestrator + ui).
+        # through end-to-end waits on a real consumer (gateway + ui).
         raise NotImplementedError("CodexCliEngine.stream not implemented in v0.1")
         yield  # pragma: no cover
 

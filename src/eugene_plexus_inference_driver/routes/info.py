@@ -47,11 +47,11 @@ async def info(request: Request) -> DriverInfo:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/hemisphere-driver#config-invalid",
+                type="https://github.com/eugene-plexus/inference-driver#config-invalid",
                 title="Configuration invalid",
                 status=503,
                 detail=f"provider config value is invalid: {e}",
-                component="hemisphere-driver:degraded",
+                component="inference-driver:degraded",
             ).model_dump(exclude_none=True),
         ) from e
 

@@ -13,7 +13,7 @@ from . import __version__
 from .auth_state import load_auth_state
 from .config import ConfigStore
 from .dependencies import require_authorized, require_operator
-from .engines.base import HemisphereEngine
+from .engines.base import BackendEngine
 from .providers import get_provider
 from .routes import admin as admin_routes
 from .routes import config as config_routes
@@ -25,7 +25,7 @@ from .settings import Settings, load_settings
 log = logging.getLogger(__name__)
 
 
-def build_engine_with(get: Callable[[str], Any]) -> HemisphereEngine:
+def build_engine_with(get: Callable[[str], Any]) -> BackendEngine:
     """Construct an engine from a key->value getter.
 
     Reads `provider` from the getter, looks up its registry entry, and
@@ -40,12 +40,12 @@ def build_engine_with(get: Callable[[str], Any]) -> HemisphereEngine:
     provider = get_provider(provider_key)
     # `engine_class` is `Any` in the registry (Protocol classes are
     # invariant in `type[]`), but every registered class implements
-    # `HemisphereEngine` — annotate the return through a local cast.
-    engine: HemisphereEngine = provider.engine_class.from_config(get, **provider.engine_kwargs)
+    # `BackendEngine` — annotate the return through a local cast.
+    engine: BackendEngine = provider.engine_class.from_config(get, **provider.engine_kwargs)
     return engine
 
 
-def build_engine(store: ConfigStore) -> HemisphereEngine:
+def build_engine(store: ConfigStore) -> BackendEngine:
     """Construct the configured engine from the runtime config store."""
     return build_engine_with(store.get)
 
@@ -72,7 +72,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # to disk, so the operator's repair survives the next boot. No
         # engine is constructed — /v1/generate reports degraded.
         log.warning(
-            "starting in SAFE MODE (EUGENE_PLEXUS_HD_SAFE_MODE=1); ignoring "
+            "starting in SAFE MODE (EUGENE_PLEXUS_DRIVER_SAFE_MODE=1); ignoring "
             "%s and running on defaults. Fix config via /v1/config, then "
             "restart without the env var.",
             settings.config_file,
@@ -139,8 +139,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
 
     app = FastAPI(
-        title="Eugene Plexus — hemisphere-driver",
-        description="One half of an Eugene Plexus bicameral pair.",
+        title="Eugene Plexus — inference-driver",
+        description="A uniform HTTP surface over one model backend.",
         version=__version__,
         lifespan=_lifespan,
     )
@@ -151,8 +151,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_routes.router)
 
     # Mixed surfaces: /v1/info backs UI model dropdowns (operator) and
-    # orchestrator health checks (service); /v1/generate is called by
-    # the orchestrator (service:orchestrator) but operators can hit it
+    # gateway health checks (service); /v1/generate is called by
+    # the gateway (service:gateway) but operators can hit it
     # too for one-off testing.
     authorized = [Depends(require_authorized)]
     app.include_router(info_routes.router, dependencies=authorized)

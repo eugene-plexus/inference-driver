@@ -3,16 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "eugene-plexus-hemisphere-driver"
+name = "eugene-plexus-inference-driver"
 version = "0.1.0"
-description = "One half of an Eugene Plexus bicameral pair: a uniform HTTP wrapper around a single LLM backend (Claude Code CLI, Codex CLI, or API)."
+description = "Eugene Plexus inference-driver: a uniform HTTP surface over one model backend. One instance per backend — local engine, hosted API, or subscription CLI."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
 authors = [
     { name = "Eugene Plexus contributors" },
 ]
-keywords = ["eugene-plexus", "llm", "fastapi", "consciousness", "bicameral"]
+keywords = ["eugene-plexus", "llm", "inference", "llama-cpp", "openai-compatible", "fastapi"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: FastAPI",
@@ -45,15 +45,15 @@ dev = [
 ]
 
 [project.scripts]
-eugene-plexus-hemisphere-driver = "eugene_plexus_hemisphere_driver.__main__:main"
+eugene-plexus-inference-driver = "eugene_plexus_inference_driver.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/eugene-plexus"
-Repository = "https://github.com/eugene-plexus/hemisphere-driver"
+Repository = "https://github.com/eugene-plexus/inference-driver"
 Specs = "https://github.com/eugene-plexus/specs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/eugene_plexus_hemisphere_driver"]
+packages = ["src/eugene_plexus_inference_driver"]
 
 # -----------------------------------------------------------------------------
 # Ruff (linter + formatter)
@@ -62,7 +62,7 @@ packages = ["src/eugene_plexus_hemisphere_driver"]
 line-length = 100
 target-version = "py312"
 extend-exclude = [
-    "src/eugene_plexus_hemisphere_driver/_generated",
+    "src/eugene_plexus_inference_driver/_generated",
 ]
 
 [tool.ruff.lint]
@@ -82,7 +82,7 @@ ignore = []
 # FastAPI uses Depends() as an argument default, which is the framework's
 # idiom for dependency injection but trips ruff's "no function calls in
 # defaults" rule. Allow it only in the dependency module that defines them.
-"src/eugene_plexus_hemisphere_driver/dependencies.py" = ["B008"]
+"src/eugene_plexus_inference_driver/dependencies.py" = ["B008"]
 
 # -----------------------------------------------------------------------------
 # Mypy
@@ -104,11 +104,11 @@ disallow_untyped_defs = true
 no_implicit_optional = true
 check_untyped_defs = true
 exclude = [
-    "src/eugene_plexus_hemisphere_driver/_generated",
+    "src/eugene_plexus_inference_driver/_generated",
 ]
 
 [[tool.mypy.overrides]]
-module = "eugene_plexus_hemisphere_driver._generated.*"
+module = "eugene_plexus_inference_driver._generated.*"
 ignore_errors = true
 
 # -----------------------------------------------------------------------------

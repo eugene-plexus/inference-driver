@@ -247,7 +247,7 @@ class OpenAiCompatibleHttpEngine:
         if request.stop:
             payload["stop"] = list(request.stop)
 
-        # DEBUG-level full-payload trace. The orchestrator's copy-trace
+        # DEBUG-level full-payload trace. The gateway's copy-trace
         # captures what we sent it; this captures what WE send upstream
         # (post role-coercion, post-thinking-directive injection,
         # post-param-shaping). When operators flip to DEBUG to chase
@@ -331,7 +331,7 @@ class OpenAiCompatibleHttpEngine:
 
     async def stream(self, request: GenerateRequest) -> AsyncIterator[object]:
         # SSE streaming via stream=true is supported by the wire shape
-        # but no consumer of hemisphere-driver streaming exists yet.
+        # but no consumer of inference-driver streaming exists yet.
         raise NotImplementedError("OpenAiCompatibleHttpEngine.stream not implemented in v0.1")
         yield  # pragma: no cover
 

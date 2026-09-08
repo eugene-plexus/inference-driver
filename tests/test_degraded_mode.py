@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_hemisphere_driver.app import create_app
-from eugene_plexus_hemisphere_driver.settings import Settings
+from eugene_plexus_inference_driver.app import create_app
+from eugene_plexus_inference_driver.settings import Settings
 
 
 @pytest.fixture
@@ -58,7 +58,7 @@ def test_config_endpoints_work_in_degraded_mode(degraded_app_settings: Settings)
     with TestClient(app) as client:
         schema = client.get("/v1/config/schema")
         assert schema.status_code == 200
-        assert schema.json()["component"] == "hemisphere-driver"
+        assert schema.json()["component"] == "inference-driver"
 
         doc = client.get("/v1/config")
         assert doc.status_code == 200

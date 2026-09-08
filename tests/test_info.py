@@ -11,5 +11,5 @@ def test_info_reports_configured_backend(client: TestClient) -> None:
     body = response.json()
     assert body["backend"] == "claude_code_cli"
     assert body["version"]
-    # Driver does not self-assert identity; the orchestrator labels it.
+    # Driver does not self-assert identity; the gateway labels it.
     assert "hemisphere" not in body

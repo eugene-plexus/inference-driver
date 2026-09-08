@@ -1,4 +1,4 @@
-"""Tests for v0.2 bearer auth on the hemisphere-driver.
+"""Tests for v0.2 bearer auth on the inference-driver.
 
 Verify-only role — the watchdog issues tokens; this component just
 validates them. Tests construct JWTs directly via PyJWT against a
@@ -23,9 +23,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_hemisphere_driver.app import create_app
-from eugene_plexus_hemisphere_driver.auth_state import AuthState
-from eugene_plexus_hemisphere_driver.settings import Settings
+from eugene_plexus_inference_driver.app import create_app
+from eugene_plexus_inference_driver.auth_state import AuthState
+from eugene_plexus_inference_driver.settings import Settings
 
 _JWT_ALG = "HS256"
 
@@ -63,8 +63,8 @@ def authed_app(tmp_path: Path, signing_key: bytes) -> FastAPI:
         signing_key=signing_key,
         service_token=_issue(
             signing_key=signing_key,
-            sub="hemisphere-driver",
-            aud="service:hemisphere-driver",
+            sub="inference-driver",
+            aud="service:inference-driver",
             ttl_seconds=365 * 24 * 3600,
         ),
         master_key=None,
@@ -85,8 +85,8 @@ def operator_token(signing_key: bytes) -> str:
 
 @pytest.fixture
 def orchestrator_service_token(signing_key: bytes) -> str:
-    """A typical inbound: orchestrator calling /v1/generate."""
-    return _issue(signing_key=signing_key, sub="orchestrator", aud="service:orchestrator")
+    """A typical inbound: gateway calling /v1/generate."""
+    return _issue(signing_key=signing_key, sub="gateway", aud="service:gateway")
 
 
 # --------------------------------------------------------------------------- #
@@ -120,7 +120,7 @@ def test_healthz_is_always_open(authed_client: TestClient) -> None:
 def test_missing_bearer_rejects_with_401(authed_client: TestClient) -> None:
     response = authed_client.get("/v1/config")
     assert response.status_code == 401
-    assert response.json()["detail"]["component"] == "hemisphere-driver"
+    assert response.json()["detail"]["component"] == "inference-driver"
 
 
 def test_wrong_signing_key_rejects(authed_client: TestClient) -> None:
@@ -180,7 +180,7 @@ def test_operator_token_accepted_on_config_patch(
 def test_service_token_rejected_on_config_patch(
     authed_client: TestClient, orchestrator_service_token: str
 ) -> None:
-    """A compromised orchestrator must not be able to rewrite the
+    """A compromised gateway must not be able to rewrite the
     driver's config — operator audience only."""
     response = authed_client.patch(
         "/v1/config",
@@ -203,7 +203,7 @@ def test_service_token_rejected_on_admin_restart(
 def test_service_token_accepted_on_info(
     authed_client: TestClient, orchestrator_service_token: str
 ) -> None:
-    """The orchestrator's drivers-list probe authenticates with a
+    """The gateway's drivers-list probe authenticates with a
     service token to read /v1/info. Must work."""
     response = authed_client.get(
         "/v1/info",
@@ -228,7 +228,7 @@ def test_operator_token_accepted_on_info(authed_client: TestClient, operator_tok
 
 
 def test_load_auth_state_disabled_when_no_signing_key() -> None:
-    from eugene_plexus_hemisphere_driver.auth_state import load_auth_state
+    from eugene_plexus_inference_driver.auth_state import load_auth_state
 
     state = load_auth_state(signing_key_b64=None, service_token=None, master_key_b64=None)
     assert state.auth_disabled is True
@@ -236,7 +236,7 @@ def test_load_auth_state_disabled_when_no_signing_key() -> None:
 
 def test_load_auth_state_rejects_partial_auth() -> None:
     """SERVICE_TOKEN without AUTH_SIGNING_KEY is a configuration bug."""
-    from eugene_plexus_hemisphere_driver.auth_state import load_auth_state
+    from eugene_plexus_inference_driver.auth_state import load_auth_state
 
     with pytest.raises(ValueError, match="inconsistent"):
         load_auth_state(
@@ -249,13 +249,13 @@ def test_load_auth_state_rejects_partial_auth() -> None:
 def test_load_auth_state_allows_signing_key_without_service_token(
     signing_key: bytes,
 ) -> None:
-    """Unlike the orchestrator, the hemisphere-driver doesn't need a
+    """Unlike the gateway, the inference-driver doesn't need a
     service token for outbound calls. AUTH_SIGNING_KEY alone is a valid
     posture — the driver can validate inbound traffic without ever
     needing to authenticate outbound."""
     import base64
 
-    from eugene_plexus_hemisphere_driver.auth_state import load_auth_state
+    from eugene_plexus_inference_driver.auth_state import load_auth_state
 
     state = load_auth_state(
         signing_key_b64=base64.b64encode(signing_key).decode("ascii"),
@@ -270,7 +270,7 @@ def test_load_auth_state_allows_signing_key_without_service_token(
 def test_load_auth_state_rejects_wrong_length_signing_key() -> None:
     import base64
 
-    from eugene_plexus_hemisphere_driver.auth_state import load_auth_state
+    from eugene_plexus_inference_driver.auth_state import load_auth_state
 
     short = base64.b64encode(b"\x00" * 16).decode("ascii")
     with pytest.raises(ValueError, match="32 bytes"):

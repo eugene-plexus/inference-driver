@@ -1,26 +1,34 @@
-# Eugene Plexus — `hemisphere-driver`
+# Eugene Plexus — `inference-driver`
 
-[![CI](https://github.com/eugene-plexus/hemisphere-driver/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eugene-plexus/hemisphere-driver/actions/workflows/ci.yml)
+[![CI](https://github.com/eugene-plexus/inference-driver/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eugene-plexus/inference-driver/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB.svg)](https://www.python.org)
 
-A uniform HTTP wrapper around a single LLM backend, used by the [Eugene Plexus](https://github.com/eugene-plexus) orchestrator to drive bicameral chat.
+A uniform HTTP surface over **one** model backend, for the [Eugene Plexus](https://github.com/eugene-plexus) control plane.
 
-The orchestrator runs **at least two** instances of this service side-by-side (v0.1 pairs them; v0.2+ generalizes to N with backup/failover), typically configured with different model families on different instances — Claude on one side, GPT on the other, a local OSS model as a third — so the bicameral pass produces genuine cross-vendor disagreement rather than two echoes of the same RLHF distribution.
+An install runs **N instances, one per backend**, with the [`gateway`](https://github.com/eugene-plexus/gateway) routing above them. A backend is any of:
+
+- a local engine speaking OpenAI-compatible HTTP — llama.cpp's `llama-server`, vLLM, LM Studio, Ollama
+- a hosted API — Anthropic, OpenAI, xAI, OpenRouter
+- a subprocess CLI riding a subscription you already pay for — `claude_code_cli`, `codex_cli`
+
+That last kind is why this is a separate process rather than something folded into the gateway: a CLI has no HTTP endpoint to proxy to, so *something* has to front it, and normalising every backend through one surface is cheaper than special-casing the ones that can't be proxied. It's also what lets a driver run next to its engine on a remote GPU host while the gateway reaches it over the tailnet.
 
 ## What this service is — and what it isn't
 
-A hemisphere-driver is **anonymous and stateless**. It wraps one LLM backend and serves `POST /v1/generate`. It doesn't know its position in any topology — no "left" / "right", no "primary" / "backup". The orchestrator owns the topology: it has a `drivers` config listing each driver's URL and operator-supplied name, and stamps that name onto every message a driver produces. Driver instances are interchangeable from outside; only the orchestrator knows which one it just labelled "left".
+A driver is **anonymous and stateless**. It wraps one backend, serves `POST /v1/generate`, and does not know its position in any topology. Its operator-supplied name lives in the watchdog topology; the gateway learns what this driver *serves* by reading `GET /v1/info` and routes on that.
 
-This means a hemisphere-driver also doesn't decide LLM-output-affecting parameters (temperature, max tokens, etc.). The orchestrator owns those and supplies them on every request — in v0.2+ they'll be NT-modulated per-pass-per-driver. The driver applies what it's given and never substitutes a local default.
+It also decides **no** output-affecting parameter. Temperature, max tokens and stop sequences arrive on the request or are not sent to the backend at all — the gateway owns them and resolves them from the model's settings profile. The driver applies what it's given and never substitutes a local default.
+
+Correspondingly it **never refuses a model.** A backend that rejects `temperature`, as some reasoning models do, gets the unsupported parameter dropped and a warning logged — not a failed construction. You own the model; routing to it is the whole job.
 
 ## Status
 
-**v0.1, working.** The HTTP surface, config protocol with `/v1/config/test`, and three adapters (`claude_code_cli`, `codex_cli`, `openai_api`) are wired up end-to-end. Streaming (`/v1/generate/stream`) is still a 501 stub — it lands alongside the orchestrator + UI consumers.
+**v0.1, working.** The HTTP surface, config protocol with `/v1/config/test`, and three adapters (`claude_code_cli`, `codex_cli`, `openai_api`) are wired up end-to-end. Streaming (`/v1/generate/stream`) is still a 501 stub — it lands alongside the gateway + UI consumers.
 
 ## Wire contract
 
-This service implements the [`hemisphere-driver.yaml`](https://github.com/eugene-plexus/specs/blob/main/openapi/hemisphere-driver.yaml) OpenAPI 3.1 spec from the [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) repo. Pydantic models in `src/eugene_plexus_hemisphere_driver/_generated/` are produced via codegen (see [Codegen](#codegen)).
+This service implements the [`inference-driver.yaml`](https://github.com/eugene-plexus/specs/blob/main/openapi/inference-driver.yaml) OpenAPI 3.1 spec from the [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) repo. Pydantic models in `src/eugene_plexus_inference_driver/_generated/` are produced via codegen (see [Codegen](#codegen)).
 
 Endpoints:
 
@@ -37,7 +45,7 @@ Endpoints:
 
 ## Backends (adapters)
 
-v0.1 ships with three adapter classes plus a provider registry. The orchestrator-facing config picks a `provider` (e.g. `claude_subscription`, `openai`, `minimax`, `ollama_local`); the registry maps each provider to the right adapter with the right base URL.
+v0.1 ships with three adapter classes plus a provider registry. The gateway-facing config picks a `provider` (e.g. `claude_subscription`, `openai`, `minimax`, `ollama_local`); the registry maps each provider to the right adapter with the right base URL.
 
 | Adapter                | Providers it serves | Notes |
 |------------------------|---------------------|-------|
@@ -54,14 +62,14 @@ The CLI adapters are **primary production mode for personal installations** — 
 
 ```bash
 pip install -e ".[dev]"
-python -m eugene_plexus_hemisphere_driver
+python -m eugene_plexus_inference_driver
 ```
 
-By default it listens on `http://127.0.0.1:8081`, overridable via `EUGENE_PLEXUS_HD_BIND_PORT` (the watchdog uses this when supervising). Configure runtime behavior via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
+By default it listens on `http://127.0.0.1:8081`, overridable via `EUGENE_PLEXUS_DRIVER_BIND_PORT` (the watchdog uses this when supervising). Configure runtime behavior via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
 
-### Pairing with the orchestrator
+### Pairing with the gateway
 
-Run two driver instances on different ports — typically 8081 and 8082 — each with a different `adapter` config. Then point the orchestrator's `drivers` config at both:
+Run two driver instances on different ports — typically 8081 and 8082 — each with a different `adapter` config. Then point the gateway's `drivers` config at both:
 
 ```yaml
 drivers:
@@ -71,7 +79,7 @@ drivers:
     url: http://127.0.0.1:8082
 ```
 
-The orchestrator's UI exposes a per-driver Test button that calls each driver's `/v1/info` so you can verify the URLs are reachable before saving.
+The gateway's UI exposes a per-driver Test button that calls each driver's `/v1/info` so you can verify the URLs are reachable before saving.
 
 ### Configuration
 
@@ -95,7 +103,7 @@ Pydantic models for the wire contract are generated from the pinned commit of `e
 python scripts/codegen.py
 ```
 
-The script downloads the specs at the pinned SHA, runs `datamodel-code-generator` against them, and writes Pydantic v2 models to `src/eugene_plexus_hemisphere_driver/_generated/`. **The generated files are committed** so builds are reproducible without network access. CI re-runs codegen and fails the build if the working tree differs.
+The script downloads the specs at the pinned SHA, runs `datamodel-code-generator` against them, and writes Pydantic v2 models to `src/eugene_plexus_inference_driver/_generated/`. **The generated files are committed** so builds are reproducible without network access. CI re-runs codegen and fails the build if the working tree differs.
 
 To bump to a newer specs commit:
 
@@ -122,10 +130,10 @@ mypy src/
 pytest
 
 # Codegen freshness
-python scripts/codegen.py && git diff --exit-code src/eugene_plexus_hemisphere_driver/_generated/
+python scripts/codegen.py && git diff --exit-code src/eugene_plexus_inference_driver/_generated/
 ```
 
-The test suite (35 tests, ~1s) covers the HTTP surface, the config protocol, all three adapters' shape adaptation, degraded-mode startup, and a UTF-8 round-trip pinning the subprocess encoding fix on Windows. CLI live-fire tests are gated behind `EUGENE_PLEXUS_HD_LIVE_CLI=1` and the API live-fire test behind `EUGENE_PLEXUS_HD_LIVE_API=1`.
+The test suite (35 tests, ~1s) covers the HTTP surface, the config protocol, all three adapters' shape adaptation, degraded-mode startup, and a UTF-8 round-trip pinning the subprocess encoding fix on Windows. CLI live-fire tests are gated behind `EUGENE_PLEXUS_DRIVER_LIVE_CLI=1` and the API live-fire test behind `EUGENE_PLEXUS_DRIVER_LIVE_API=1`.
 
 ## License
 

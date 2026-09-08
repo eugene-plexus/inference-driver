@@ -14,7 +14,7 @@ router = APIRouter(tags=["meta"])
 async def healthz(request: Request) -> Health:
     # The driver always serves /healthz so config endpoints stay reachable.
     # When adapter init failed at startup, surface that as `degraded` so
-    # consumers (UI, orchestrator) can tell the driver is alive but can't
+    # consumers (UI, gateway) can tell the driver is alive but can't
     # generate anything until the operator fixes config.
     adapter = getattr(request.app.state, "adapter", None)
     adapter_error = getattr(request.app.state, "adapter_error", None)
@@ -24,7 +24,7 @@ async def healthz(request: Request) -> Health:
         return Health(
             status=Status.degraded,
             version=__version__,
-            component="hemisphere-driver",
+            component="inference-driver",
             safeMode=safe_mode,
             details={"adapter_error": adapter_error},
         )
@@ -32,6 +32,6 @@ async def healthz(request: Request) -> Health:
     return Health(
         status=Status.ok,
         version=__version__,
-        component="hemisphere-driver",
+        component="inference-driver",
         safeMode=False,
     )

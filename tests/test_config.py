@@ -9,7 +9,7 @@ def test_get_config_schema_lists_expected_fields(client: TestClient) -> None:
     response = client.get("/v1/config/schema")
     assert response.status_code == 200
     body = response.json()
-    assert body["component"] == "hemisphere-driver"
+    assert body["component"] == "inference-driver"
 
     field_keys = {f["key"] for f in body["fields"]}
     expected = {
@@ -24,10 +24,10 @@ def test_get_config_schema_lists_expected_fields(client: TestClient) -> None:
     }
     assert expected.issubset(field_keys)
     # LLM-output-affecting params (temperature, max-tokens, etc.) are
-    # owned by the orchestrator and never appear on the driver schema.
+    # owned by the gateway and never appear on the driver schema.
     assert "defaultTemperature" not in field_keys
     assert "defaultMaxTokens" not in field_keys
-    # Driver no longer self-asserts identity — the orchestrator labels
+    # Driver no longer self-asserts identity — the gateway labels
     # it via the `drivers` config and the `driverName` it stamps on
     # every emitted message.
     assert "hemisphere" not in field_keys
@@ -53,7 +53,7 @@ def test_get_config_returns_defaults_on_first_run(client: TestClient) -> None:
     doc = response.json()
     assert doc["provider"] == "claude_subscription"
     # `port` is no longer a config field — owned by the watchdog topology
-    # via EUGENE_PLEXUS_HD_BIND_PORT. Both legacy keys are rejected.
+    # via EUGENE_PLEXUS_DRIVER_BIND_PORT. Both legacy keys are rejected.
     assert "port" not in doc
     assert "hemisphere" not in doc
     assert "adapter" not in doc  # renamed to provider
@@ -115,7 +115,7 @@ def test_schema_modelid_carries_suggestions_when_models_available() -> None:
     an id the driver hasn't fetched yet (Ollama just-pulled, custom
     endpoint, etc.); the UI renders the suggestions as a combobox
     dropdown next to the input."""
-    from eugene_plexus_hemisphere_driver.config import as_schema
+    from eugene_plexus_inference_driver.config import as_schema
 
     schema = as_schema(available_models=["claude-opus-4-7", "claude-sonnet-4-7"])
     model_field = next(f for f in schema.fields if f.key == "modelId")
@@ -129,7 +129,7 @@ def test_schema_modelid_carries_suggestions_when_models_available() -> None:
 def test_schema_modelid_stays_string_without_models() -> None:
     """Empty / missing list → free-text input. Belt-and-suspenders for
     the fallback path the schema route uses in degraded mode."""
-    from eugene_plexus_hemisphere_driver.config import as_schema
+    from eugene_plexus_inference_driver.config import as_schema
 
     schema = as_schema(available_models=None)
     model_field = next(f for f in schema.fields if f.key == "modelId")

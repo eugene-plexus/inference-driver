@@ -1,6 +1,6 @@
 """FastAPI dependencies for v0.2 bearer auth.
 
-Same shape as the orchestrator: `require_authorized` accepts operator
+Same shape as the gateway: `require_authorized` accepts operator
 OR any `service:*` audience; `require_operator` accepts operator only.
 Both pass-through when `AuthState.auth_disabled` is true (the dev
 path). All auth-rejection paths produce 7807-style Problem JSON so
@@ -24,11 +24,11 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail=Problem(
-            type=f"https://github.com/eugene-plexus/hemisphere-driver#{slug}",
+            type=f"https://github.com/eugene-plexus/inference-driver#{slug}",
             title=title,
             status=status_code,
             detail=detail,
-            component="hemisphere-driver",
+            component="inference-driver",
         ).model_dump(exclude_none=True),
     )
 

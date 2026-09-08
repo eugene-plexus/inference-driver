@@ -3,7 +3,7 @@
 Reads `SPECS_REF` (a single line: the git SHA of `eugene-plexus/specs`),
 downloads the OpenAPI tree at that SHA, and runs `datamodel-code-generator`
 to produce Pydantic v2 models under
-`src/eugene_plexus_hemisphere_driver/_generated/`.
+`src/eugene_plexus_inference_driver/_generated/`.
 
 The generated files are committed to the repo so builds are reproducible
 without network access. CI re-runs this script and fails the build if the
@@ -27,16 +27,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPECS_REF_FILE = REPO_ROOT / "SPECS_REF"
-GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_hemisphere_driver" / "_generated"
+GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_inference_driver" / "_generated"
 WORKING_DIR = REPO_ROOT / ".codegen-cache"
 
 SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{ref}.tar.gz"
 
 # datamodel-code-generator follows local $refs, so generating from
-# hemisphere-driver.yaml alone pulls in everything it needs from
+# inference-driver.yaml alone pulls in everything it needs from
 # components/common.yaml. One input, one output module: simpler imports.
 SPECS_TO_GENERATE = [
-    ("openapi/hemisphere-driver.yaml", "models.py"),
+    ("openapi/inference-driver.yaml", "models.py"),
 ]
 
 

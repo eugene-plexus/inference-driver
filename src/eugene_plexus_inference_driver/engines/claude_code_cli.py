@@ -150,7 +150,7 @@ class ClaudeCodeCliEngine:
         argv = self._build_argv(system_prompt=system_prompt)
 
         # DEBUG-level full-payload trace. CLI adapters flatten the
-        # orchestrator's structured message list into a single labeled
+        # gateway's structured message list into a single labeled
         # transcript string before sending — the operator's copy-trace
         # shows the pre-flattening shape, this shows what actually
         # reaches the model.
@@ -216,7 +216,7 @@ class ClaudeCodeCliEngine:
     async def stream(self, request: GenerateRequest) -> AsyncIterator[object]:
         # Claude Code CLI does support streaming via
         # --output-format stream-json --include-partial-messages, but no
-        # consumer of hemisphere-driver streaming exists yet.
+        # consumer of inference-driver streaming exists yet.
         raise NotImplementedError("ClaudeCodeCliEngine.stream not implemented in v0.1")
         yield  # pragma: no cover
 

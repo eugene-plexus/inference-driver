@@ -1,16 +1,16 @@
-"""Auth state for the hemisphere-driver's verify-only role.
+"""Auth state for the inference-driver's verify-only role.
 
 Built once at startup from the env vars the watchdog threads in when
 it spawns this child:
 
-  * `EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
+  * `EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
     key used to validate inbound bearer tokens.
-  * `EUGENE_PLEXUS_HD_SERVICE_TOKEN` — long-lived JWT (`aud:
-    service:hemisphere-driver`). The hemisphere-driver currently
+  * `EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN` — long-lived JWT (`aud:
+    service:inference-driver`). The inference-driver currently
     makes no outbound calls to peer components (LLM backend calls are
     a separate trust boundary), so this is captured but unused in
     v0.2. Reserved for v0.3 if hemispheres start reading memory.
-  * `EUGENE_PLEXUS_HD_MASTER_KEY` — base64 of the 32-byte secretbox
+  * `EUGENE_PLEXUS_DRIVER_MASTER_KEY` — base64 of the 32-byte secretbox
     key. Used by Phase 6 to decrypt the at-rest envelope around
     `apiKey` config values; not consumed in this phase.
 
@@ -89,7 +89,7 @@ def load_auth_state(
                 "AUTH_SIGNING_KEY is not — refusing to start in a partially-auth state"
             )
         log.warning(
-            "EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY not set — running unauthenticated "
+            "EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY not set — running unauthenticated "
             "(dev/standalone mode). Production spawns via watchdog always supply this."
         )
         return AuthState(signing_key=None, service_token=None, master_key=None)

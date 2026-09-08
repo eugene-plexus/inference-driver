@@ -1,4 +1,4 @@
-"""HemisphereEngine — uniform contract every backend implementation honors.
+"""BackendEngine — uniform contract every backend implementation honors.
 
 An *engine* is the protocol-level adapter: how this driver talks to its
 backend (HTTP, subprocess, whatever). The user-facing concept is the
@@ -6,7 +6,7 @@ backend (HTTP, subprocess, whatever). The user-facing concept is the
 in `providers.py` declares which engine to use and any
 provider-specific knobs (deny patterns, default URLs, friendly labels).
 
-Engines are stateless: the orchestrator owns conversation state and
+Engines are stateless: the gateway owns conversation state and
 passes the full prompt every call. Each engine knows how to:
 
   - declare its own config fields (`field_specs`)
@@ -33,7 +33,7 @@ from .._generated.models import (
 
 
 class StreamChunk(Protocol):
-    """One event in the SSE stream emitted by `HemisphereEngine.stream`."""
+    """One event in the SSE stream emitted by `BackendEngine.stream`."""
 
     text: str
     """The newly-generated text fragment for this event. Empty for non-token events."""
@@ -45,7 +45,7 @@ class StreamChunk(Protocol):
     """Set on the final event, capturing the assembled response and usage."""
 
 
-class HemisphereEngine(Protocol):
+class BackendEngine(Protocol):
     """The interface every backend implementation honors.
 
     Engines are constructed once at process startup based on the
@@ -68,7 +68,7 @@ class HemisphereEngine(Protocol):
         ...
 
     @classmethod
-    def from_config(cls, get: Any, **provider_kwargs: Any) -> HemisphereEngine:
+    def from_config(cls, get: Any, **provider_kwargs: Any) -> BackendEngine:
         """Construct from a `key -> value` getter (which transparently
         merges runtime config + transient overrides). `provider_kwargs`
         carries any provider-specific knobs the registry pinned for

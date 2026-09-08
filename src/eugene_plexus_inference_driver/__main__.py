@@ -1,4 +1,4 @@
-"""Entrypoint: `python -m eugene_plexus_hemisphere_driver`."""
+"""Entrypoint: `python -m eugene_plexus_inference_driver`."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ _DEFAULT_PORT = 8081
 def _resolve_port(bootstrap_store: ConfigStore) -> int:
     """Resolution order, highest precedence first:
 
-    1. `EUGENE_PLEXUS_HD_BIND_PORT` env var — the watchdog sets this when
+    1. `EUGENE_PLEXUS_DRIVER_BIND_PORT` env var — the watchdog sets this when
        it spawns the driver, parsed from the topology's component URL.
        Watchdog-supervised installs always hit this branch.
     2. Built-in default (8081). Used when running the driver standalone
@@ -28,7 +28,7 @@ def _resolve_port(bootstrap_store: ConfigStore) -> int:
        per-driver config file; it's gone now (one source of truth: the
        watchdog topology owns ports).
     """
-    env_port = os.environ.get("EUGENE_PLEXUS_HD_BIND_PORT")
+    env_port = os.environ.get("EUGENE_PLEXUS_DRIVER_BIND_PORT")
     if env_port:
         return int(env_port)
     return _DEFAULT_PORT
