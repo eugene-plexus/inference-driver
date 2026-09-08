@@ -21,7 +21,7 @@ from ._generated.models import BackendKind, ConfigField
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
 from .engines.openai_compat_http import (
-    OPENAI_DENY_PATTERN,
+    OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
 )
 
@@ -78,11 +78,11 @@ def _custom_base_url_field() -> list[ConfigField]:
     ]
 
 
-# Future xAI deny pattern lives here for symmetry — Grok models that
-# reject temperature would land here. Empty for now since Grok-2 / 3 / 4
-# all support temperature; revisit if xAI ships a reasoning-only variant
-# that doesn't.
-_XAI_DENY_PATTERN: re.Pattern[str] | None = None
+# Future xAI fixed-temperature pattern lives here for symmetry — Grok
+# models that reject temperature would land here. Empty for now since
+# Grok-2 / 3 / 4 all support temperature; revisit if xAI ships a
+# reasoning-only variant that doesn't.
+_XAI_FIXED_TEMPERATURE_PATTERN: re.Pattern[str] | None = None
 
 # Provider registry. The dict order is the order entries appear in the
 # UI dropdown — group personal-subscription engines first, then OpenAI
@@ -105,7 +105,7 @@ PROVIDERS: dict[str, Provider] = {
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
             "default_base_url": "https://api.openai.com",
-            "deny_pattern": OPENAI_DENY_PATTERN,
+            "fixed_temperature_pattern": OPENAI_FIXED_TEMPERATURE_PATTERN,
             "backend_kind": BackendKind.openai_api,
         },
     ),
@@ -115,7 +115,7 @@ PROVIDERS: dict[str, Provider] = {
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
             "default_base_url": "https://api.x.ai",
-            "deny_pattern": _XAI_DENY_PATTERN,
+            "fixed_temperature_pattern": _XAI_FIXED_TEMPERATURE_PATTERN,
             "backend_kind": BackendKind.openai_compat_http,
         },
     ),
@@ -130,7 +130,7 @@ PROVIDERS: dict[str, Provider] = {
             # specific underlying model rejects temperature, the
             # request just 400s and the new error-propagation surfaces
             # the upstream message clearly.
-            "deny_pattern": None,
+            "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
         },
     ),
@@ -140,7 +140,7 @@ PROVIDERS: dict[str, Provider] = {
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
             "default_base_url": "https://api.minimax.io",
-            "deny_pattern": None,
+            "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
         },
     ),
@@ -150,7 +150,7 @@ PROVIDERS: dict[str, Provider] = {
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
             "default_base_url": "http://127.0.0.1:11434",
-            "deny_pattern": None,
+            "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
             # Ollama doesn't require auth on its local endpoint; the
             # apiKey field exists but is optional. Without this flag,
@@ -170,7 +170,7 @@ PROVIDERS: dict[str, Provider] = {
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
             "default_base_url": "http://127.0.0.1:1234",
-            "deny_pattern": None,
+            "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
             "auth_required": False,
             "filter_models": False,
@@ -183,7 +183,7 @@ PROVIDERS: dict[str, Provider] = {
         engine_kwargs={
             # No default — user must supply baseUrl.
             "default_base_url": None,
-            "deny_pattern": None,
+            "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
         },
         extra_field_specs=_custom_base_url_field(),

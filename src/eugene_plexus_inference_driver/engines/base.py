@@ -73,7 +73,7 @@ class BackendEngine(Protocol):
         merges runtime config + transient overrides). `provider_kwargs`
         carries any provider-specific knobs the registry pinned for
         this engine instance — e.g. the OpenAI-compatible engine takes
-        `default_base_url`, `deny_pattern`, `backend_kind`. CLI engines
+        `default_base_url`, `fixed_temperature_pattern`, `backend_kind`. CLI engines
         ignore them."""
         ...
 

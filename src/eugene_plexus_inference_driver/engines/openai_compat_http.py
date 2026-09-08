@@ -12,7 +12,7 @@ with `Authorization: Bearer <key>`:
 This is a *transport* — the user-facing "provider" picker decides
 which `Provider` from the registry is in play, and the registry
 hands this engine a `default_base_url`, an optional
-`deny_pattern`, and the `backend_kind` to report. New providers
+`fixed_temperature_pattern`, and the `backend_kind` to report. New providers
 that share this protocol = a new entry in `providers.py`, not a
 new engine file.
 
@@ -48,13 +48,16 @@ from ._thinking import apply_thinking_mode, strip_thinking_blocks
 
 log = logging.getLogger(__name__)
 
-# Default deny pattern for OpenAI proper (`provider: openai` →
-# OpenAiCompatibleHttpEngine + this pattern). Catches every gpt-5 family
-# member that uses either `-` or `.` after the family name, plus the
-# o-series, while explicitly NOT matching hypothetical `gpt-50` /
-# `gpt-5o` style names that aren't actually 5.x. Other providers can
-# pass their own pattern (or None) via the registry.
-OPENAI_DENY_PATTERN: re.Pattern[str] = re.compile(
+# Models whose `temperature` is not tunable: OpenAI's o-series rejects
+# the parameter outright, and the gpt-5 family schema-accepts it but
+# errors on any value other than the default. Sending it is a 400, so
+# the adapter drops it and warns rather than refusing the model — see
+# `_temperature_for`. Catches every gpt-5 family member that uses
+# either `-` or `.` after the family name, plus the o-series, while
+# explicitly NOT matching hypothetical `gpt-50` / `gpt-5o` style names
+# that aren't actually 5.x. Other providers pass their own pattern (or
+# None) via the registry.
+OPENAI_FIXED_TEMPERATURE_PATTERN: re.Pattern[str] = re.compile(
     r"^(?:o\d+|gpt-5)(?:[-.]|$)",
     re.IGNORECASE,
 )
@@ -92,6 +95,13 @@ _CHAT_MODEL_PREFIXES = (
     "abab",  # MiniMax
 )
 
+# The o-series doesn't share a prefix with anything else on the list, so
+# it needs its own test. It was absent while reasoning models were
+# refused outright and never reached the dropdown; now that they do, an
+# allow-list that silently omits `o3` is the same refusal by another
+# route. Anchored digits so a future `omni-` model doesn't match.
+_O_SERIES_RE = re.compile(r"^o\d+(?:[-.]|$)", re.IGNORECASE)
+
 
 def _is_plausible_chat_model(model_id: str) -> bool:
     lowered = model_id.lower()
@@ -105,7 +115,7 @@ def _is_plausible_chat_model(model_id: str) -> bool:
         # Pure image-gen models. Vision-capable chat models (e.g. gpt-4o)
         # don't carry "image" in the id, so they're unaffected.
         return False
-    return lowered.startswith(_CHAT_MODEL_PREFIXES)
+    return lowered.startswith(_CHAT_MODEL_PREFIXES) or bool(_O_SERIES_RE.match(lowered))
 
 
 _FINISH_REASON_MAP = {
@@ -139,7 +149,7 @@ class OpenAiCompatibleHttpEngine:
         base_url: str = "https://api.openai.com",
         model_id: str = "gpt-4o",
         timeout_seconds: float = 120.0,
-        deny_pattern: re.Pattern[str] | None = None,
+        fixed_temperature_pattern: re.Pattern[str] | None = None,
         backend_kind: BackendKind = BackendKind.openai_api,
         thinking_mode: str = "auto",
         auth_required: bool = True,
@@ -151,23 +161,21 @@ class OpenAiCompatibleHttpEngine:
                 "openai_compat_http engine has no API key — set `apiKey` in "
                 "config or export OPENAI_API_KEY in the environment."
             )
-        if deny_pattern is not None and deny_pattern.match(model_id):
-            raise CliError(
-                f"This provider rejects model {model_id!r} because it doesn't "
-                "support a tunable `temperature` parameter (e.g. OpenAI's "
-                "o-series rejects temperature outright; the gpt-5 family "
-                "schema-accepts it but only the default value of 1). Eugene "
-                "Plexus uses temperature as the per-pass divergence knob "
-                "between hemispheres, and v0.2's NT system modulates it "
-                "per-driver — a model that won't move with temperature has "
-                "no place in the bicameral loop. Pick a non-reasoning chat "
-                "model with controllable temperature from the dropdown."
-            )
         self._api_key = resolved_key
         self._base_url = base_url.rstrip("/")
         self._model_id = model_id
         self._timeout_seconds = timeout_seconds
-        self._deny_pattern = deny_pattern
+        self._fixed_temperature_pattern = fixed_temperature_pattern
+        self._temperature_is_fixed = fixed_temperature_pattern is not None and bool(
+            fixed_temperature_pattern.match(model_id)
+        )
+        if self._temperature_is_fixed:
+            log.warning(
+                "model %r does not accept a tunable `temperature`; the driver "
+                "will omit the parameter on every request and let the model "
+                "use its own default. Everything else works normally.",
+                model_id,
+            )
         self.backend_kind = backend_kind
         self._thinking_mode = thinking_mode or "auto"
         self._filter_models = filter_models
@@ -204,7 +212,7 @@ class OpenAiCompatibleHttpEngine:
         get: Any,
         *,
         default_base_url: str | None,
-        deny_pattern: re.Pattern[str] | None,
+        fixed_temperature_pattern: re.Pattern[str] | None,
         backend_kind: BackendKind,
         auth_required: bool = True,
         filter_models: bool = True,
@@ -223,7 +231,7 @@ class OpenAiCompatibleHttpEngine:
             base_url=base_url,
             model_id=str(get("modelId") or "gpt-4o"),
             timeout_seconds=float(get("requestTimeoutSeconds") or 120),
-            deny_pattern=deny_pattern,
+            fixed_temperature_pattern=fixed_temperature_pattern,
             backend_kind=backend_kind,
             thinking_mode=str(get("thinkingMode") or "auto"),
             auth_required=auth_required,
@@ -242,7 +250,7 @@ class OpenAiCompatibleHttpEngine:
         }
         if request.maxTokens is not None:
             payload[_max_tokens_field_for(self._base_url)] = request.maxTokens
-        if request.temperature is not None:
+        if request.temperature is not None and not self._temperature_is_fixed:
             payload["temperature"] = float(request.temperature)
         if request.stop:
             payload["stop"] = list(request.stop)
@@ -340,11 +348,11 @@ class OpenAiCompatibleHttpEngine:
 
         OpenAI proper and most OpenAI-compatible providers expose
         `GET /v1/models` returning `{"data": [{"id": "<model>", ...}]}`.
-        We filter out:
-
-        - non-chat models (embeddings, dall-e, whisper, tts, moderation,
-          codex-only, audio) — heuristic by id prefix / substring
-        - models the configured `deny_pattern` would refuse at construction
+        We filter out non-chat models (embeddings, dall-e, whisper, tts,
+        moderation, codex-only, audio) — heuristic by id prefix /
+        substring. Reasoning models stay in the list: they are chat
+        models the operator owns, and the only thing special about them
+        is a parameter the adapter already drops for them.
 
         Returns `[]` on transport / parse failure so the schema endpoint
         can fall back to free-text input. Driver stays up either way.
@@ -377,12 +385,8 @@ class OpenAiCompatibleHttpEngine:
             # operator explicitly pulled — model ids include publisher
             # prefixes like `huihui_ai/dolphin3-abliterated:8b-...` that
             # the chat-prefix heuristic rejects. Skip filtering for
-            # those; trust the operator's choice. The deny-pattern still
-            # applies because temperature compatibility is a wire-level
-            # concern, not a discovery one.
+            # those; trust the operator's choice.
             if self._filter_models and not _is_plausible_chat_model(mid):
-                continue
-            if self._deny_pattern is not None and self._deny_pattern.match(mid):
                 continue
             ids.append(mid)
         ids.sort()

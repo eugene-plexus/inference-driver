@@ -7,6 +7,7 @@ EUGENE_PLEXUS_DRIVER_LIVE_API=1 and skipped by default.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import httpx
@@ -22,7 +23,7 @@ from eugene_plexus_inference_driver._generated.models import (
 )
 from eugene_plexus_inference_driver.engines._subprocess import CliError
 from eugene_plexus_inference_driver.engines.openai_compat_http import (
-    OPENAI_DENY_PATTERN,
+    OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
 )
 
@@ -205,7 +206,7 @@ async def test_openai_adapter_uses_max_completion_tokens_against_openai() -> Non
         # gpt-5 family — schema-accepts temperature but only allows the
         # default value (1). Both the simple names and the dated /
         # variant suffixes OpenAI's /v1/models actually returns must
-        # all be rejected at construction.
+        # all be recognised, or we send a parameter that 400s.
         "gpt-5",
         "gpt-5-mini",
         "gpt-5-pro",
@@ -219,21 +220,64 @@ async def test_openai_adapter_uses_max_completion_tokens_against_openai() -> Non
         "gpt-5-nano-2025-08-07",
     ],
 )
-def test_openai_adapter_rejects_models_without_controllable_temperature(
+@respx.mock
+async def test_openai_adapter_drops_temperature_instead_of_refusing_model(
     model_id: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Eugene Plexus relies on temperature as the per-pass divergence
-    knob. Models that either reject the parameter (o-series) or only
-    accept its default value (gpt-5 family) won't move with our
-    NT-modulated temperature in v0.2+, so the adapter refuses to
-    construct against one — driver lands in degraded mode with the
-    explanation."""
-    with pytest.raises(CliError, match="temperature"):
-        OpenAiCompatibleHttpEngine(
+    """A control plane never refuses a model the operator owns. Models
+    that reject `temperature` (o-series) or accept only its default
+    (gpt-5 family) construct fine; the adapter omits the parameter on
+    the wire and warns once, so the model runs with its own default
+    rather than 400ing."""
+    route = respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=OK_BODY)
+    )
+    with caplog.at_level(logging.WARNING):
+        adapter = OpenAiCompatibleHttpEngine(
             api_key="sk-test",
             model_id=model_id,
-            deny_pattern=OPENAI_DENY_PATTERN,
+            fixed_temperature_pattern=OPENAI_FIXED_TEMPERATURE_PATTERN,
         )
+    assert "does not accept a tunable `temperature`" in caplog.text
+    assert model_id in caplog.text
+
+    await adapter.generate(
+        GenerateRequest(
+            messages=[Message(role=Role.user, content="hi")],
+            temperature=0.7,
+        )
+    )
+    import json as _json
+
+    sent_payload = _json.loads(route.calls[0].request.read())
+    assert "temperature" not in sent_payload
+    assert sent_payload["model"] == model_id
+
+
+@respx.mock
+async def test_openai_adapter_still_sends_temperature_for_tunable_models() -> None:
+    """The drop is scoped to the fixed-temperature pattern. Everything
+    else keeps the gateway-supplied value, which the gateway owns and
+    the driver must never substitute a local default for."""
+    route = respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=OK_BODY)
+    )
+    adapter = OpenAiCompatibleHttpEngine(
+        api_key="sk-test",
+        model_id="gpt-4o",
+        fixed_temperature_pattern=OPENAI_FIXED_TEMPERATURE_PATTERN,
+    )
+    await adapter.generate(
+        GenerateRequest(
+            messages=[Message(role=Role.user, content="hi")],
+            temperature=0.7,
+        )
+    )
+    import json as _json
+
+    sent_payload = _json.loads(route.calls[0].request.read())
+    assert sent_payload["temperature"] == 0.7
 
 
 @respx.mock
@@ -267,10 +311,10 @@ async def test_openai_adapter_uses_legacy_max_tokens_against_self_hosted() -> No
 
 
 @respx.mock
-async def test_openai_adapter_list_models_filters_temperature_uncontrollable() -> None:
-    """Live fetch returns the post-filter set: chat-plausible model IDs
-    that ALSO pass our temperature-controllability bar. Embeddings,
-    audio, image and the o-series / gpt-5 families are stripped."""
+async def test_openai_adapter_list_models_filters_non_chat_only() -> None:
+    """Live fetch returns the post-filter set: chat-plausible model IDs.
+    Embeddings, audio, image, moderation and retired completion-only
+    models are stripped; reasoning models are not."""
     fake_catalog = {
         "data": [
             {"id": "gpt-4o", "object": "model"},
@@ -306,20 +350,22 @@ async def test_openai_adapter_list_models_filters_temperature_uncontrollable() -
     adapter = OpenAiCompatibleHttpEngine(
         api_key="sk-test",
         model_id="gpt-4o",
-        deny_pattern=OPENAI_DENY_PATTERN,
+        fixed_temperature_pattern=OPENAI_FIXED_TEMPERATURE_PATTERN,
     )
 
     models = await adapter.list_models()
 
-    # Allowed: chat-plausible AND temperature-controllable.
+    # Kept: every chat-plausible model.
     assert "gpt-4o" in models
     assert "gpt-4o-mini" in models
     assert "gpt-4.1" in models
     assert "gpt-4-turbo" in models
     assert "gpt-3.5-turbo" in models
-    # Filtered: o-series and gpt-5 family (including the dotted /
-    # dated variants OpenAI's /v1/models actually returns).
-    for forbidden in (
+    # Kept too: reasoning models. They used to be hidden here because
+    # the adapter would have refused to construct against one. It no
+    # longer does, so hiding them would be the control plane deciding
+    # which of the operator's models they are allowed to pick.
+    for reasoning in (
         "gpt-5",
         "gpt-5-mini",
         "gpt-5-2025-08-07",
@@ -331,7 +377,7 @@ async def test_openai_adapter_list_models_filters_temperature_uncontrollable() -
         "o1-mini",
         "o3",
     ):
-        assert forbidden not in models
+        assert reasoning in models
     # Filtered: non-chat.
     assert "text-embedding-3-large" not in models
     assert "dall-e-3" not in models
