@@ -268,6 +268,14 @@ class OpenAiCompatibleHttpEngine:
                 json.dumps(payload, indent=2, ensure_ascii=False),
             )
 
+        # No key means no header, not `Bearer None`. Providers that need
+        # auth reject a missing header with a readable 401; a literal
+        # "None" is a malformed credential, and some servers answer that
+        # with a 400 that reads like our payload was wrong.
+        headers = {"Accept": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
         async with httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
@@ -275,10 +283,7 @@ class OpenAiCompatibleHttpEngine:
             try:
                 response = await client.post(
                     "/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Accept": "application/json",
-                    },
+                    headers=headers,
                     json=payload,
                 )
             except httpx.HTTPError as e:

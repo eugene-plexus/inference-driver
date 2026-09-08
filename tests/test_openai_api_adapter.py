@@ -26,6 +26,7 @@ from eugene_plexus_inference_driver.engines.openai_compat_http import (
     OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
 )
+from eugene_plexus_inference_driver.providers import PROVIDERS
 
 
 def _request(prompt: str = "say PING", system: str | None = None) -> GenerateRequest:
@@ -159,6 +160,38 @@ async def test_openai_adapter_passes_roles_through_unchanged() -> None:
         "Hello!",
         "reconsider",
     ]
+
+
+@respx.mock
+async def test_openai_adapter_omits_auth_header_when_there_is_no_key() -> None:
+    """Fronting a local engine is the control-plane's headline case and
+    it has no API key. Send no Authorization header at all rather than
+    the literal string "Bearer None", which is a malformed credential
+    some servers reject with a confusing 400."""
+    route = respx.post("http://127.0.0.1:8090/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=OK_BODY)
+    )
+    adapter = OpenAiCompatibleHttpEngine(
+        base_url="http://127.0.0.1:8090",
+        model_id="qwen3.6-27b",
+        auth_required=False,
+    )
+    await adapter.generate(_request())
+    assert "authorization" not in route.calls[0].request.headers
+
+
+def test_openai_compat_custom_provider_needs_no_api_key() -> None:
+    """A custom OpenAI-compatible URL is how a driver fronts a runtime
+    the watchdog supervises. Requiring a key there would mean inventing
+    one to reach a model on your own machine — the driver would land in
+    degraded mode instead, and `GET /v1/models` on the gateway would
+    report nothing routable."""
+    provider = PROVIDERS["openai_compat_custom"]
+    engine = provider.engine_class.from_config(
+        {"baseUrl": "http://127.0.0.1:8090", "modelId": "qwen3.6-27b"}.get,
+        **provider.engine_kwargs,
+    )
+    assert engine is not None
 
 
 def test_openai_adapter_rejects_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:

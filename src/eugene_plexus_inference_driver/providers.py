@@ -185,6 +185,20 @@ PROVIDERS: dict[str, Provider] = {
             "default_base_url": None,
             "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
+            # A custom URL is at least as likely to be a local engine
+            # with no auth (llama-server, vLLM) as a hosted service, and
+            # this is the provider a driver uses to front a runtime the
+            # watchdog supervises — the control plane's headline case.
+            # Requiring a key there would mean typing a fake one to
+            # reach a model on your own machine. When the endpoint does
+            # want a key and none was set, the upstream 401 propagates
+            # with its own message, which beats refusing to construct.
+            "auth_required": False,
+            # And don't second-guess what the endpoint serves: a local
+            # runtime's model id is its alias, which defaults to the
+            # model's own filename and generally will not match a
+            # chat-model prefix heuristic. The operator chose the URL.
+            "filter_models": False,
         },
         extra_field_specs=_custom_base_url_field(),
     ),
