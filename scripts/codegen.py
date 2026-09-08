@@ -35,8 +35,12 @@ SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{re
 # datamodel-code-generator follows local $refs, so generating from
 # inference-driver.yaml alone pulls in everything it needs from
 # components/common.yaml. One input, one output module: simpler imports.
+# The spec filename tracks SPECS_REF, not this repo's name. The pin below
+# is still a pre-rename commit where this document is
+# hemisphere-driver.yaml; the name changes in the same commit that bumps
+# the pin, because bumping it also deletes schemas this code still uses.
 SPECS_TO_GENERATE = [
-    ("openapi/inference-driver.yaml", "models.py"),
+    ("openapi/hemisphere-driver.yaml", "models.py"),
 ]
 
 
