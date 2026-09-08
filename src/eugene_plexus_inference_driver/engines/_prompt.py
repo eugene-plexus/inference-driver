@@ -1,10 +1,11 @@
 """Conversation -> single-prompt-string serialization for CLI adapters.
 
-The bicameral CLIs we wrap (Claude Code, Codex) accept a single prompt
-argument rather than a structured chat-message array. v0.1 collapses our
-spec's `Message[]` into a flat tagged transcript. This is approximate but
-adequate for early bicameral experiments; v0.2 may use API adapters or
-session-mode CLIs to preserve true multi-turn structure.
+The agentic CLIs we wrap (Claude Code, Codex) take a single prompt argument
+rather than a structured chat-message array, so the spec's `Message[]` has
+to be collapsed into a flat tagged transcript. Approximate but adequate:
+these backends are subscription passthroughs, not the local engines the
+control plane is built around, and those speak OpenAI-compatible HTTP where
+the message array survives intact.
 """
 
 from __future__ import annotations
@@ -16,17 +17,7 @@ def messages_to_prompt(messages: list[Message]) -> str:
     """Render a chat-message list as a single role-prefixed transcript string."""
     lines: list[str] = []
     for msg in messages:
-        role = _role_str(msg.role)
-        if msg.role == Role.hemisphere and msg.driverName:
-            label = f"[HEMISPHERE-{msg.driverName.upper()}]"
-        elif msg.role == Role.system:
-            label = "[SYSTEM]"
-        elif msg.role == Role.user:
-            label = "[USER]"
-        elif msg.role == Role.assistant:
-            label = "[ASSISTANT]"
-        else:
-            label = f"[{role.upper()}]"
+        label = f"[{_role_str(msg.role).upper()}]"
         lines.append(f"{label} {msg.content}")
     return "\n\n".join(lines)
 

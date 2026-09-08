@@ -397,7 +397,7 @@ def _to_openai_messages(messages: list[Any]) -> list[dict[str, str]]:
             out.append({"role": "system", "content": m.content})
         elif m.role == Role.user:
             out.append({"role": "user", "content": m.content})
-        elif m.role == Role.assistant or m.role == Role.hemisphere:
+        elif m.role == Role.assistant:
             out.append({"role": "assistant", "content": m.content})
         else:
             out.append({"role": "user", "content": m.content})

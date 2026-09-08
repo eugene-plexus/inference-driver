@@ -123,7 +123,12 @@ async def test_openai_adapter_raises_when_no_choices() -> None:
 
 
 @respx.mock
-async def test_openai_adapter_collapses_hemisphere_role_to_assistant() -> None:
+async def test_openai_adapter_passes_roles_through_unchanged() -> None:
+    """`Role` is now exactly OpenAI's three roles, so the mapping is
+    identity and the multi-turn shape survives the hop. Was a test that
+    the bicameral `hemisphere` role collapsed to `assistant`; that role
+    left the contract with the consciousness program, but the property
+    worth pinning — no re-shaping on the way to the backend — did not."""
     route = respx.post("https://api.openai.com/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=OK_BODY)
     )
@@ -131,9 +136,9 @@ async def test_openai_adapter_collapses_hemisphere_role_to_assistant() -> None:
     await adapter.generate(
         GenerateRequest(
             messages=[
-                Message(role=Role.system, content="You are Eugene."),
+                Message(role=Role.system, content="You are a helpful assistant."),
                 Message(role=Role.user, content="hi"),
-                Message(role=Role.hemisphere, content="(left side wisdom)"),
+                Message(role=Role.assistant, content="Hello!"),
                 Message(role=Role.user, content="reconsider"),
             ]
         )
@@ -141,8 +146,18 @@ async def test_openai_adapter_collapses_hemisphere_role_to_assistant() -> None:
     import json as _json
 
     sent_payload = _json.loads(route.calls[0].request.read())
-    roles = [m["role"] for m in sent_payload["messages"]]
-    assert roles == ["system", "user", "assistant", "user"]
+    assert [m["role"] for m in sent_payload["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert [m["content"] for m in sent_payload["messages"]] == [
+        "You are a helpful assistant.",
+        "hi",
+        "Hello!",
+        "reconsider",
+    ]
 
 
 def test_openai_adapter_rejects_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
