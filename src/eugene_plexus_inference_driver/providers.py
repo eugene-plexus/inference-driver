@@ -188,7 +188,7 @@ PROVIDERS: dict[str, Provider] = {
             # A custom URL is at least as likely to be a local engine
             # with no auth (llama-server, vLLM) as a hosted service, and
             # this is the provider a driver uses to front a runtime the
-            # watchdog supervises — the control plane's headline case.
+            # agent supervises — the control plane's headline case.
             # Requiring a key there would mean typing a fake one to
             # reach a model on your own machine. When the endpoint does
             # want a key and none was set, the upstream 401 propagates

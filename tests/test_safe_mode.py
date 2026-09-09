@@ -1,4 +1,4 @@
-"""Tests for the watchdog safe-mode contract.
+"""Tests for the agent safe-mode contract.
 
 Per specs/openapi/inference-driver.yaml: when started with
 `EUGENE_PLEXUS_DRIVER_SAFE_MODE=1` the driver must

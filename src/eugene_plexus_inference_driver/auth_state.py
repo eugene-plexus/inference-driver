@@ -1,6 +1,6 @@
 """Auth state for the inference-driver's verify-only role.
 
-Built once at startup from the env vars the watchdog threads in when
+Built once at startup from the env vars the agent threads in when
 it spawns this child:
 
   * `EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
@@ -16,7 +16,7 @@ it spawns this child:
 
 If `AUTH_SIGNING_KEY` is unset, the driver runs in `auth_disabled=True`
 mode: route dependencies short-circuit and let everything through.
-That's the dev/standalone path. Production via the watchdog always
+That's the dev/standalone path. Production via the agent always
 supplies the env var.
 """
 
@@ -44,7 +44,7 @@ class AuthState:
 
     master_key: bytes | None
     """At-rest secretbox key. Only set when the operator has logged in
-    at the watchdog. Phase 6 uses this to decrypt config-stored apiKey
+    at the agent. Phase 6 uses this to decrypt config-stored apiKey
     values; Phase 4 leaves it untouched."""
 
     @property
@@ -90,7 +90,7 @@ def load_auth_state(
             )
         log.warning(
             "EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY not set — running unauthenticated "
-            "(dev/standalone mode). Production spawns via watchdog always supply this."
+            "(dev/standalone mode). Production spawns via agent always supply this."
         )
         return AuthState(signing_key=None, service_token=None, master_key=None)
 

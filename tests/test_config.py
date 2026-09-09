@@ -52,7 +52,7 @@ def test_get_config_returns_defaults_on_first_run(client: TestClient) -> None:
     assert response.status_code == 200
     doc = response.json()
     assert doc["provider"] == "claude_subscription"
-    # `port` is no longer a config field — owned by the watchdog topology
+    # `port` is no longer a config field — owned by the agent topology
     # via EUGENE_PLEXUS_DRIVER_BIND_PORT. Both legacy keys are rejected.
     assert "port" not in doc
     assert "hemisphere" not in doc

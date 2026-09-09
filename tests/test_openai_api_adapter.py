@@ -182,7 +182,7 @@ async def test_openai_adapter_omits_auth_header_when_there_is_no_key() -> None:
 
 def test_openai_compat_custom_provider_needs_no_api_key() -> None:
     """A custom OpenAI-compatible URL is how a driver fronts a runtime
-    the watchdog supervises. Requiring a key there would mean inventing
+    the agent supervises. Requiring a key there would mean inventing
     one to reach a model on your own machine — the driver would land in
     degraded mode instead, and `GET /v1/models` on the gateway would
     report nothing routable."""

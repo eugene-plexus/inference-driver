@@ -1,8 +1,8 @@
 """Tests for v0.2 bearer auth on the inference-driver.
 
-Verify-only role — the watchdog issues tokens; this component just
+Verify-only role — the agent issues tokens; this component just
 validates them. Tests construct JWTs directly via PyJWT against a
-known signing key (standing in for the watchdog) and assert the
+known signing key (standing in for the agent) and assert the
 dependencies accept / reject the right shapes.
 
 Auth posture is selected by whether `app.state.auth_state` is
@@ -38,7 +38,7 @@ def _issue(
     ttl_seconds: int = 60,
     iat: int | None = None,
 ) -> str:
-    """Mint a JWT exactly the way the watchdog would."""
+    """Mint a JWT exactly the way the agent would."""
     issued_at = iat if iat is not None else int(time.time())
     claims = {
         "sub": sub,
@@ -97,7 +97,7 @@ def orchestrator_service_token(signing_key: bytes) -> str:
 def test_auth_disabled_lets_everything_through(client: TestClient) -> None:
     """No signing key wired in → every route answers normally without
     a bearer header. The dev / standalone posture; production via the
-    watchdog supplies the env vars."""
+    agent supplies the env vars."""
     assert client.get("/healthz").status_code == 200
     assert client.get("/v1/config").status_code == 200
 

@@ -11,7 +11,7 @@ from .app import create_app
 from .config import ConfigStore
 from .settings import load_settings
 
-# Default bind port when neither the watchdog (via env var) nor the
+# Default bind port when neither the agent (via env var) nor the
 # operator (via standalone launch) overrides it. Matches the smoke-test
 # convention for the canonical bicameral pair.
 _DEFAULT_PORT = 8081
@@ -20,13 +20,13 @@ _DEFAULT_PORT = 8081
 def _resolve_port(bootstrap_store: ConfigStore) -> int:
     """Resolution order, highest precedence first:
 
-    1. `EUGENE_PLEXUS_DRIVER_BIND_PORT` env var — the watchdog sets this when
+    1. `EUGENE_PLEXUS_DRIVER_BIND_PORT` env var — the agent sets this when
        it spawns the driver, parsed from the topology's component URL.
-       Watchdog-supervised installs always hit this branch.
+       Agent-supervised installs always hit this branch.
     2. Built-in default (8081). Used when running the driver standalone
-       outside the watchdog. The `port` field used to live in the
+       outside the agent. The `port` field used to live in the
        per-driver config file; it's gone now (one source of truth: the
-       watchdog topology owns ports).
+       agent topology owns ports).
     """
     env_port = os.environ.get("EUGENE_PLEXUS_DRIVER_BIND_PORT")
     if env_port:
@@ -38,7 +38,7 @@ def main() -> None:
     settings = load_settings()
 
     # Bootstrap the config store just to discover log_level. Ports are
-    # owned by the watchdog now (or the default for standalone launch).
+    # owned by the agent now (or the default for standalone launch).
     bootstrap_store = ConfigStore(settings.config_file)
     if not settings.safe_mode:
         bootstrap_store.load()

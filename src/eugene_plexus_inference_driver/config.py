@@ -103,9 +103,9 @@ def _common_fields() -> list[ConfigField]:
     """Provider-agnostic fields — logging and timeouts.
 
     The bind port deliberately is NOT in this list. Ports are owned by
-    the watchdog topology (`watchdog.yaml`), passed to spawned children
+    the agent topology (`agent.yaml`), passed to spawned children
     via `EUGENE_PLEXUS_DRIVER_BIND_PORT`. Two sources of truth on `port`
-    was an OpenClaw-style trap waiting to bite — the watchdog spawns at
+    was an OpenClaw-style trap waiting to bite — the agent spawns at
     one port, the driver's own config says another, and the gateway
     can't reach the driver. Now there's one source.
     """

@@ -1,7 +1,7 @@
 """Tests for Phase 6 — at-rest encryption of sensitive config fields.
 
 Exercises ConfigStore directly (the encryption boundary) plus the
-round-trip through the file system. The watchdog provides the master
+round-trip through the file system. The agent provides the master
 key in production; tests construct one and pass it in directly.
 
 Three scenarios matter and are covered:

@@ -28,22 +28,22 @@ class Settings(BaseSettings):
 
     safe_mode: bool = False
     """If true, skip loading the persisted config file at startup and run on
-    built-in defaults. Set by the watchdog via EUGENE_PLEXUS_DRIVER_SAFE_MODE=1
+    built-in defaults. Set by the agent via EUGENE_PLEXUS_DRIVER_SAFE_MODE=1
     when a previous boot failed because the config was broken; lets the
     operator reach /v1/config to fix it. PATCH /v1/config still writes to
     `config_file` normally, so the next non-safe-mode boot picks up the
     repair. Per the safe-mode contract in specs/openapi/inference-driver.yaml."""
 
     auth_signing_key: str | None = None
-    """Base64-encoded 32-byte HMAC signing key, supplied by the watchdog at
+    """Base64-encoded 32-byte HMAC signing key, supplied by the agent at
     spawn time (EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY). When absent the driver
     runs unauthenticated — dev / standalone path only; production via the
-    watchdog always supplies this."""
+    agent always supplies this."""
 
     service_token: str | None = None
     """Long-lived service JWT (EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN). Not consumed
     by the driver in v0.2 — captured for v0.3 when hemispheres may read
-    from memory. The watchdog supplies it for symmetry with other kinds."""
+    from memory. The agent supplies it for symmetry with other kinds."""
 
     master_key: str | None = None
     """Base64-encoded 32-byte secretbox key for at-rest decryption

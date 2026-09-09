@@ -1,6 +1,6 @@
 """v0.2 security primitives.
 
-The inference-driver is never the trust root. The watchdog generates
+The inference-driver is never the trust root. The agent generates
 the per-restart HMAC signing key and the install-wide master key
 (libsodium secretbox), and distributes both via env vars
 (`EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY`, `EUGENE_PLEXUS_DRIVER_MASTER_KEY`).
@@ -11,7 +11,7 @@ This module exposes:
     `eugene_plexus_memory.security`.
   * Secretbox envelope `seal` / `open_envelope` for at-rest encryption
     of sensitive config fields (Phase 6). The wire shape is identical
-    to the watchdog's `MasterKeyEnvelope` in common.yaml so envelopes
+    to the agent's `MasterKeyEnvelope` in common.yaml so envelopes
     written by one component can be opened by another given the same
     master key — useful for future per-component key rotation flows.
 """
@@ -98,7 +98,7 @@ def decode_token(
 @dataclass(frozen=True)
 class Envelope:
     """Canonical shape of an at-rest encrypted secret. Wire-identical
-    to the watchdog's `MasterKeyEnvelope` schema in common.yaml so
+    to the agent's `MasterKeyEnvelope` schema in common.yaml so
     envelopes round-trip across components if both hold the same
     master key."""
 

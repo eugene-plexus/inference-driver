@@ -16,7 +16,7 @@ That last kind is why this is a separate process rather than something folded in
 
 ## What this service is — and what it isn't
 
-A driver is **anonymous and stateless**. It wraps one backend, serves `POST /v1/generate`, and does not know its position in any topology. Its operator-supplied name lives in the watchdog topology; the gateway learns what this driver *serves* by reading `GET /v1/info` and routes on that.
+A driver is **anonymous and stateless**. It wraps one backend, serves `POST /v1/generate`, and does not know its position in any topology. Its operator-supplied name lives in the agent topology; the gateway learns what this driver *serves* by reading `GET /v1/info` and routes on that.
 
 It also decides **no** output-affecting parameter. Temperature, max tokens and stop sequences arrive on the request or are not sent to the backend at all — the gateway owns them and resolves them from the model's settings profile. The driver applies what it's given and never substitutes a local default.
 
@@ -65,7 +65,7 @@ pip install -e ".[dev]"
 python -m eugene_plexus_inference_driver
 ```
 
-By default it listens on `http://127.0.0.1:8081`, overridable via `EUGENE_PLEXUS_DRIVER_BIND_PORT` (the watchdog uses this when supervising). Configure runtime behavior via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
+By default it listens on `http://127.0.0.1:8081`, overridable via `EUGENE_PLEXUS_DRIVER_BIND_PORT` (the agent uses this when supervising). Configure runtime behavior via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
 
 ### Pairing with the gateway
 
