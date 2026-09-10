@@ -51,29 +51,50 @@ class Provider:
     provider needs a user-supplied `baseUrl` — most providers don't)."""
 
 
-# `baseUrl` is shown only for the custom provider — for named providers,
-# the URL is implicit in the registry entry. Defined here so multiple
-# providers (none today, but room for future "BYO compat URL" variants)
-# could reuse the same field declaration if needed.
-def _custom_base_url_field() -> list[ConfigField]:
+# Which backend the custom provider fronts. Two fields, and which one is
+# set decides how the backend is addressed — `runtimeName` wins when both
+# are. Shown only for the custom provider: for named providers the URL is
+# implicit in the registry entry, and a cloud API is not a runtime we
+# supervise. Defined here so a future "BYO compat URL" variant could
+# reuse the same declarations.
+def _custom_backend_fields() -> list[ConfigField]:
     from ._generated.models import ConfigFieldShowWhen, ConfigValueType
 
+    only_custom = ConfigFieldShowWhen(key="provider", equals="openai_compat_custom")
     return [
+        ConfigField(
+            key="runtimeName",
+            label="Supervised runtime",
+            description=(
+                "The engine runtime this driver fronts, by the name it has on "
+                "the agent (`GET /v1/runtimes`). The driver resolves the name "
+                "to a URL from the agent when it starts and whenever it is "
+                "restarted, so it follows the runtime through whatever the "
+                "agent does with ports — the agent assigns those, and a "
+                "hand-typed URL is wrong the moment the runtime moves. Wins "
+                "over `baseUrl` when both are set. Leave empty for a backend "
+                "that is not a runtime this install supervises."
+            ),
+            category="adapter",
+            valueType=ConfigValueType.runtime_name,
+            requiresRestart=True,
+            showWhen=only_custom,
+        ),
         ConfigField(
             key="baseUrl",
             label="Base URL",
             description=(
-                "HTTP base of your OpenAI-compatible endpoint (e.g. "
+                "HTTP base of an OpenAI-compatible endpoint that is *not* a "
+                "runtime this install supervises — a remote LM Studio, an "
+                "engine somebody else operates, a self-hosted server (e.g. "
                 "`https://my-vllm.example.com`). The driver appends "
-                "`/v1/chat/completions` automatically. Only used by the "
-                "Custom OpenAI-compatible provider — for named providers "
-                "(OpenAI, xAI, OpenRouter, …) the URL is built in."
+                "`/v1/chat/completions` automatically. Ignored when "
+                "`runtimeName` is set. One of the two is required."
             ),
             category="adapter",
             valueType=ConfigValueType.url,
             requiresRestart=True,
-            required=True,
-            showWhen=ConfigFieldShowWhen(key="provider", equals="openai_compat_custom"),
+            showWhen=only_custom,
         ),
     ]
 
@@ -200,7 +221,7 @@ PROVIDERS: dict[str, Provider] = {
             # chat-model prefix heuristic. The operator chose the URL.
             "filter_models": False,
         },
-        extra_field_specs=_custom_base_url_field(),
+        extra_field_specs=_custom_backend_fields(),
     ),
 }
 

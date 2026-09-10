@@ -20,12 +20,33 @@ from .routes import config as config_routes
 from .routes import generate as generate_routes
 from .routes import health as health_routes
 from .routes import info as info_routes
+from .runtime_lookup import resolve_runtime_url
 from .settings import Settings, load_settings
 
 log = logging.getLogger(__name__)
 
+#: Turns a `runtimeName` into the URL that runtime listens on. Built once
+#: per app from its settings and auth state — see `runtime_resolver_for`.
+RuntimeResolver = Callable[[str], str]
 
-def build_engine_with(get: Callable[[str], Any]) -> BackendEngine:
+
+def runtime_resolver_for(app: FastAPI) -> RuntimeResolver:
+    """The resolver this app uses: the agent from settings, the service
+    token the agent handed us at spawn."""
+    settings: Settings = app.state.settings
+    service_token: str | None = getattr(app.state.auth_state, "service_token", None)
+
+    def resolve(name: str) -> str:
+        return resolve_runtime_url(name, agent_url=settings.agent_url, service_token=service_token)
+
+    return resolve
+
+
+def build_engine_with(
+    get: Callable[[str], Any],
+    *,
+    resolve_runtime: RuntimeResolver | None = None,
+) -> BackendEngine:
     """Construct an engine from a key->value getter.
 
     Reads `provider` from the getter, looks up its registry entry, and
@@ -33,21 +54,52 @@ def build_engine_with(get: Callable[[str], Any]) -> BackendEngine:
     getter (with provider-specific kwargs forwarded). Used directly by
     `/v1/config/test` to build a temporary engine from saved config +
     transient overrides without touching the persisted store.
+
+    When the config names a `runtimeName` and the provider's engine can
+    follow one, the name is resolved to a URL through `resolve_runtime`
+    first — that is the whole of the M2 routing-gap fix on the driver's
+    side. A resolution failure raises, so the driver comes up degraded
+    with the reason on `/healthz` and the config endpoints reachable.
     """
     provider_key = str(get("provider") or "").strip()
     if not provider_key:
         raise ValueError("config has no `provider` set; pick one in the UI / config file")
     provider = get_provider(provider_key)
+
+    kwargs: dict[str, Any] = dict(provider.engine_kwargs)
+    runtime_name = str(get("runtimeName") or "").strip()
+    if runtime_name:
+        if getattr(provider.engine_class, "follows_runtimes", False):
+            if resolve_runtime is None:
+                raise ValueError(
+                    f"`runtimeName` is {runtime_name!r} but this driver has no way to reach "
+                    f"the agent to resolve it"
+                )
+            kwargs["runtime_url"] = resolve_runtime(runtime_name)
+            kwargs["runtime_name"] = runtime_name
+        else:
+            # A stale value left behind by a provider switch. The field is
+            # only shown for the custom provider, so say so rather than
+            # fail a subscription-backed driver over it.
+            log.warning(
+                "`runtimeName` %r is set but provider %r does not front a supervised "
+                "runtime; ignoring it",
+                runtime_name,
+                provider_key,
+            )
+
     # `engine_class` is `Any` in the registry (Protocol classes are
     # invariant in `type[]`), but every registered class implements
     # `BackendEngine` — annotate the return through a local cast.
-    engine: BackendEngine = provider.engine_class.from_config(get, **provider.engine_kwargs)
+    engine: BackendEngine = provider.engine_class.from_config(get, **kwargs)
     return engine
 
 
-def build_engine(store: ConfigStore) -> BackendEngine:
+def build_engine(
+    store: ConfigStore, *, resolve_runtime: RuntimeResolver | None = None
+) -> BackendEngine:
     """Construct the configured engine from the runtime config store."""
-    return build_engine_with(store.get)
+    return build_engine_with(store.get, resolve_runtime=resolve_runtime)
 
 
 @asynccontextmanager
@@ -97,7 +149,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.adapter_error = "running in safe mode"
     else:
         try:
-            engine = build_engine(store)
+            engine = build_engine(store, resolve_runtime=runtime_resolver_for(app))
             app.state.adapter = engine  # historical name; routes still read `app.state.adapter`
             app.state.adapter_error = None
             log.info("engine ready: backend=%s", engine.backend_kind.value)

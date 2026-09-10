@@ -53,7 +53,7 @@ async def test_config(
     minimal generate() round-trip. Override values are NOT persisted —
     PATCH /v1/config is still required to commit them."""
     # Imported lazily to avoid a routes -> app -> routes circular dep.
-    from ..app import build_engine_with
+    from ..app import build_engine_with, runtime_resolver_for
 
     start = time.perf_counter()
     store: ConfigStore = request.app.state.config_store
@@ -65,7 +65,9 @@ async def test_config(
         return overrides[key] if key in overrides else store.get(key)
 
     try:
-        engine = build_engine_with(get)
+        # Same resolver the lifespan uses, so a pending `runtimeName` can
+        # be tested against the agent before it is saved.
+        engine = build_engine_with(get, resolve_runtime=runtime_resolver_for(request.app))
     except Exception as e:
         return ConfigTestResult(
             ok=False,

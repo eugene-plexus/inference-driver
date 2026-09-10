@@ -41,9 +41,17 @@ class Settings(BaseSettings):
     agent always supplies this."""
 
     service_token: str | None = None
-    """Long-lived service JWT (EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN). Not consumed
-    by the driver in v0.2 — captured for v0.3 when hemispheres may read
-    from memory. The agent supplies it for symmetry with other kinds."""
+    """Long-lived service JWT (EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN). Presented to
+    the agent when a `runtimeName` is resolved to a URL — reads on the
+    agent's `/v1/runtimes` accept any service token, the same rule that
+    lets the gateway resolve topology. The agent supplies it at spawn."""
+
+    agent_url: str = "http://127.0.0.1:8079"
+    """Agent endpoint a `runtimeName` is resolved against
+    (EUGENE_PLEXUS_DRIVER_AGENT_URL). Bootstrap-only, like the gateway's
+    identical setting: the agent supervises only its own host, so the
+    driver it spawned can always reach it on loopback at the default
+    port. Override when the agent binds elsewhere."""
 
     master_key: str | None = None
     """Base64-encoded 32-byte secretbox key for at-rest decryption

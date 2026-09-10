@@ -21,6 +21,12 @@ async def info(request: Request) -> DriverInfo:
     # `backend_kind` over re-deriving it from config. Falls back to
     # config-only inference when the engine isn't constructed
     # (degraded mode), so /v1/info stays useful for ops.
+    # The runtime this driver follows, when it was configured with
+    # `runtimeName`. Not the driver's own address — that rule stands — but
+    # *what it serves*, which is what /v1/info is for: a model that is
+    # loaded but unroutable becomes diagnosable from the routing table.
+    runtime = str(store.get("runtimeName") or "").strip() or None
+
     engine = request.app.state.adapter
     if engine is not None:
         backend = engine.backend_kind
@@ -28,6 +34,10 @@ async def info(request: Request) -> DriverInfo:
             backend=backend,
             provider=provider_key,
             modelId=store.get("modelId") or None,
+            # Off the live engine: only set when the URL was genuinely
+            # resolved from a runtime, so a stale name on a CLI provider
+            # does not claim a runtime it is not fronting.
+            runtime=getattr(engine, "runtime", None),
             version=__version__,
         )
 
@@ -59,5 +69,8 @@ async def info(request: Request) -> DriverInfo:
         backend=backend,
         provider=provider_key,
         modelId=store.get("modelId") or None,
+        # Degraded: the configured intent, so a driver that failed to
+        # resolve its runtime still says which one it was meant to front.
+        runtime=runtime,
         version=__version__,
     )

@@ -142,6 +142,12 @@ def _max_tokens_field_for(base_url: str) -> str:
 class OpenAiCompatibleHttpEngine:
     """OpenAI-compatible HTTP engine. Provider-agnostic."""
 
+    #: This engine can front a runtime the agent supervises, addressed by
+    #: name rather than by URL. The CLI engines cannot — a subscription
+    #: is not a runtime — so `app.build_engine_with` consults this before
+    #: resolving `runtimeName` at all.
+    follows_runtimes = True
+
     def __init__(
         self,
         *,
@@ -154,6 +160,7 @@ class OpenAiCompatibleHttpEngine:
         thinking_mode: str = "auto",
         auth_required: bool = True,
         filter_models: bool = True,
+        runtime: str | None = None,
     ) -> None:
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
         if auth_required and not resolved_key:
@@ -179,6 +186,10 @@ class OpenAiCompatibleHttpEngine:
         self.backend_kind = backend_kind
         self._thinking_mode = thinking_mode or "auto"
         self._filter_models = filter_models
+        #: The supervised runtime this engine follows, when `base_url` was
+        #: resolved from one. Reported on `/v1/info` so the gateway and
+        #: the UI can show which engine process is behind this driver.
+        self.runtime = runtime
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -216,15 +227,22 @@ class OpenAiCompatibleHttpEngine:
         backend_kind: BackendKind,
         auth_required: bool = True,
         filter_models: bool = True,
+        runtime_url: str | None = None,
+        runtime_name: str | None = None,
     ) -> OpenAiCompatibleHttpEngine:
-        # User's `baseUrl` wins (set only for openai_compat_custom);
-        # otherwise the provider's default applies.
-        base_url = str(get("baseUrl") or default_base_url or "").strip()
+        # Precedence: a resolved runtime URL (the caller turned
+        # `runtimeName` into one via the agent), then the operator's
+        # literal `baseUrl` (set only for openai_compat_custom), then the
+        # provider's built-in default. `runtimeName` wins when both are
+        # set — the contract says so, and the reason is that the literal
+        # URL is the one that goes stale.
+        base_url = str(runtime_url or get("baseUrl") or default_base_url or "").strip()
         if not base_url:
             raise CliError(
-                "OpenAI-compatible engine has no base URL. For the custom "
-                "provider, set `baseUrl` in config. For named providers, "
-                "this is a registry bug — file an issue."
+                "OpenAI-compatible engine has no backend. For the custom provider, "
+                "set `runtimeName` to a runtime the agent supervises, or `baseUrl` "
+                "for an endpoint that is not one. For named providers this is a "
+                "registry bug — file an issue."
             )
         return cls(
             api_key=str(get("apiKey") or "") or None,
@@ -236,6 +254,7 @@ class OpenAiCompatibleHttpEngine:
             thinking_mode=str(get("thinkingMode") or "auto"),
             auth_required=auth_required,
             filter_models=filter_models,
+            runtime=runtime_name if runtime_url else None,
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:

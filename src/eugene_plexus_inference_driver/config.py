@@ -259,7 +259,16 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
 
     vt = field.valueType
 
-    if vt == ConfigValueType.string or vt == ConfigValueType.url or vt == ConfigValueType.file_path:
+    if vt in (
+        ConfigValueType.string,
+        ConfigValueType.url,
+        ConfigValueType.file_path,
+        # A runtime's name. The UI sources a dropdown from the agent's
+        # `/v1/runtimes`; the wire value is the plain name, and it is not
+        # checked against the agent here — the engine resolves it at
+        # construction and reports a missing runtime by name.
+        ConfigValueType.runtime_name,
+    ):
         if not isinstance(value, str):
             return f"expected string, got {type(value).__name__}"
         if field.pattern is not None:
