@@ -74,7 +74,7 @@ ruff format --check .              # formatting
 mypy src/                          # type-check
 pytest                             # tests
 python scripts/codegen.py          # regenerate models from pinned specs
-git diff --exit-code src/.../_generated/   # codegen freshness
+git diff --exit-code src/eugene_plexus_inference_driver/_generated/   # codegen freshness
 ```
 
 ## Reporting issues
@@ -85,4 +85,5 @@ File issues at <https://github.com/eugene-plexus/inference-driver/issues>. Usefu
 - Spec-vs-impl divergence (the impl drifted from `inference-driver.yaml`).
 - Performance / latency regressions with measurements.
 
-For broader architectural questions about Eugene Plexus, file the issue on the [gateway repo](https://github.com/eugene-plexus/gateway) instead.
+Cross-component architecture questions belong in
+[specs issues](https://github.com/eugene-plexus/specs/issues).
