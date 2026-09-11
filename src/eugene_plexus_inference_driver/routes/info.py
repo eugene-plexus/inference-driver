@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request, status
 
 from .. import __version__
-from .._generated.models import BackendKind, DriverInfo, Problem
+from .._generated.models import BackendKind, Capabilities, DriverInfo, Problem
 from ..config import ConfigStore
 
 router = APIRouter(tags=["meta"])
@@ -31,6 +31,13 @@ async def info(request: Request) -> DriverInfo:
     if engine is not None:
         backend = engine.backend_kind
         return DriverInfo(
+            # Contracted since M0 and populated since M10, when there was
+            # finally something true to say: `streaming` means "emits
+            # genuinely incremental tokens", which is False for a backend
+            # that streams one whole message (codex) even though its
+            # endpoint works. A flag that said True for everything would
+            # tell a UI nothing.
+            capabilities=Capabilities(streaming=bool(getattr(engine, "supports_streaming", False))),
             backend=backend,
             provider=provider_key,
             modelId=store.get("modelId") or None,

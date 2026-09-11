@@ -21,7 +21,8 @@ classmethods (`field_specs`, `from_config`) let `config.py` and
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .._generated.models import (
@@ -45,6 +46,27 @@ class StreamChunk(Protocol):
     """Set on the final event, capturing the assembled response and usage."""
 
 
+@dataclass(frozen=True)
+class Chunk:
+    """The concrete `StreamChunk` every engine yields.
+
+    `StreamChunk` above is a Protocol so a test can substitute anything
+    with the right shape; this is what the shipped engines actually
+    emit, so the three of them do not each invent one.
+
+    Two kinds of event, matching the contract in
+    `inference-driver.yaml`: a token event carries `text` with
+    `done=False`, and the final event carries `done=True` plus
+    `result`. A token event whose text is empty is legal and is simply
+    not forwarded -- upstream SSE feeds routinely open with a delta
+    that carries only a role.
+    """
+
+    text: str = ""
+    done: bool = False
+    result: GenerateResponse | None = None
+
+
 class BackendEngine(Protocol):
     """The interface every backend implementation honors.
 
@@ -58,6 +80,18 @@ class BackendEngine(Protocol):
     """Reported in `/v1/info` and on every `GenerateResponse` so ops can
     see *which protocol* the driver is speaking. Distinct from the
     user-facing `provider` — many providers share one backend kind."""
+
+    supports_streaming: bool
+    """Whether `stream()` emits genuinely incremental tokens.
+
+    Reported as `capabilities.streaming` on `/v1/info`, whose contract
+    wording is "whether `/v1/generate/stream` emits **true incremental**
+    tokens". It is allowed to be False and must be honest when it is:
+    the stream contract explicitly permits a backend to emit the whole
+    response as one token event followed by `done`, so a batching
+    backend still works — it just cannot promise early delivery, and a
+    flag that claimed otherwise would be useless for the one thing it
+    is for."""
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -81,8 +115,23 @@ class BackendEngine(Protocol):
         """Single-shot generation. Returns the full response."""
         ...
 
-    async def stream(self, request: GenerateRequest) -> AsyncIterator[StreamChunk]:
-        """Streamed generation. Yields chunks ending with one where `done` is True."""
+    def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamChunk, None]:
+        """Streamed generation. Yields chunks ending with one where `done` is True.
+
+        Declared with a plain `def` returning an `AsyncIterator`, not
+        `async def`. An async-generator function is not a coroutine: the
+        call returns the iterator directly. Writing `async def` here
+        typed the call as `Coroutine[..., AsyncIterator[...]]`, so every
+        caller looked like it needed an extra `await` -- which nothing
+        noticed for nine milestones because nothing called it.
+
+        `AsyncGenerator` rather than `AsyncIterator`, because cleanup on
+        abandonment is load-bearing: a client that disconnects mid-answer
+        must leave no subprocess generating and no upstream response
+        open, and `aclose()` running the implementation's `finally` is
+        what guarantees that. An iterator without it would satisfy the
+        types and leak the process.
+        """
         ...
 
     async def list_models(self) -> list[str]:

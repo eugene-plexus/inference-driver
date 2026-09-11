@@ -108,4 +108,124 @@ def strip_thinking_blocks(text: str) -> str:
     return cleaned.strip()
 
 
-__all__ = ["THINKING_MODE_INSTRUCTIONS", "apply_thinking_mode", "strip_thinking_blocks"]
+class ThinkingFilter:
+    """`strip_thinking_blocks`, but for text arriving a piece at a time.
+
+    **Why this has to exist.** The batch stripper runs the regex over a
+    finished response, which streaming cannot do: a `<think>` block
+    forwarded to the client cannot be un-sent. M10 would otherwise have
+    made `thinkingMode: off` silently weaker for exactly the clients
+    that stream -- the same shape of defect as M8's, where the
+    non-streaming path carried the routing envelope and the streaming
+    path did not.
+
+    So this is a small state machine that holds back any text which
+    might yet turn out to be a tag. Two things it must get right, both
+    of which a naive "strip each chunk" gets wrong:
+
+      * **Tags split across chunks.** Upstream may deliver `<th` and
+        `ink>` in separate SSE events, so the filter withholds any tail
+        that is still a viable prefix of an opening tag.
+      * **Attributes.** The batch pattern is `<think[^>]*>`, so an
+        opening tag can be arbitrarily long; once `<think` is seen the
+        filter waits for `>` rather than assuming a fixed width.
+
+    `feed` returns the text safe to emit now, which may be empty.
+    `flush` returns whatever was still withheld at end of stream --
+    non-empty only when the model stopped mid-tag, in which case the
+    withheld text was never a tag and is real output the client is owed.
+
+    The invariant worth testing, and tested: for any chunking of any
+    input, the concatenation of every `feed` plus `flush` equals
+    `strip_thinking_blocks` of the whole -- modulo the outer `.strip()`,
+    which a streamer cannot apply to text it has already sent.
+    """
+
+    _OPEN = "<think"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        #: None = outside a block; "opening" = seen `<think`, waiting for
+        #: `>`; "inside" = within a block, waiting for `</think>`.
+        self._state: str | None = None
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            if self._state is None:
+                index = self._find_open(self._buf)
+                if index is None:
+                    # No tag can begin in what is left; emit all but a
+                    # tail that is still a viable prefix of one.
+                    keep = self._viable_prefix_len(self._buf)
+                    if keep:
+                        out.append(self._buf[:-keep])
+                        self._buf = self._buf[-keep:]
+                    else:
+                        out.append(self._buf)
+                        self._buf = ""
+                    break
+                out.append(self._buf[:index])
+                self._buf = self._buf[index:]
+                self._state = "opening"
+            elif self._state == "opening":
+                end = self._buf.find(">")
+                if end == -1:
+                    # Still inside the opening tag; withhold everything.
+                    break
+                self._buf = self._buf[end + 1 :]
+                self._state = "inside"
+            else:
+                end = self._buf.lower().find(self._CLOSE)
+                if end == -1:
+                    # Inside the block. Drop all but a tail that might be
+                    # a partial closing tag -- dropping that too would
+                    # lose the boundary and leak the rest of the answer.
+                    keep = min(len(self._buf), len(self._CLOSE) - 1)
+                    self._buf = self._buf[len(self._buf) - keep :] if keep else ""
+                    break
+                self._buf = self._buf[end + len(self._CLOSE) :]
+                self._state = None
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Whatever is still withheld. Only non-empty on a truncated tag."""
+        if self._state is not None:
+            # An unterminated block is thinking text, not an answer.
+            self._buf = ""
+            self._state = None
+            return ""
+        out, self._buf = self._buf, ""
+        return out
+
+    @classmethod
+    def _find_open(cls, text: str) -> int | None:
+        """Index of a complete-enough `<think` marker, or None."""
+        lowered = text.lower()
+        index = lowered.find(cls._OPEN)
+        return index if index != -1 else None
+
+    @classmethod
+    def _viable_prefix_len(cls, text: str) -> int:
+        """How many trailing chars could still become an opening tag.
+
+        `<thin` must be withheld because the next chunk may carry `k>`.
+        Checked case-insensitively, since the batch pattern is
+        IGNORECASE and a model emitting `<THINK>` must not slip past a
+        filter that only knows the lowercase spelling.
+        """
+        lowered = text.lower()
+        for size in range(min(len(text), len(cls._OPEN) - 1), 0, -1):
+            if cls._OPEN.startswith(lowered[-size:]):
+                return size
+        return 0
+
+
+__all__ = [
+    "THINKING_MODE_INSTRUCTIONS",
+    "ThinkingFilter",
+    "apply_thinking_mode",
+    "strip_thinking_blocks",
+]

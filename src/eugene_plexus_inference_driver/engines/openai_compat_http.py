@@ -27,7 +27,8 @@ import json
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
@@ -44,7 +45,8 @@ from .._generated.models import (
     Usage,
 )
 from ._subprocess import CliError
-from ._thinking import apply_thinking_mode, strip_thinking_blocks
+from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
+from .base import Chunk
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +141,23 @@ def _max_tokens_field_for(base_url: str) -> str:
     return "max_completion_tokens" if "openai.com" in base_url.lower() else "max_tokens"
 
 
+def _sse_data(line: str) -> str | None:
+    """The payload of one SSE `data:` line, or None for anything else.
+
+    Deliberately narrow. This reads *upstream's* SSE (llama.cpp, vLLM,
+    Ollama, OpenAI and the rest all frame it the same way): one JSON
+    object per `data:` line, blank lines between events, `:` comments
+    used as keep-alives. Event names, multi-line data and `id:`/`retry:`
+    fields do not appear on this wire and are ignored rather than
+    half-supported.
+    """
+    if not line or line.startswith(":"):
+        return None
+    if not line.startswith("data:"):
+        return None
+    return line[5:].strip()
+
+
 class OpenAiCompatibleHttpEngine:
     """OpenAI-compatible HTTP engine. Provider-agnostic."""
 
@@ -147,6 +166,10 @@ class OpenAiCompatibleHttpEngine:
     #: is not a runtime — so `app.build_engine_with` consults this before
     #: resolving `runtimeName` at all.
     follows_runtimes = True
+
+    #: Upstream SSE delivers real per-token deltas, so `stream()`
+    #: yields text as the model produces it.
+    supports_streaming = True
 
     def __init__(
         self,
@@ -257,7 +280,14 @@ class OpenAiCompatibleHttpEngine:
             runtime=runtime_name if runtime_url else None,
         )
 
-    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+    def _payload_for(self, request: GenerateRequest) -> dict[str, Any]:
+        """The chat-completions body for this request.
+
+        Shared by `generate` and `stream` so the two cannot drift on
+        param shaping -- which would be an especially quiet bug, since
+        the only symptom would be a streamed answer differing from a
+        non-streamed one for the same request.
+        """
         # Apply the operator's thinkingMode by mutating the system
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
@@ -273,6 +303,20 @@ class OpenAiCompatibleHttpEngine:
             payload["temperature"] = float(request.temperature)
         if request.stop:
             payload["stop"] = list(request.stop)
+        return payload
+
+    def _headers(self) -> dict[str, str]:
+        # No key means no header, not `Bearer None`. Providers that need
+        # auth reject a missing header with a readable 401; a literal
+        # "None" is a malformed credential, and some servers answer that
+        # with a 400 that reads like our payload was wrong.
+        headers = {"Accept": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        payload = self._payload_for(request)
 
         # DEBUG-level full-payload trace. The gateway's copy-trace
         # captures what we sent it; this captures what WE send upstream
@@ -287,13 +331,7 @@ class OpenAiCompatibleHttpEngine:
                 json.dumps(payload, indent=2, ensure_ascii=False),
             )
 
-        # No key means no header, not `Bearer None`. Providers that need
-        # auth reject a missing header with a readable 401; a literal
-        # "None" is a malformed credential, and some servers answer that
-        # with a 400 that reads like our payload was wrong.
-        headers = {"Accept": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
+        headers = self._headers()
 
         async with httpx.AsyncClient(
             base_url=self._base_url,
@@ -361,11 +399,108 @@ class OpenAiCompatibleHttpEngine:
             latencyMs=int(response.elapsed.total_seconds() * 1000),
         )
 
-    async def stream(self, request: GenerateRequest) -> AsyncIterator[object]:
-        # SSE streaming via stream=true is supported by the wire shape
-        # but no consumer of inference-driver streaming exists yet.
-        raise NotImplementedError("OpenAiCompatibleHttpEngine.stream not implemented in v0.1")
-        yield  # pragma: no cover
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
+        """Token-by-token, over upstream's own SSE.
+
+        The wire shape is OpenAI's: `data:` lines carrying a chunk whose
+        `choices[0].delta.content` is the new text, terminated by a
+        literal `data: [DONE]`. Deltas that carry only a role are
+        normal and yield nothing.
+
+        Two things here are not obvious:
+
+        **`thinkingMode: off` needs an incremental filter.** The batch
+        path strips `<think>...</think>` from a finished string, which
+        a stream cannot do -- a block already forwarded cannot be
+        un-sent. `ThinkingFilter` withholds text that might still turn
+        out to be a tag. Without it this mode would be silently weaker
+        for exactly the clients that stream.
+
+        **`usage` usually is not there.** Most servers omit it on a
+        streamed response unless asked; llama.cpp and vLLM both honour
+        `stream_options.include_usage`, so we ask, and tolerate its
+        absence rather than failing the request over accounting.
+
+        The response is closed by the `async with`, including when the
+        consumer abandons the generator -- which is what a client
+        disconnect looks like from here.
+        """
+        payload = self._payload_for(request)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+
+        started = time.monotonic()
+        filtered = ThinkingFilter() if self._thinking_mode == "off" else None
+        emitted: list[str] = []
+        finish_reason = "stop"
+        usage_payload: dict[str, Any] = {}
+        served_model = self._model_id
+
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
+        ) as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={**self._headers(), "Accept": "text/event-stream"},
+                    json=payload,
+                ) as response:
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        raise CliError(
+                            f"openai_compat_http returned {response.status_code}: "
+                            f"{_redact(body.decode('utf-8', 'replace')[:500])}"
+                        )
+                    async for line in response.aiter_lines():
+                        data = _sse_data(line)
+                        if data is None:
+                            continue
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except ValueError:
+                            # A malformed frame mid-stream is not worth
+                            # failing a half-delivered answer over.
+                            log.debug("openai_compat_http: unparseable SSE frame %r", data[:200])
+                            continue
+                        served_model = str(event.get("model") or served_model)
+                        if event.get("usage"):
+                            usage_payload = event["usage"]
+                        for choice in event.get("choices") or []:
+                            if choice.get("finish_reason"):
+                                finish_reason = str(choice["finish_reason"])
+                            text = ((choice.get("delta") or {}).get("content")) or ""
+                            if not text:
+                                continue
+                            visible = filtered.feed(text) if filtered is not None else text
+                            if visible:
+                                emitted.append(visible)
+                                yield Chunk(text=visible)
+            except httpx.HTTPError as e:
+                raise CliError(f"openai_compat_http stream failed: {e}") from e
+
+        if filtered is not None:
+            tail = filtered.flush()
+            if tail:
+                emitted.append(tail)
+                yield Chunk(text=tail)
+
+        content = "".join(emitted)
+        yield Chunk(
+            done=True,
+            result=GenerateResponse(
+                content=content,
+                finishReason=_FINISH_REASON_MAP.get(finish_reason, FinishReason.stop),
+                usage=_usage_from_envelope(usage_payload),
+                requestId=request.requestId,
+                backend=self.backend_kind,
+                modelId=served_model,
+                latencyMs=int((time.monotonic() - started) * 1000),
+            ),
+        )
 
     async def list_models(self) -> list[str]:
         """Live-fetch the model catalog from the configured base URL.

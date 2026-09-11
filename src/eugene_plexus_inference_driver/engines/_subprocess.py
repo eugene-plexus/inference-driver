@@ -7,9 +7,11 @@ builder and its output parser.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 # Forced-UTF-8 environment for child processes. The smoke test on
@@ -46,6 +48,94 @@ class CliResult:
     stderr: bytes
     returncode: int
     elapsed_ms: int
+
+
+async def stream_cli_lines(
+    argv: list[str],
+    *,
+    timeout_seconds: float,
+    stdin_input: bytes | None = None,
+) -> AsyncIterator[str]:
+    """Run argv and yield its stdout a line at a time, as it arrives.
+
+    The streaming counterpart to `run_cli`, which buffers to completion
+    and therefore cannot be used for token delivery -- a CLI backend
+    that emits JSONL is already producing tokens, and `communicate()`
+    hides them until the process exits.
+
+    Three things this owes the caller that a naive read loop does not:
+
+      * **The child dies with the iterator.** A consumer that stops
+        early -- which is what a client disconnecting mid-stream looks
+        like from here -- runs the `finally`, which kills the process
+        rather than leaving a model generating into a closed pipe.
+      * **The timeout covers the whole stream**, not one read, because a
+        CLI that emits one line and then wedges is the case worth
+        bounding.
+      * **stderr is drained concurrently.** A child that fills the
+        stderr pipe while we only read stdout deadlocks, and the CLI
+        backends are chatty on stderr -- codex writes an auth-refresh
+        error per event.
+
+    Decoding is UTF-8 with replacement, matching `run_cli`: a mangled
+    character must not end a half-delivered answer.
+    """
+    if not argv:
+        raise ValueError("argv is empty")
+    binary = argv[0]
+    resolved = shutil.which(binary)
+    if resolved is None:
+        raise CliError(f"binary {binary!r} not found on PATH")
+    argv = [resolved, *argv[1:]]
+
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE if stdin_input is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_utf8_subprocess_env(),
+    )
+    assert proc.stdout is not None
+
+    async def _drain_stderr() -> bytes:
+        if proc.stderr is None:
+            return b""
+        return await proc.stderr.read()
+
+    stderr_task = asyncio.create_task(_drain_stderr())
+    deadline = time.perf_counter() + timeout_seconds
+
+    try:
+        if stdin_input is not None and proc.stdin is not None:
+            proc.stdin.write(stdin_input)
+            await proc.stdin.drain()
+            proc.stdin.close()
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise CliError(f"CLI {binary!r} did not finish within {timeout_seconds}s; killed")
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            except TimeoutError as e:
+                raise CliError(
+                    f"CLI {binary!r} did not finish within {timeout_seconds}s; killed"
+                ) from e
+            if not line:
+                break
+            yield line.decode("utf-8", "replace").rstrip()
+        await asyncio.wait_for(proc.wait(), timeout=max(0.1, deadline - time.perf_counter()))
+        if proc.returncode:
+            stderr = (await stderr_task).decode("utf-8", "replace").strip()
+            raise CliError(f"{binary} exited {proc.returncode}: {stderr or '<no stderr>'}")
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await stderr_task
 
 
 async def run_cli(

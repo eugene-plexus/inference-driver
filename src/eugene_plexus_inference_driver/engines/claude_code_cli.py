@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from .._generated.models import (
@@ -48,8 +49,9 @@ from .._generated.models import (
     Usage,
 )
 from ._prompt import messages_to_prompt
-from ._subprocess import CliError, run_cli
+from ._subprocess import CliError, run_cli, stream_cli_lines
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
+from .base import Chunk
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,10 @@ _KNOWN_CLAUDE_MODELS: list[str] = [
 
 class ClaudeCodeCliEngine:
     backend_kind = BackendKind.claude_code_cli
+
+    #: `--include-partial-messages` yields real `text_delta` events,
+    #: verified against the CLI at v2.1.207.
+    supports_streaming = True
 
     def __init__(
         self,
@@ -213,12 +219,112 @@ class ClaudeCodeCliEngine:
             latencyMs=result.elapsed_ms,
         )
 
-    async def stream(self, request: GenerateRequest) -> AsyncIterator[object]:
-        # Claude Code CLI does support streaming via
-        # --output-format stream-json --include-partial-messages, but no
-        # consumer of inference-driver streaming exists yet.
-        raise NotImplementedError("ClaudeCodeCliEngine.stream not implemented in v0.1")
-        yield  # pragma: no cover
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
+        """Token-by-token, over Claude Code's `stream-json` output.
+
+        **The event shapes here were captured from the real CLI
+        (v2.1.207), not remembered.** `--output-format stream-json
+        --include-partial-messages --verbose` emits one JSON object per
+        line, and the ones that matter are:
+
+          * `{"type":"stream_event","event":{"type":"content_block_delta",
+            "delta":{"type":"text_delta","text":"..."}}}` — the answer,
+            arriving a fragment at a time. This is what we forward.
+          * the same wrapper with `"delta":{"type":"thinking_delta",
+            "thinking":"..."}` — extended reasoning, which must **not**
+            be forwarded as content. Claude Code carries thinking in its
+            own field rather than inline `<think>` tags, so the
+            `ThinkingFilter` the HTTP engine needs has nothing to do
+            here: dropping a delta by type is exact where a text filter
+            would be a guess.
+          * `{"type":"result","subtype":"success","result":"...",...}` —
+            the terminal envelope, identical to the one `--output-format
+            json` produces, so the final chunk is built by the same code
+            path as `generate()` rather than a second parser that could
+            disagree with it.
+
+        `--verbose` is not optional: Claude Code refuses
+        `--output-format stream-json` under `--print` without it.
+        """
+        messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
+        system_messages = [m for m in messages if m.role == Role.system]
+        other_messages = [m for m in messages if m.role != Role.system]
+        system_prompt = "\n\n".join(m.content for m in system_messages).strip()
+        user_prompt = messages_to_prompt(other_messages)
+
+        argv = self._build_argv(system_prompt=system_prompt, stream=True)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("claude_code_cli → (stream) argv:\n%s", argv)
+
+        started = time.perf_counter()
+        emitted: list[str] = []
+        envelope: dict[str, Any] | None = None
+
+        async for line in stream_cli_lines(
+            argv,
+            timeout_seconds=self._timeout_seconds,
+            stdin_input=user_prompt.encode("utf-8"),
+        ):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # Claude Code writes progress lines that are not JSON when
+                # a terminal is attached; ignore rather than fail a
+                # half-delivered answer.
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type")
+            if kind == "result":
+                envelope = event
+                continue
+            if kind != "stream_event":
+                continue
+            inner = event.get("event") or {}
+            if inner.get("type") != "content_block_delta":
+                continue
+            delta = inner.get("delta") or {}
+            # Only text. `thinking_delta` and `signature_delta` are the
+            # reasoning block and its attestation, neither of which is
+            # the answer.
+            if delta.get("type") != "text_delta":
+                continue
+            text = delta.get("text")
+            if isinstance(text, str) and text:
+                emitted.append(text)
+                yield Chunk(text=text)
+
+        if envelope is None:
+            raise CliError("claude stream ended without a `result` envelope")
+        if envelope.get("is_error"):
+            raise CliError(f"claude reported error: {envelope.get('result')!r}")
+
+        # Prefer the envelope's own `result` over our reassembly: it is
+        # what `generate()` returns, so the two paths cannot disagree
+        # about the final content. Fall back to what we streamed if the
+        # envelope somehow carries none.
+        content = envelope.get("result")
+        if not isinstance(content, str):
+            content = "".join(emitted)
+        if self._thinking_mode == "off":
+            content = strip_thinking_blocks(content)
+
+        yield Chunk(
+            done=True,
+            result=GenerateResponse(
+                content=content,
+                finishReason=_STOP_REASON_MAP.get(
+                    str(envelope.get("stop_reason") or ""), FinishReason.stop
+                ),
+                usage=_usage_from_envelope(envelope.get("usage") or {}),
+                requestId=request.requestId,
+                backend=BackendKind.claude_code_cli,
+                modelId=self._model_id,
+                latencyMs=int((time.perf_counter() - started) * 1000),
+            ),
+        )
 
     async def list_models(self) -> list[str]:
         # Claude Code CLI doesn't expose a list endpoint — return a
@@ -226,13 +332,18 @@ class ClaudeCodeCliEngine:
         # models support tunable temperature.
         return list(_KNOWN_CLAUDE_MODELS)
 
-    def _build_argv(self, *, system_prompt: str) -> list[str]:
+    def _build_argv(self, *, system_prompt: str, stream: bool = False) -> list[str]:
         argv = [
             self._binary_path,
             "--print",
             "--output-format",
-            "json",
+            "stream-json" if stream else "json",
         ]
+        if stream:
+            # `--verbose` is required: Claude Code refuses stream-json
+            # under --print without it. `--include-partial-messages` is
+            # what turns whole-message events into text deltas.
+            argv += ["--include-partial-messages", "--verbose"]
         if system_prompt:
             argv += ["--system-prompt", system_prompt]
         if self._model_id:
