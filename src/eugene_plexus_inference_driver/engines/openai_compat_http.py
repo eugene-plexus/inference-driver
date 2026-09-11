@@ -432,6 +432,11 @@ class OpenAiCompatibleHttpEngine:
         started = time.monotonic()
         filtered = ThinkingFilter() if self._thinking_mode == "off" else None
         emitted: list[str] = []
+        # Did upstream actually say it was finished? Iterating a closed
+        # connection simply ends, so without one of these two markers a
+        # backend that died mid-answer is indistinguishable from one that
+        # completed -- see the raise below.
+        saw_terminator = False
         finish_reason = "stop"
         usage_payload: dict[str, Any] = {}
         served_model = self._model_id
@@ -458,6 +463,7 @@ class OpenAiCompatibleHttpEngine:
                         if data is None:
                             continue
                         if data == "[DONE]":
+                            saw_terminator = True
                             break
                         try:
                             event = json.loads(data)
@@ -472,6 +478,7 @@ class OpenAiCompatibleHttpEngine:
                         for choice in event.get("choices") or []:
                             if choice.get("finish_reason"):
                                 finish_reason = str(choice["finish_reason"])
+                                saw_terminator = True
                             text = ((choice.get("delta") or {}).get("content")) or ""
                             if not text:
                                 continue
@@ -481,6 +488,23 @@ class OpenAiCompatibleHttpEngine:
                                 yield Chunk(text=visible)
             except httpx.HTTPError as e:
                 raise CliError(f"openai_compat_http stream failed: {e}") from e
+
+        if not saw_terminator:
+            # **Found by M10's acceptance run, which fixtures could not
+            # produce.** A backend that vanishes mid-answer closes the
+            # connection, `aiter_lines()` ends without raising, and this
+            # method used to fall through and emit a `done` carrying
+            # whatever had arrived -- reporting a truncated answer as a
+            # completed one, with a 200. Upstream marks the end with
+            # `data: [DONE]` or a `finish_reason` (llama.cpp, vLLM and
+            # Ollama all send at least one); neither means the stream was
+            # cut, and saying so is what lets the gateway emit an error
+            # frame instead of presenting half an answer as whole.
+            raise CliError(
+                "openai_compat_http stream ended without [DONE] or a finish_reason "
+                f"after {len(''.join(emitted))} characters: the backend closed the "
+                "connection mid-answer"
+            )
 
         if filtered is not None:
             tail = filtered.flush()

@@ -448,3 +448,61 @@ async def test_openai_live_call() -> None:
         _request(prompt="Reply with exactly the four characters: PING", system="You are concise.")
     )
     assert "PING" in response.content
+
+
+@respx.mock
+async def test_a_stream_cut_short_is_an_error_not_a_completion() -> None:
+    """Found by M10's live acceptance run, which fixtures had missed.
+
+    A backend that dies mid-answer just closes the connection.
+    `aiter_lines()` ends without raising, so the engine used to fall
+    through and emit its `done` chunk carrying whatever had arrived --
+    a truncated answer reported as a finished one, with a 200 all the
+    way back to the client. Upstream always marks the end, with either
+    `data: [DONE]` or a `finish_reason`; neither means the stream was
+    cut.
+    """
+    cut_short = (
+        'data: {"model":"m","choices":[{"delta":{"content":"half an "}}]}\n\n'
+        'data: {"model":"m","choices":[{"delta":{"content":"answer"}}]}\n\n'
+    )
+    respx.post("http://127.0.0.1:8090/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, text=cut_short, headers={"content-type": "text/event-stream"}
+        )
+    )
+    engine = OpenAiCompatibleHttpEngine(
+        base_url="http://127.0.0.1:8090", model_id="m", auth_required=False
+    )
+    request = GenerateRequest(messages=[Message(role=Role.user, content="hi")])
+
+    seen: list[str] = []
+    with pytest.raises(CliError, match="closed the connection mid-answer"):
+        async for chunk in engine.stream(request):
+            if not chunk.done:
+                seen.append(chunk.text)
+
+    # The tokens that did arrive were still delivered: truncating is
+    # honest, swallowing what the user already saw is not.
+    assert seen == ["half an ", "answer"]
+
+
+@respx.mock
+async def test_a_finish_reason_alone_is_enough_of_a_terminator() -> None:
+    """Not every server sends `[DONE]`. One that reports a finish_reason
+    has said the same thing, and must not be treated as truncated."""
+    ended = (
+        'data: {"model":"m","choices":[{"delta":{"content":"done"}}]}\n\n'
+        'data: {"model":"m","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    )
+    respx.post("http://127.0.0.1:8090/v1/chat/completions").mock(
+        return_value=httpx.Response(200, text=ended, headers={"content-type": "text/event-stream"})
+    )
+    engine = OpenAiCompatibleHttpEngine(
+        base_url="http://127.0.0.1:8090", model_id="m", auth_required=False
+    )
+    request = GenerateRequest(messages=[Message(role=Role.user, content="hi")])
+    chunks = [c async for c in engine.stream(request)]
+    assert chunks[-1].done
+    assert chunks[-1].result is not None
+    assert chunks[-1].result.content == "done"
