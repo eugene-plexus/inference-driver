@@ -42,6 +42,7 @@ from .._generated.models import (
     ConfigField,
     ConfigFieldShowWhen,
     ConfigValueType,
+    EmbedResponse,
     FinishReason,
     GenerateRequest,
     GenerateResponse,
@@ -85,6 +86,11 @@ class ClaudeCodeCliEngine:
     #: verified against the CLI at v2.1.207.
     supports_streaming = True
     supports_tool_calling = False
+    #: Declared, not inherited: `BackendEngine` is a Protocol, so a
+    #: default on it reaches nothing. A CLI subscription has no
+    #: embeddings surface at all -- there is no flag that makes the
+    #: harness on the other side of the pipe return a vector.
+    supports_embeddings = False
     """Claude Code CLI takes a prompt and returns prose; its own tool use
     is internal to the subprocess and is not exposed as OpenAI tool
     calls we could carry.
@@ -332,6 +338,18 @@ class ClaudeCodeCliEngine:
                 modelId=self._model_id,
                 latencyMs=int((time.perf_counter() - started) * 1000),
             ),
+        )
+
+    async def embed(self, inputs: list[str]) -> EmbedResponse:
+        """Refused. A CLI subscription exposes no embeddings surface at
+        all -- there is no flag that makes the harness on the other side
+        of the pipe return a vector. `supports_embeddings` stays False,
+        so the route rejects before reaching here; this exists so the
+        engine satisfies the protocol rather than failing at import."""
+        raise CliError(
+            f"the {self.backend_kind.value} backend has no embeddings surface; "
+            "point an inference-driver at a local engine or an OpenAI-compatible "
+            "provider to serve embeddings."
         )
 
     async def context_window(self) -> int | None:

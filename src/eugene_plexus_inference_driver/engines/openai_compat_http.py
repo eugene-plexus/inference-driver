@@ -38,6 +38,7 @@ from .._generated.models import (
     ConfigField,
     ConfigFieldShowWhen,
     ConfigValueType,
+    EmbedResponse,
     FinishReason,
     Function1,
     FunctionCall,
@@ -218,6 +219,11 @@ class OpenAiCompatibleHttpEngine:
     #: yields text as the model produces it.
     supports_streaming = True
     supports_tool_calling = True
+    #: Set from `probe_embeddings()` at first ask, not declared --
+    #: the backend is the only thing that knows, and it only knows
+    #: when asked. False until then, which is honest: an
+    #: unprobed backend has made no promise.
+    supports_embeddings = False
 
     def __init__(
         self,
@@ -267,6 +273,11 @@ class OpenAiCompatibleHttpEngine:
         #: window would be wrong.
         self._context_window: int | None = None
         self._context_window_checked_at: float | None = None
+        #: Whether the backend will embed. Determined by trying, once,
+        #: and cached for the life of the engine -- which is the right
+        #: lifetime: it cannot change without the backend restarting,
+        #: and the engine is rebuilt on every config change.
+        self._embeddings: bool | None = None
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -644,6 +655,94 @@ class OpenAiCompatibleHttpEngine:
             ),
         )
 
+    async def embed(self, inputs: list[str]) -> EmbedResponse:
+        """`POST /v1/embeddings` upstream, in the shape OpenAI defined.
+
+        **Always asks for floats.** The base64 encoding the OpenAI SDKs
+        request by default is applied by the gateway instead, so a
+        caller sees identical behaviour whether or not this particular
+        backend implements `encoding_format` -- and several do not.
+        """
+        started = time.monotonic()
+        payload: dict[str, Any] = {"model": self._model_id, "input": inputs}
+
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
+        ) as client:
+            try:
+                response = await client.post(
+                    "/v1/embeddings", headers=self._headers(), json=payload
+                )
+            except httpx.HTTPError as e:
+                raise CliError(f"openai_compat_http embeddings request failed: {e}") from e
+
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for embeddings: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+            )
+        try:
+            body = response.json()
+        except ValueError as e:
+            raise CliError(
+                f"openai_compat_http returned non-JSON for embeddings: {response.text[:200]!r}"
+            ) from e
+
+        vectors = _vectors_from_envelope(body, expected=len(inputs))
+        return EmbedResponse(
+            embeddings=vectors,
+            modelId=str(body.get("model") or self._model_id),
+            backend=self.backend_kind,
+            usage=_usage_from_envelope(body.get("usage") or {}),
+            latencyMs=int((time.monotonic() - started) * 1000),
+        )
+
+    async def probe_embeddings(self) -> bool:
+        """Whether this backend will embed, determined by asking it to.
+
+        **There is no read-only signal, and that was measured rather
+        than assumed.** `llama-server` b9846's `/props` exposes no
+        pooling or embedding field; Ollama's OpenAI-compatible surface
+        says nothing either, and its `/api/ps` reports a context length
+        but not a task. The capability also belongs to the *runner*
+        rather than the model -- an Ollama runner started for chat
+        refuses to embed the very model it is serving.
+
+        So: send the smallest possible request and see. The negative
+        case costs nothing measurable -- llama.cpp rejects a non-pooling
+        model in 45 ms, before any compute, and Ollama answers
+        immediately -- while the positive case costs one tiny embedding
+        against a model this driver exists to serve.
+
+        Cached for the engine's lifetime once there is a definite
+        answer. A transport failure is **not** a definite answer and is
+        not cached, or a backend that happened to be down at startup
+        would be recorded as incapable forever.
+        """
+        if self._embeddings is not None:
+            return self._embeddings
+        try:
+            await self.embed(["1"])
+        except CliError as e:
+            status = getattr(e, "upstream_status", None)
+            if status is None:
+                log.debug("embeddings probe inconclusive (transport): %s", e)
+                return False
+            # A definite "no" from the backend. 4xx and 5xx both count:
+            # a server that errors on a one-character embed is not one
+            # to advertise an embeddings surface for.
+            log.info("backend at %s does not serve embeddings (HTTP %s)", self._base_url, status)
+            self._embeddings = False
+            return False
+        except (httpx.HTTPError, ValueError) as e:
+            log.debug("embeddings probe inconclusive: %s", e)
+            return False
+        log.info("backend at %s serves embeddings", self._base_url)
+        self._embeddings = True
+        return True
+
     async def context_window(self) -> int | None:
         """The context window this backend resolved, read back from it.
 
@@ -1008,6 +1107,46 @@ def _tool_calls_from_wire(raw: Any) -> list[ToolCall]:
             )
         )
     return calls
+
+
+def _vectors_from_envelope(body: Any, *, expected: int) -> list[list[float]]:
+    """`data[].embedding`, ordered by `index`.
+
+    **Sorted by `index` rather than trusted in arrival order.** OpenAI
+    documents that `data` may come back out of order, and the caller has
+    no other way to match a vector to its input -- an embedding carries
+    no identity. Getting this wrong would silently pair every vector
+    with the wrong text, which is the failure that looks like a working
+    system producing bad search results.
+    """
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list) or not data:
+        raise CliError(f"openai_compat_http returned no embeddings: {body!r}")
+    rows: list[tuple[int, list[float]]] = []
+    for position, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise CliError(f"openai_compat_http returned a malformed embedding entry: {entry!r}")
+        vector = entry.get("embedding")
+        if isinstance(vector, str):
+            # The backend answered base64 even though we asked for
+            # floats. Refused rather than decoded: we never requested it,
+            # so something is translating the request, and quietly
+            # coping would hide that.
+            raise CliError(
+                "openai_compat_http returned a base64 embedding for a float request; "
+                "the driver asks for floats and the gateway does any encoding"
+            )
+        if not isinstance(vector, list) or not vector:
+            raise CliError(f"openai_compat_http returned a malformed embedding: {entry!r}")
+        index = entry.get("index")
+        rows.append((index if isinstance(index, int) else position, [float(x) for x in vector]))
+    rows.sort(key=lambda r: r[0])
+    if len(rows) != expected:
+        raise CliError(
+            f"openai_compat_http returned {len(rows)} embeddings for {expected} inputs; "
+            "order and count are the only way a caller can match vectors to text"
+        )
+    return [v for _, v in rows]
 
 
 def _usage_from_envelope(usage: dict[str, Any]) -> Usage | None:

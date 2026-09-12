@@ -54,6 +54,7 @@ from .._generated.models import (
     ConfigField,
     ConfigFieldShowWhen,
     ConfigValueType,
+    EmbedResponse,
     FinishReason,
     GenerateRequest,
     GenerateResponse,
@@ -89,6 +90,11 @@ class CodexCliEngine:
     #: `stream` for why this is False rather than optimistic.
     supports_streaming = False
     supports_tool_calling = False
+    #: Declared, not inherited: `BackendEngine` is a Protocol, so a
+    #: default on it reaches nothing. A CLI subscription has no
+    #: embeddings surface at all -- there is no flag that makes the
+    #: harness on the other side of the pipe return a vector.
+    supports_embeddings = False
     """Codex CLI takes a prompt and returns prose; it exposes no
     OpenAI-shaped tool-call surface to carry.
 
@@ -304,6 +310,18 @@ class CodexCliEngine:
                 modelId=self._model_id,
                 latencyMs=int((time.perf_counter() - started) * 1000),
             ),
+        )
+
+    async def embed(self, inputs: list[str]) -> EmbedResponse:
+        """Refused. A CLI subscription exposes no embeddings surface at
+        all -- there is no flag that makes the harness on the other side
+        of the pipe return a vector. `supports_embeddings` stays False,
+        so the route rejects before reaching here; this exists so the
+        engine satisfies the protocol rather than failing at import."""
+        raise CliError(
+            f"the {self.backend_kind.value} backend has no embeddings surface; "
+            "point an inference-driver at a local engine or an OpenAI-compatible "
+            "provider to serve embeddings."
         )
 
     async def context_window(self) -> int | None:

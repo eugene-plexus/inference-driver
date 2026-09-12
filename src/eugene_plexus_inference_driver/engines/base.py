@@ -28,6 +28,7 @@ from typing import Any, Protocol
 from .._generated.models import (
     BackendKind,
     ConfigField,
+    EmbedResponse,
     GenerateRequest,
     GenerateResponse,
     ToolCallDelta,
@@ -148,6 +149,36 @@ class BackendEngine(Protocol):
         open, and `aclose()` running the implementation's `finally` is
         what guarantees that. An iterator without it would satisfy the
         types and leak the process.
+        """
+        ...
+
+    supports_embeddings: bool = False
+    """Whether `embed()` works against this backend.
+
+    **Not a property of the model, and not readable from anything.**
+    Measured 2026-09-12: `llama-server`'s `/props` carries no pooling or
+    embedding field at all, and an Ollama runner started for chat
+    answers "This server does not support embeddings. Start it with
+    --embeddings". So the HTTP engine determines it by trying once and
+    caching -- see `OpenAiCompatibleHttpEngine.probe_embeddings`.
+
+    Defaults to False so a new engine is honest by omission, the same
+    reasoning as `supports_tool_calling`: the failure mode of the
+    opposite default is a caller receiving something that is not an
+    embedding.
+    """
+
+    async def embed(self, inputs: list[str]) -> EmbedResponse:
+        """Vectors for each input, in the order the inputs arrived.
+
+        Order is the contract. An embedding carries no identity of its
+        own, so position is the only thing that lets a caller match a
+        vector back to the text it came from.
+
+        Floats, never base64. The base64 encoding the OpenAI SDKs ask
+        for by default is a transport detail the gateway applies, so
+        that a caller gets the same behaviour whether or not the backend
+        underneath implements it.
         """
         ...
 

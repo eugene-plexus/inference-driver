@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from .._generated.models import GenerateRequest, GenerateResponse, Problem
+from .._generated.models import (
+    EmbedRequest,
+    EmbedResponse,
+    GenerateRequest,
+    GenerateResponse,
+    Problem,
+)
 from ..engines._subprocess import CliError
 
 if TYPE_CHECKING:
@@ -90,6 +96,52 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
             await stream.aclose()
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@router.post("/v1/embed", response_model=EmbedResponse)
+async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
+    """Text in, vectors out, in the order the text arrived.
+
+    **Refused, never substituted.** A backend that cannot embed gets a
+    400 naming itself, rather than anything that might be mistaken for
+    an embedding. That is the same rule tool calling landed on and for
+    a sharper reason: a caller cannot look at a vector and tell whether
+    it is wrong, and if it reaches a vector store the mistake outlives
+    the request.
+    """
+    engine: BackendEngine | None = request.app.state.adapter
+    if engine is None:
+        raise _not_configured(getattr(request.app.state, "adapter_error", None))
+
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    probe = getattr(engine, "probe_embeddings", None)
+    capable = (
+        await probe() if probe is not None else bool(getattr(engine, "supports_embeddings", False))
+    )
+    if not capable:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#embeddings-unsupported",
+                title="Embeddings not supported by this backend",
+                status=400,
+                detail=(
+                    f"This driver's backend ({kind_label}) does not serve embeddings, so the "
+                    "request was refused rather than answered with something that is not one. "
+                    "GET /v1/info reports capabilities.embeddings; the gateway reports the same "
+                    "per model as x_eugene_plexus.surfaces on GET /v1/models. A local engine "
+                    "must be started in embedding mode -- it is a property of the running "
+                    "backend, not of the model."
+                ),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
+
+    try:
+        return await engine.embed(list(body.input))
+    except CliError as e:
+        log.warning("embeddings invocation failed: %s", e)
+        raise _backend_error(e, kind_label) from e
 
 
 def _frame(chunk: Any) -> str:

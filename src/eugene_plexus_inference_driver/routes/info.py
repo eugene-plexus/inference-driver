@@ -54,6 +54,12 @@ async def info(request: Request) -> DriverInfo:
                 # and cached by the engine; None stays None rather than
                 # becoming a guess.
                 maxContextTokens=await _context_window(engine),
+                # The third capability flag this project contracted and
+                # left unpopulated -- `streaming` was the first (M10),
+                # `maxContextTokens` the second (step 7). Determined by
+                # asking the backend, because nothing exposes it: see
+                # `probe_embeddings`.
+                embeddings=await _embeddings(engine),
             ),
             backend=backend,
             provider=provider_key,
@@ -118,3 +124,22 @@ async def _context_window(engine: Any) -> int | None:
         log.debug("context-window probe failed; reporting unknown", exc_info=True)
         return None
     return value if isinstance(value, int) and value > 0 else None
+
+
+async def _embeddings(engine: Any) -> bool | None:
+    """Whether the backend embeds, and never an exception.
+
+    Same rule as `_context_window`: `/v1/info` is what the gateway polls
+    to build its routing table, so a driver that 500s here drops out of
+    routing entirely. A capability flag is not worth that, and `None`
+    already means "unknown" in the contract.
+    """
+    probe = getattr(engine, "probe_embeddings", None)
+    if probe is None:
+        declared = getattr(engine, "supports_embeddings", None)
+        return bool(declared) if declared is not None else None
+    try:
+        return bool(await probe())
+    except Exception:  # see docstring: /v1/info must not fail over a capability
+        log.debug("embeddings probe failed; reporting unknown", exc_info=True)
+        return None
