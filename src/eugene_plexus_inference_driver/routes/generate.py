@@ -170,7 +170,58 @@ def _not_configured(adapter_error: str | None) -> HTTPException:
     )
 
 
+# Backend 4xx codes that say "not now" rather than "not ever". These
+# keep the 502 they have always had, so the gateway's priority-list
+# cascade still fires on them -- a rate-limited cloud provider falling
+# through to a local engine is the case failover was built for, and the
+# smoke test that motivated it was exactly an OpenRouter 429.
+_RETRYABLE_BACKEND_STATUSES = frozenset({408, 409, 425, 429})
+
+
 def _backend_error(e: Exception, kind_label: str) -> HTTPException:
+    """A backend failure, as the status the layer above should act on.
+
+    **Two buckets, and the split is the whole point.** The gateway
+    cascades a 5xx to the next backend in the slot and hard-fails a 4xx,
+    because a request the backend rejected is one the next backend would
+    reject identically. That rule is only as good as this function: when
+    every backend failure became a 502, the gateway cascaded through
+    every replica and every tier of a request that could not succeed
+    anywhere, then handed the caller a retryable error.
+
+    The case that matters is an over-long prompt. `llama-server` answers
+    one with a 400 naming both numbers -- `n_prompt_tokens` and `n_ctx`
+    -- which is a better answer than anything this layer could compute,
+    and it used to arrive as "every backend serving this model failed".
+    A harness reading a 502 retries the same prompt; a harness reading a
+    400 fixes it. Deciding which one it sees is this function's job.
+
+    `upstream_status` is None for a subprocess backend and for a
+    transport failure, where there is no status to carry and 502 is
+    right.
+    """
+    upstream = getattr(e, "upstream_status", None)
+    rejected = (
+        isinstance(upstream, int)
+        and 400 <= upstream < 500
+        and upstream not in _RETRYABLE_BACKEND_STATUSES
+    )
+    if rejected:
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#backend-rejected-request",
+                title="Backend rejected the request",
+                status=400,
+                detail=(
+                    f"The backend refused this request with HTTP {upstream}, so it was not "
+                    f"retried against another backend -- the next one would refuse it too. "
+                    f"A prompt longer than the context window is the usual cause and the "
+                    f"backend's own message below says so exactly. {e}"
+                ),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
     return HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
         detail=Problem(

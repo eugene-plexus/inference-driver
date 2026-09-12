@@ -39,7 +39,25 @@ def _utf8_subprocess_env() -> dict[str, str]:
 
 
 class CliError(RuntimeError):
-    """Raised when a CLI invocation exits non-zero or times out."""
+    """Raised when a backend invocation fails.
+
+    Named for the CLI engines it was written for, and since M0 also the
+    way the HTTP engine reports an upstream failure -- so it carries the
+    upstream status when there was one.
+
+    `upstream_status` is what makes the difference between a refusal the
+    next backend would repeat and one worth trying elsewhere, and the
+    route turns it into the driver's own 400 or 502. Without it every
+    backend failure looked the same from one layer up, and llama.cpp's
+    exact "your prompt is 20597 tokens and the window is 512" arrived as
+    a retryable 502 that cascaded through every replica in the slot.
+    `None` for a subprocess backend or a transport failure, where there
+    is no status to carry and 502 is the honest answer.
+    """
+
+    def __init__(self, *args: object, upstream_status: int | None = None) -> None:
+        super().__init__(*args)
+        self.upstream_status = upstream_status
 
 
 @dataclass

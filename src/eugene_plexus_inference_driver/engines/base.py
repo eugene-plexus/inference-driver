@@ -151,6 +151,23 @@ class BackendEngine(Protocol):
         """
         ...
 
+    async def context_window(self) -> int | None:
+        """The context window the backend resolved, or None if unknown.
+
+        Reported as `capabilities.maxContextTokens` on `/v1/info`.
+        **None is a real answer and the correct one by default** -- a
+        backend this driver cannot interrogate has no window it can
+        promise, and the gateway skips it rather than substituting a
+        guess. An engine that returned a plausible-looking number it had
+        not read from the backend would be worse than one that returned
+        nothing, because the whole point of the field is that a harness
+        can size a prompt against it.
+
+        Same defaulting logic as `supports_tool_calling`: honest by
+        omission, so a new engine has to opt in to making a claim.
+        """
+        ...
+
     async def list_models(self) -> list[str]:
         """Return the model IDs this backend offers, post-policy-filter.
 

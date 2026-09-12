@@ -54,6 +54,44 @@ from .base import Chunk
 
 log = logging.getLogger(__name__)
 
+# How long a discovered context window is trusted before the backend is
+# asked again. Generous because the number only moves when an engine is
+# restarted with different flags, and the cost of asking is three HTTP
+# GETs inside the gateway's routing refresh.
+_CONTEXT_TTL_SECONDS = 300.0
+
+# How long a *miss* is remembered. Much shorter, because the common miss
+# is an Ollama with nothing loaded yet: the window appears the moment a
+# first request loads the model, and waiting five minutes to notice
+# would mean a fresh install advertises no window through its whole
+# first conversation.
+_CONTEXT_MISS_TTL = 30.0
+
+# Total wall-clock the three probes share. `/v1/info` is polled by the
+# gateway's routing refresh, which runs inside whatever request
+# triggered it, so this is latency an end user can feel -- and a backend
+# that answers none of the three is usually a hosted provider that will
+# 404 instantly anyway.
+_CONTEXT_PROBE_BUDGET_SECONDS = 2.0
+
+
+def _only_or_named(
+    entries: list[dict[str, Any]], model_id: str, *, keys: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """The entry describing `model_id`, or the sole entry if there is one.
+
+    Matching by name first matters when a server hosts several models:
+    taking the first card would report one model's window for another,
+    and a window that is wrong is worse than one that is missing. The
+    single-entry fallback covers the servers that do not echo the id we
+    configured in the form we configured it.
+    """
+    named = [e for e in entries if any(e.get(k) == model_id for k in keys)]
+    if named:
+        return named[0]
+    return entries[0] if len(entries) == 1 else None
+
+
 # Models whose `temperature` is not tunable: OpenAI's o-series rejects
 # the parameter outright, and the gpt-5 family schema-accepts it but
 # errors on any value other than the default. Sending it is a 400, so
@@ -223,6 +261,12 @@ class OpenAiCompatibleHttpEngine:
         #: resolved from one. Reported on `/v1/info` so the gateway and
         #: the UI can show which engine process is behind this driver.
         self.runtime = runtime
+        #: Last window the backend admitted to, and when we last asked.
+        #: Cached on the engine rather than the app because the engine is
+        #: rebuilt on every config change, which is exactly when a stale
+        #: window would be wrong.
+        self._context_window: int | None = None
+        self._context_window_checked_at: float | None = None
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -384,9 +428,15 @@ class OpenAiCompatibleHttpEngine:
                     int(response.elapsed.total_seconds() * 1000),
                     _redact(response.text[:4000]),
                 )
+            # **The status is the payload.** An over-long prompt comes
+            # back from llama.cpp as a 400 naming both numbers, and the
+            # route needs the 4xx/5xx distinction to decide whether the
+            # gateway should cascade past it. Flattening it here is what
+            # made an exact refusal look like a broken backend.
             raise CliError(
                 f"openai_compat_http returned {response.status_code}: "
-                f"{_redact(response.text[:500])}"
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
             )
 
         try:
@@ -498,9 +548,13 @@ class OpenAiCompatibleHttpEngine:
                 ) as response:
                     if response.status_code >= 400:
                         body = await response.aread()
+                        # Nothing has been streamed yet, so this can
+                        # still be a status code -- see the same raise in
+                        # `generate`.
                         raise CliError(
                             f"openai_compat_http returned {response.status_code}: "
-                            f"{_redact(body.decode('utf-8', 'replace')[:500])}"
+                            f"{_redact(body.decode('utf-8', 'replace')[:500])}",
+                            upstream_status=response.status_code,
                         )
                     async for line in response.aiter_lines():
                         data = _sse_data(line)
@@ -589,6 +643,147 @@ class OpenAiCompatibleHttpEngine:
                 latencyMs=int((time.monotonic() - started) * 1000),
             ),
         )
+
+    async def context_window(self) -> int | None:
+        """The context window this backend resolved, read back from it.
+
+        Reported as `capabilities.maxContextTokens` on `/v1/info`, where
+        it was contracted at M0 and populated by nothing until now --
+        `capabilities.streaming`'s M10 story, one field over. The
+        consequence was concrete: every backend the install does not
+        supervise, which is every Ollama and LM Studio anyone points us
+        at, advertised no window at all, so `GET /v1/models` reported
+        `context_length: null` for the most common local setup there is.
+
+        **The resolved window, never the trained one.** Each source
+        below reports what the server actually allocated, which is what
+        a caller needs; a model's trained maximum is an upper bound that
+        overstates whenever the operator or the server itself picked
+        something smaller, and overstating is the one direction that
+        hurts -- a harness that fills an advertised window it does not
+        have is the silent-truncation failure this is here to expose.
+
+        Three sources, in the order that short-circuits soonest for the
+        engine most likely to be behind an `openai_compat_http` driver:
+
+        * `GET /props` -- llama.cpp, `default_generation_settings.n_ctx`
+        * `GET /v1/models` -- vLLM, `max_model_len` on the model's card
+        * `GET /api/ps` -- Ollama, `context_length` on a **loaded**
+          model. Ollama's OpenAI-compatible surface carries none of
+          this, and its `/api/show` carries only the trained maximum;
+          `/api/ps` is the one place the number it actually chose
+          appears. Measured on 0.34.0: 131072, matching what it
+          auto-sized to.
+
+        Absent means unknown and stays unknown. A hosted provider has
+        nothing to read, a model Ollama has idled out is not in
+        `/api/ps` until the next request loads it, and in both cases
+        guessing would be worse than silence -- `_smallest_context` in
+        the gateway simply skips a backend that reports nothing.
+
+        Deliberately not on the request path. `/v1/info` is what the
+        gateway polls to build its routing table, and a probe there
+        happens inside the refresh that a request triggered, so the
+        whole cycle shares one short deadline and the answer is cached.
+        """
+        now = time.monotonic()
+        if self._context_window_checked_at is not None:
+            ttl = _CONTEXT_TTL_SECONDS if self._context_window is not None else _CONTEXT_MISS_TTL
+            if now - self._context_window_checked_at < ttl:
+                return self._context_window
+
+        deadline = now + _CONTEXT_PROBE_BUDGET_SECONDS
+        found: int | None = None
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=httpx.Timeout(_CONTEXT_PROBE_BUDGET_SECONDS, connect=2.0),
+            ) as client:
+                for source in (self._ctx_llama_cpp, self._ctx_vllm, self._ctx_ollama):
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        found = await source(client)
+                    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                        found = None
+                    if found is not None:
+                        break
+        except (httpx.HTTPError, ValueError):
+            found = None
+
+        self._context_window_checked_at = time.monotonic()
+        # A probe that found nothing does not erase what an earlier one
+        # found. Ollama drops a model out of `/api/ps` the moment it
+        # idles out, and the window it will get on the next load is
+        # overwhelmingly the same one -- reporting `null` in between
+        # would make the advertised window flicker with the engine's
+        # idle timer rather than with anything a caller did.
+        if found is not None:
+            if found != self._context_window:
+                log.info(
+                    "backend at %s reports a context window of %d tokens",
+                    self._base_url,
+                    found,
+                )
+            self._context_window = found
+        return self._context_window
+
+    async def _ctx_llama_cpp(self, client: httpx.AsyncClient) -> int | None:
+        """`GET /props` -- what `llama-server` resolved, post-clamp.
+
+        The agent reads the same field off supervised runtimes; this
+        reads it from wherever the driver points, supervised or not.
+        """
+        response = await client.get("/props", headers=self._headers())
+        if response.status_code >= 400:
+            return None
+        props = response.json()
+        if not isinstance(props, dict):
+            return None
+        settings = props.get("default_generation_settings")
+        value = settings.get("n_ctx") if isinstance(settings, dict) else None
+        if value is None:
+            value = props.get("n_ctx")
+        return value if isinstance(value, int) and value > 0 else None
+
+    async def _ctx_vllm(self, client: httpx.AsyncClient) -> int | None:
+        """`GET /v1/models` -- vLLM puts `max_model_len` on each card.
+
+        Matched to our own `modelId` rather than taken from the first
+        entry, because a vLLM serving several models would otherwise
+        hand back a window belonging to a different one.
+        """
+        response = await client.get("/v1/models", headers=self._headers())
+        if response.status_code >= 400:
+            return None
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            return None
+        cards = [c for c in data if isinstance(c, dict)]
+        card = _only_or_named(cards, self._model_id, keys=("id",))
+        value = card.get("max_model_len") if card else None
+        return value if isinstance(value, int) and value > 0 else None
+
+    async def _ctx_ollama(self, client: httpx.AsyncClient) -> int | None:
+        """`GET /api/ps` -- the window Ollama chose for a loaded model.
+
+        Native API, not the OpenAI-compatible one, because the number
+        does not exist on the compatible surface. Empty while nothing is
+        loaded, which is why a miss is cached briefly and never
+        overwrites a previous hit.
+        """
+        response = await client.get("/api/ps", headers={"Accept": "application/json"})
+        if response.status_code >= 400:
+            return None
+        body = response.json()
+        models = body.get("models") if isinstance(body, dict) else None
+        if not isinstance(models, list):
+            return None
+        entries = [m for m in models if isinstance(m, dict)]
+        entry = _only_or_named(entries, self._model_id, keys=("name", "model"))
+        value = entry.get("context_length") if entry else None
+        return value if isinstance(value, int) and value > 0 else None
 
     async def list_models(self) -> list[str]:
         """Live-fetch the model catalog from the configured base URL.

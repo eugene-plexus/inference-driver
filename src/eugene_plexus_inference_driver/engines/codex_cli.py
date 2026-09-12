@@ -306,6 +306,17 @@ class CodexCliEngine:
             ),
         )
 
+    async def context_window(self) -> int | None:
+        """Unknown, and honestly so.
+
+        A CLI subscription has no context window of its own to report:
+        the harness on the other side of the pipe owns the window, picks
+        the model, and manages its own compaction. Any number here would
+        be a guess about a moving target, and the gateway treats an
+        absent window as "do not promise one" -- which is the truth.
+        """
+        return None
+
     async def list_models(self) -> list[str]:
         # Codex CLI doesn't expose a list endpoint. Return a hardcoded
         # set; note that `modelId` is informational here — the CLI's

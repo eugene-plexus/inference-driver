@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request, status
 
 from .. import __version__
@@ -9,6 +12,8 @@ from .._generated.models import BackendKind, Capabilities, DriverInfo, Problem
 from ..config import ConfigStore
 
 router = APIRouter(tags=["meta"])
+
+log = logging.getLogger(__name__)
 
 
 @router.get("/v1/info", response_model=DriverInfo)
@@ -40,6 +45,15 @@ async def info(request: Request) -> DriverInfo:
             capabilities=Capabilities(
                 streaming=bool(getattr(engine, "supports_streaming", False)),
                 toolCalling=bool(getattr(engine, "supports_tool_calling", False)),
+                # Contracted at M0, populated by nothing until step 7 --
+                # `streaming`'s own story, one field over, and with the
+                # same consequence: every backend the install does not
+                # supervise advertised no context window at all, so the
+                # gateway published `context_length: null` for the most
+                # ordinary local setup there is. Probed from the backend
+                # and cached by the engine; None stays None rather than
+                # becoming a guess.
+                maxContextTokens=await _context_window(engine),
             ),
             backend=backend,
             provider=provider_key,
@@ -84,3 +98,23 @@ async def info(request: Request) -> DriverInfo:
         runtime=runtime,
         version=__version__,
     )
+
+
+async def _context_window(engine: Any) -> int | None:
+    """The engine's resolved window, and never an exception.
+
+    `/v1/info` is what the gateway polls to build its routing table, and
+    a driver that 500s here drops out of routing entirely. A window is
+    the least important thing this endpoint reports, so it is the first
+    thing to give up: any failure is an absent window, which the
+    contract already defines as "unknown".
+    """
+    probe = getattr(engine, "context_window", None)
+    if probe is None:
+        return None
+    try:
+        value = await probe()
+    except Exception:  # see docstring: /v1/info must not fail over a window
+        log.debug("context-window probe failed; reporting unknown", exc_info=True)
+        return None
+    return value if isinstance(value, int) and value > 0 else None
