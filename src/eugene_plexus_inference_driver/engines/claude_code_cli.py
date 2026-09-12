@@ -84,6 +84,14 @@ class ClaudeCodeCliEngine:
     #: `--include-partial-messages` yields real `text_delta` events,
     #: verified against the CLI at v2.1.207.
     supports_streaming = True
+    supports_tool_calling = False
+    """Claude Code CLI takes a prompt and returns prose; its own tool use
+    is internal to the subprocess and is not exposed as OpenAI tool
+    calls we could carry.
+
+    Declared rather than inherited, because the default being
+    False is a safety net and not a statement. A request carrying
+    `tools` is refused with a reason; see `routes/generate.py`."""
 
     def __init__(
         self,
@@ -144,7 +152,7 @@ class ClaudeCodeCliEngine:
         # text inside the user-message argv.
         system_messages = [m for m in messages if m.role == Role.system]
         other_messages = [m for m in messages if m.role != Role.system]
-        system_prompt = "\n\n".join(m.content for m in system_messages).strip()
+        system_prompt = "\n\n".join(m.content or "" for m in system_messages).strip()
         user_prompt = messages_to_prompt(other_messages)
 
         # The user-prompt transcript can contain newlines (paragraph breaks
@@ -249,7 +257,7 @@ class ClaudeCodeCliEngine:
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         system_messages = [m for m in messages if m.role == Role.system]
         other_messages = [m for m in messages if m.role != Role.system]
-        system_prompt = "\n\n".join(m.content for m in system_messages).strip()
+        system_prompt = "\n\n".join(m.content or "" for m in system_messages).strip()
         user_prompt = messages_to_prompt(other_messages)
 
         argv = self._build_argv(system_prompt=system_prompt, stream=True)

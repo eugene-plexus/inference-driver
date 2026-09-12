@@ -79,9 +79,12 @@ def apply_thinking_mode(messages: list[Message], thinking_mode: str | None) -> l
     # Append the directive to the FIRST system message (the gateway's
     # bicameral preamble lives there). If there's no system message, push
     # one onto the front carrying just the directive.
+    # `content` is nullable since tool calling landed: an assistant turn
+    # that only calls a tool carries no text. A system message with none
+    # is not a thing anyone sends, but the type now says it could be.
     for i, msg in enumerate(out):
         if msg.role == Role.system:
-            combined = f"{msg.content.rstrip()}\n\n{directive}"
+            combined = f"{(msg.content or '').rstrip()}\n\n{directive}"
             out[i] = msg.model_copy(update={"content": combined})
             return out
     out.insert(0, Message(role=Role.system, content=directive))

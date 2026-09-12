@@ -39,9 +39,13 @@ from .._generated.models import (
     ConfigFieldShowWhen,
     ConfigValueType,
     FinishReason,
+    Function1,
+    FunctionCall,
     GenerateRequest,
     GenerateResponse,
     Role,
+    ToolCall,
+    ToolCallDelta,
     Usage,
 )
 from ._subprocess import CliError
@@ -124,8 +128,13 @@ _FINISH_REASON_MAP = {
     "stop": FinishReason.stop,
     "length": FinishReason.length,
     "content_filter": FinishReason.error,
-    "tool_calls": FinishReason.stop,
-    "function_call": FinishReason.stop,
+    # Both were `FinishReason.stop` until tool calling landed, which is
+    # the shape of the whole gap: a backend that HAD made a tool call
+    # reported a clean natural stop, and the calls themselves were
+    # dropped one line later. `function_call` is OpenAI's deprecated
+    # spelling and means the same thing.
+    "tool_calls": FinishReason.tool_calls,
+    "function_call": FinishReason.tool_calls,
 }
 
 
@@ -170,6 +179,7 @@ class OpenAiCompatibleHttpEngine:
     #: Upstream SSE delivers real per-token deltas, so `stream()`
     #: yields text as the model produces it.
     supports_streaming = True
+    supports_tool_calling = True
 
     def __init__(
         self,
@@ -303,6 +313,26 @@ class OpenAiCompatibleHttpEngine:
             payload["temperature"] = float(request.temperature)
         if request.stop:
             payload["stop"] = list(request.stop)
+        # Tools ride through untouched. We do not validate the JSON
+        # Schema in `parameters`, rewrite dialects, or reorder the list:
+        # a backend that rejects a construct rejects it in its own
+        # words, which is more use to the caller than a guess of ours
+        # made one hop earlier.
+        if request.tools:
+            payload["tools"] = [t.model_dump(mode="json", exclude_none=True) for t in request.tools]
+        if request.toolChoice is not None:
+            choice = request.toolChoice
+            payload["tool_choice"] = (
+                str(choice.value)
+                if hasattr(choice, "value")
+                else choice.model_dump(mode="json", exclude_none=True)
+                if hasattr(choice, "model_dump")
+                else choice
+            )
+        if request.responseFormat is not None:
+            payload["response_format"] = request.responseFormat.model_dump(
+                mode="json", exclude_none=True
+            )
         return payload
 
     def _headers(self) -> dict[str, str]:
@@ -379,16 +409,25 @@ class OpenAiCompatibleHttpEngine:
         first = choices[0] or {}
         message = first.get("message") or {}
         content = message.get("content")
+        tool_calls = _tool_calls_from_wire(message.get("tool_calls"))
+        # **`content` is null on a tool-call-only turn**, and this used
+        # to raise on exactly that response -- the concrete way a tool
+        # call failed here before the contract carried one. Text is
+        # still required when there are no calls: a response with
+        # neither is a backend malfunction, not an empty answer.
         if not isinstance(content, str):
-            raise CliError(f"openai_compat_http response missing string content: {body!r}")
-        # Defensive strip of <think>...</think> when the operator opted
-        # out of thinking but the model emitted tags anyway. See
-        # _thinking.strip_thinking_blocks for the why.
-        if self._thinking_mode == "off":
+            if not tool_calls:
+                raise CliError(f"openai_compat_http response missing string content: {body!r}")
+            content = None
+        elif self._thinking_mode == "off":
+            # Defensive strip of <think>...</think> when the operator opted
+            # out of thinking but the model emitted tags anyway. See
+            # _thinking.strip_thinking_blocks for the why.
             content = strip_thinking_blocks(content)
 
         return GenerateResponse(
             content=content,
+            toolCalls=tool_calls or None,
             finishReason=_FINISH_REASON_MAP.get(
                 str(first.get("finish_reason") or "stop"), FinishReason.stop
             ),
@@ -439,6 +478,11 @@ class OpenAiCompatibleHttpEngine:
         saw_terminator = False
         finish_reason = "stop"
         usage_payload: dict[str, Any] = {}
+        # Tool-call fragments accumulated by `index`, so the terminal
+        # `done` can carry whole calls. A model may interleave fragments
+        # of two calls, which is why the index is the key and not the
+        # arrival order.
+        call_parts: dict[int, dict[str, str]] = {}
         served_model = self._model_id
 
         async with httpx.AsyncClient(
@@ -479,7 +523,23 @@ class OpenAiCompatibleHttpEngine:
                             if choice.get("finish_reason"):
                                 finish_reason = str(choice["finish_reason"])
                                 saw_terminator = True
-                            text = ((choice.get("delta") or {}).get("content")) or ""
+                            delta = choice.get("delta") or {}
+                            # Tool-call fragments ride their own frame.
+                            # Forwarded rather than accumulated here: the
+                            # gateway has to emit them as OpenAI deltas
+                            # anyway, and buffering them to the end of
+                            # the stream would defeat the point of
+                            # streaming a call the caller wants to start
+                            # dispatching. We also accumulate a copy so
+                            # the terminal `done` carries whole calls,
+                            # for the non-streaming half of the contract.
+                            raw_calls = delta.get("tool_calls")
+                            if raw_calls:
+                                fragments = _tool_call_deltas_from_wire(raw_calls)
+                                if fragments:
+                                    _accumulate_tool_calls(call_parts, raw_calls)
+                                    yield Chunk(toolCalls=fragments)
+                            text = (delta.get("content")) or ""
                             if not text:
                                 continue
                             visible = filtered.feed(text) if filtered is not None else text
@@ -513,10 +573,14 @@ class OpenAiCompatibleHttpEngine:
                 yield Chunk(text=tail)
 
         content = "".join(emitted)
+        tool_calls = _finish_tool_calls(call_parts)
         yield Chunk(
             done=True,
             result=GenerateResponse(
-                content=content,
+                # None rather than "" when the turn was only tool calls,
+                # so the streamed and non-streamed shapes agree.
+                content=content if (content or not tool_calls) else None,
+                toolCalls=tool_calls or None,
                 finishReason=_FINISH_REASON_MAP.get(finish_reason, FinishReason.stop),
                 usage=_usage_from_envelope(usage_payload),
                 requestId=request.requestId,
@@ -576,19 +640,179 @@ class OpenAiCompatibleHttpEngine:
         return ids
 
 
-def _to_openai_messages(messages: list[Any]) -> list[dict[str, str]]:
-    """Map our Message[] to OpenAI chat-completions messages."""
-    out: list[dict[str, str]] = []
+def _to_openai_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Map our Message[] to OpenAI chat-completions messages.
+
+    The `tool` role and an assistant turn's `toolCalls` are what make an
+    agent loop possible: the harness sends back the assistant message
+    that *asked* for the calls plus one `tool` message per result, and a
+    backend that does not receive both has no idea its own request was
+    answered.
+
+    Before tool calling landed the final branch here coerced every
+    unrecognised role to `user`. That was safe while `Role` had three
+    values; with `tool` in the enum it would have turned a tool result
+    into something the model reads as the human talking, which is a
+    plausible-looking transcript that quietly breaks the loop.
+    """
+    out: list[dict[str, Any]] = []
     for m in messages:
-        if m.role == Role.system:
-            out.append({"role": "system", "content": m.content})
-        elif m.role == Role.user:
-            out.append({"role": "user", "content": m.content})
-        elif m.role == Role.assistant:
-            out.append({"role": "assistant", "content": m.content})
+        role = getattr(m, "role", None)
+        content = getattr(m, "content", None)
+        if role == Role.system:
+            out.append({"role": "system", "content": content or ""})
+        elif role == Role.user:
+            out.append({"role": "user", "content": content or ""})
+        elif role == Role.assistant:
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            calls = getattr(m, "toolCalls", None)
+            if calls:
+                msg["tool_calls"] = [_tool_call_to_wire(c) for c in calls]
+            out.append(msg)
+        elif role == Role.tool:
+            out.append(
+                {
+                    "role": "tool",
+                    "content": content or "",
+                    "tool_call_id": getattr(m, "toolCallId", None) or "",
+                }
+            )
         else:
-            out.append({"role": "user", "content": m.content})
+            out.append({"role": "user", "content": content or ""})
     return out
+
+
+def _tool_call_to_wire(call: Any) -> dict[str, Any]:
+    """One of our tool calls as OpenAI sends them back up.
+
+    Accepts a dict as well as a model, because `common.yaml` types
+    `Message.toolCalls` loosely on purpose -- the shared schema refuses
+    to be a third definition of OpenAI's object.
+    """
+    if isinstance(call, dict):
+        fn = call.get("function") or {}
+        return {
+            "id": call.get("id") or "",
+            "type": "function",
+            "function": {
+                "name": (fn.get("name") if isinstance(fn, dict) else None) or "",
+                "arguments": (fn.get("arguments") if isinstance(fn, dict) else None) or "",
+            },
+        }
+    return {
+        "id": getattr(call, "id", "") or "",
+        "type": "function",
+        "function": {
+            "name": getattr(call.function, "name", "") or "",
+            "arguments": getattr(call.function, "arguments", "") or "",
+        },
+    }
+
+
+def _tool_call_deltas_from_wire(raw: Any) -> list[ToolCallDelta]:
+    """One frame's worth of tool-call fragments, forwarded as-is.
+
+    A fragment is not a call and is not parseable on its own: `id` and
+    `function.name` arrive once, and `function.arguments` arrives as a
+    string split at arbitrary points -- `{"loc` in one frame and
+    `ation": "NYC"}` in the next is normal. Anything that tries to read
+    a single fragment as JSON will fail on almost every stream.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[ToolCallDelta] = []
+    for position, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        raw_fn = item.get("function")
+        fn: dict[str, Any] = raw_fn if isinstance(raw_fn, dict) else {}
+        out.append(
+            ToolCallDelta(
+                index=int(index) if isinstance(index, int) else position,
+                id=item.get("id"),
+                # `function` is the only const in the contract, so it is
+                # always that rather than an echo of whatever upstream
+                # sent -- a value we cannot represent is a value we must
+                # not invent.
+                type="function",
+                function=Function1(name=fn.get("name"), arguments=fn.get("arguments"))
+                if fn
+                else None,
+            )
+        )
+    return out
+
+
+def _accumulate_tool_calls(parts: dict[int, dict[str, str]], raw: Any) -> None:
+    """Fold one frame's fragments into the calls being assembled."""
+    if not isinstance(raw, list):
+        return
+    for position, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        key = int(index) if isinstance(index, int) else position
+        slot = parts.setdefault(key, {"id": "", "name": "", "arguments": ""})
+        if item.get("id"):
+            slot["id"] = str(item["id"])
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            if fn.get("name"):
+                slot["name"] = str(fn["name"])
+            if fn.get("arguments"):
+                slot["arguments"] += str(fn["arguments"])
+
+
+def _finish_tool_calls(parts: dict[int, dict[str, str]]) -> list[ToolCall]:
+    """The assembled calls, in index order.
+
+    A fragment set with no name is dropped rather than emitted with an
+    empty one: a call nothing can dispatch is worse than no call, because
+    a harness will try.
+    """
+    calls: list[ToolCall] = []
+    for key in sorted(parts):
+        slot = parts[key]
+        if not slot.get("name"):
+            continue
+        calls.append(
+            ToolCall(
+                id=slot.get("id") or f"call_{key}",
+                type="function",
+                function=FunctionCall(name=slot["name"], arguments=slot.get("arguments") or ""),
+            )
+        )
+    return calls
+
+
+def _tool_calls_from_wire(raw: Any) -> list[ToolCall]:
+    """Parse a backend's `tool_calls` array into our shape.
+
+    `arguments` stays a string. A model can emit invalid JSON and
+    OpenAI's contract preserves what it actually said rather than
+    failing the whole response; parsing here would move that failure to
+    the one place least able to report it usefully.
+    """
+    if not isinstance(raw, list):
+        return []
+    calls: list[ToolCall] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") or {}
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not name:
+            continue
+        args = fn.get("arguments") if isinstance(fn, dict) else None
+        calls.append(
+            ToolCall(
+                id=str(item.get("id") or f"call_{i}"),
+                type="function",
+                function=FunctionCall(name=str(name), arguments=str(args or "")),
+            )
+        )
+    return calls
 
 
 def _usage_from_envelope(usage: dict[str, Any]) -> Usage | None:

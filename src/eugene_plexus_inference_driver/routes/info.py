@@ -37,7 +37,10 @@ async def info(request: Request) -> DriverInfo:
             # that streams one whole message (codex) even though its
             # endpoint works. A flag that said True for everything would
             # tell a UI nothing.
-            capabilities=Capabilities(streaming=bool(getattr(engine, "supports_streaming", False))),
+            capabilities=Capabilities(
+                streaming=bool(getattr(engine, "supports_streaming", False)),
+                toolCalling=bool(getattr(engine, "supports_tool_calling", False)),
+            ),
             backend=backend,
             provider=provider_key,
             modelId=store.get("modelId") or None,

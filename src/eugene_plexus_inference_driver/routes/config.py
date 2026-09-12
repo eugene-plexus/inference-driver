@@ -95,5 +95,5 @@ async def test_config(
         component="inference-driver",
         latencyMs=elapsed_ms,
         summary=f"{engine.backend_kind.value} responded in {response.latencyMs or 0}ms.",
-        sampleOutput=response.content[:200],
+        sampleOutput=(response.content or "")[:200],
     )

@@ -30,6 +30,7 @@ from .._generated.models import (
     ConfigField,
     GenerateRequest,
     GenerateResponse,
+    ToolCallDelta,
 )
 
 
@@ -63,6 +64,11 @@ class Chunk:
     """
 
     text: str = ""
+    toolCalls: list[ToolCallDelta] | None = None
+    """Tool-call fragments on this frame, when the backend is streaming
+    a call rather than text. A frame carries text or fragments, never
+    both -- upstream sends them in separate deltas and combining them
+    here would invent a shape no backend produces."""
     done: bool = False
     result: GenerateResponse | None = None
 
@@ -80,6 +86,17 @@ class BackendEngine(Protocol):
     """Reported in `/v1/info` and on every `GenerateResponse` so ops can
     see *which protocol* the driver is speaking. Distinct from the
     user-facing `provider` — many providers share one backend kind."""
+
+    supports_tool_calling: bool = False
+    """Whether this engine can carry `tools` to its backend and report
+    `toolCalls` back.
+
+    Reported as `capabilities.toolCalling` on `/v1/info`, and the
+    gateway refuses a tools request against a driver that says False
+    rather than dropping the field. **Defaults to False so a new engine
+    is honest by omission** -- the failure mode of the opposite default
+    is a harness receiving a plain answer it cannot distinguish from the
+    model declining to call anything."""
 
     supports_streaming: bool
     """Whether `stream()` emits genuinely incremental tokens.

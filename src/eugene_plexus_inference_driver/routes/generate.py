@@ -26,6 +26,7 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    _refuse_unsupported_tools(engine, body)
     try:
         return await engine.generate(body)
     except CliError as e:
@@ -55,6 +56,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    _refuse_unsupported_tools(engine, body)
 
     stream = engine.stream(body)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
@@ -96,7 +98,49 @@ def _frame(chunk: Any) -> str:
         result = getattr(chunk, "result", None)
         payload = result.model_dump(exclude_none=True, mode="json") if result else {}
         return f"event: done\ndata: {json.dumps(payload)}\n\n"
+    # A token frame carries text or tool-call fragments, never both:
+    # upstream sends them in separate deltas, and merging them here
+    # would invent a shape no backend produces and no client expects.
+    calls = getattr(chunk, "toolCalls", None)
+    if calls:
+        fragments = [c.model_dump(exclude_none=True, mode="json") for c in calls]
+        return f"event: token\ndata: {json.dumps({'toolCalls': fragments})}\n\n"
     return f"event: token\ndata: {json.dumps({'text': getattr(chunk, 'text', '')})}\n\n"
+
+
+def _refuse_unsupported_tools(engine: BackendEngine, body: GenerateRequest) -> None:
+    """400 when the caller sent tools and this backend cannot carry them.
+
+    **Never silently strip.** A harness that receives a plain answer
+    cannot tell "the model chose not to call anything" from "nobody ever
+    offered it the tools", and the second is a bug wearing the first
+    one's clothes -- it reads as a model being unhelpful, which is where
+    days go. `capabilities.toolCalling` exists so the question is
+    answerable before a request is ever sent.
+
+    400 and not 502: nothing is wrong with the backend, the request is
+    asking it for something it does not do.
+    """
+    if not body.tools:
+        return
+    if getattr(engine, "supports_tool_calling", False):
+        return
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#tools-unsupported",
+            title="Tools not supported by this backend",
+            status=400,
+            detail=(
+                f"This driver's backend ({kind_label}) cannot carry tool definitions, "
+                "so the request was refused rather than answered without them. "
+                "GET /v1/info reports capabilities.toolCalling; the gateway reports "
+                "the same per model as x_eugene_plexus.tool_calling on GET /v1/models."
+            ),
+            component=f"inference-driver:{kind_label}",
+        ).model_dump(exclude_none=True),
+    )
 
 
 def _error_frame(detail: str, kind_label: str) -> str:

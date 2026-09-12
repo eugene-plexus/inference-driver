@@ -88,6 +88,13 @@ class CodexCliEngine:
     #: `agent_message` -- incremental delivery, not per-token. See
     #: `stream` for why this is False rather than optimistic.
     supports_streaming = False
+    supports_tool_calling = False
+    """Codex CLI takes a prompt and returns prose; it exposes no
+    OpenAI-shaped tool-call surface to carry.
+
+    Declared rather than inherited, because the default being
+    False is a safety net and not a statement. A request carrying
+    `tools` is refused with a reason; see `routes/generate.py`."""
 
     def __init__(
         self,
