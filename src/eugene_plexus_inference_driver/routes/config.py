@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import anyio.to_thread
 from fastapi import APIRouter, Request
 
 from .._generated.models import (
@@ -64,10 +65,18 @@ async def test_config(
     def get(key: str) -> Any:
         return overrides[key] if key in overrides else store.get(key)
 
+    resolver = runtime_resolver_for(request.app)
     try:
         # Same resolver the lifespan uses, so a pending `runtimeName` can
-        # be tested against the agent before it is saved.
-        engine = build_engine_with(get, resolve_runtime=runtime_resolver_for(request.app))
+        # be tested against the agent before it is saved. **In a thread**,
+        # because resolving a `runtimeName` is a synchronous HTTP call
+        # with a five-second cap (`runtime_lookup`, sync on purpose), and
+        # on this path it would otherwise block the event loop -- and so
+        # every other request this driver is serving -- for the whole of
+        # a lookup against an agent that is down.
+        engine = await anyio.to_thread.run_sync(
+            lambda: build_engine_with(get, resolve_runtime=resolver)
+        )
     except Exception as e:
         return ConfigTestResult(
             ok=False,
@@ -79,21 +88,30 @@ async def test_config(
     test_request = GenerateRequest(
         messages=[Message(role=Role.user, content="Reply with exactly: PING")],
     )
+    # This engine is a throwaway and owns its own connection pool, so it
+    # is closed whichever way the test ends. Without this, every PATCH
+    # validated through here would leak one pool for the life of the
+    # process -- which is why `_client()` is lazy rather than eager.
     try:
-        response = await engine.generate(test_request)
-    except Exception as e:
-        return ConfigTestResult(
-            ok=False,
-            component="inference-driver",
-            latencyMs=int((time.perf_counter() - start) * 1000),
-            error=f"{engine.backend_kind.value} generate failed: {e}",
-        )
+        try:
+            response = await engine.generate(test_request)
+        except Exception as e:
+            return ConfigTestResult(
+                ok=False,
+                component="inference-driver",
+                latencyMs=int((time.perf_counter() - start) * 1000),
+                error=f"{engine.backend_kind.value} generate failed: {e}",
+            )
 
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
-    return ConfigTestResult(
-        ok=True,
-        component="inference-driver",
-        latencyMs=elapsed_ms,
-        summary=f"{engine.backend_kind.value} responded in {response.latencyMs or 0}ms.",
-        sampleOutput=(response.content or "")[:200],
-    )
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return ConfigTestResult(
+            ok=True,
+            component="inference-driver",
+            latencyMs=elapsed_ms,
+            summary=f"{engine.backend_kind.value} responded in {response.latencyMs or 0}ms.",
+            sampleOutput=(response.content or "")[:200],
+        )
+    finally:
+        closer = getattr(engine, "aclose", None)
+        if closer is not None:
+            await closer()

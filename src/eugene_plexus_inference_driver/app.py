@@ -183,7 +183,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 e,
             )
 
-    yield
+    try:
+        yield
+    finally:
+        # The engine owns one HTTP client for the life of the process
+        # (see `OpenAiCompatibleHttpEngine._client`). Release its
+        # connection pool on the way out rather than leaving sockets to
+        # the garbage collector, which on Windows is what produces the
+        # "address already in use" a restart then trips over.
+        closer = getattr(app.state.adapter, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception as e:  # never fail a shutdown over cleanup
+                log.debug("engine aclose failed: %s", e)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

@@ -27,6 +27,8 @@ from urllib.parse import quote
 
 import httpx
 
+from ._http import sync_client_for
+
 log = logging.getLogger(__name__)
 
 # The agent answers `GET /v1/runtimes/{name}` from memory; anything slower
@@ -66,7 +68,13 @@ def resolve_runtime_url(
         headers["Authorization"] = f"Bearer {service_token}"
 
     try:
-        with httpx.Client(timeout=timeout) as client:
+        # `sync_client_for` rather than a bare `httpx.Client`: the bare
+        # one parses certifi's PEM bundle on construction (~104 ms), and
+        # this call runs on the event loop from `/v1/config/test`. It
+        # also declines the user's proxy, because the agent is this
+        # machine or this install's LAN and a corporate `HTTP_PROXY`
+        # would swallow the lookup and report the agent as down.
+        with sync_client_for(base, timeout=timeout) as client:
             response = client.get(url, headers=headers)
     except httpx.HTTPError as e:
         raise RuntimeResolutionError(

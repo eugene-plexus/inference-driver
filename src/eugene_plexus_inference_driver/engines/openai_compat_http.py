@@ -49,6 +49,7 @@ from .._generated.models import (
     ToolCallDelta,
     Usage,
 )
+from .._http import client_for
 from ._subprocess import CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
 from .base import Chunk
@@ -74,6 +75,13 @@ _CONTEXT_MISS_TTL = 30.0
 # that answers none of the three is usually a hosted provider that will
 # 404 instantly anyway.
 _CONTEXT_PROBE_BUDGET_SECONDS = 2.0
+
+# Per-request deadline for the three context probes. They share the
+# engine's one client, whose default budget is the generation timeout
+# (120 s), so the short deadline has to ride on each request rather
+# than on the client -- otherwise one client would have to carry four
+# different budgets and the shortest would become everyone's.
+_CONTEXT_PROBE_TIMEOUT = httpx.Timeout(_CONTEXT_PROBE_BUDGET_SECONDS, connect=2.0)
 
 
 def _only_or_named(
@@ -278,6 +286,45 @@ class OpenAiCompatibleHttpEngine:
         #: lifetime: it cannot change without the backend restarting,
         #: and the engine is rebuilt on every config change.
         self._embeddings: bool | None = None
+        #: This engine's one HTTP client, built on first use by
+        #: `_client()`. See that method for why it is lazy and why the
+        #: per-call deadlines do not live on it.
+        self._http_client: httpx.AsyncClient | None = None
+
+    def _client(self) -> httpx.AsyncClient:
+        """This engine's HTTP client, built once and reused.
+
+        **Never construct a client per call.** Doing so parses certifi's
+        PEM bundle on the event loop -- 104-136 ms of synchronous CPU
+        measured in this repo's own venv on the Python the installers
+        provision -- which was the whole of the ~116 ms of control-plane
+        overhead this project carried as unexplained from M8. It also
+        stalls every *concurrent* stream, because the parse is CPU and
+        the loop cannot interleave it.
+
+        Lazy rather than built in `__init__` because `/v1/config/test`
+        and the schema endpoint construct a throwaway engine to validate
+        a PATCH; an eager client would leak a connection pool per PATCH.
+        Whoever builds an engine closes it -- `aclose()`.
+
+        The client carries the base URL and the default request budget;
+        the probes that need a shorter deadline pass `timeout=` per
+        request, because four different budgets share one client and
+        the shortest of them must not become everyone's.
+        """
+        if self._http_client is None:
+            self._http_client = client_for(
+                self._base_url,
+                base_url=self._base_url,
+                timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
+            )
+        return self._http_client
+
+    async def aclose(self) -> None:
+        """Release the connection pool. Idempotent."""
+        client, self._http_client = self._http_client, None
+        if client is not None:
+            await client.aclose()
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -401,6 +448,18 @@ class OpenAiCompatibleHttpEngine:
         return headers
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        # **Brackets the same span `stream()` does, deliberately.** This
+        # used to report `response.elapsed`, which httpx starts *after*
+        # the client is built and stops when the body is read -- so the
+        # driver's largest cost sat outside the driver's own measurement,
+        # and the ~116 ms gap between what the gateway timed and what the
+        # driver reported read as unexplained overhead for a week. One
+        # instrument, one span, both paths. `perf_counter` and never
+        # `monotonic`: on Windows/CPython 3.12, the Python both
+        # installers provision, `monotonic()` is `GetTickCount64` with a
+        # 15.6 ms grid -- 20 distinct values in 300 ms -- which is coarser
+        # than the thing being measured.
+        started = time.perf_counter()
         payload = self._payload_for(request)
 
         # DEBUG-level full-payload trace. The gateway's copy-trace
@@ -418,25 +477,22 @@ class OpenAiCompatibleHttpEngine:
 
         headers = self._headers()
 
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
-        ) as client:
-            try:
-                response = await client.post(
-                    "/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-            except httpx.HTTPError as e:
-                raise CliError(f"openai_compat_http request failed: {e}") from e
+        client = self._client()
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http request failed: {e}") from e
 
         if response.status_code >= 400:
             if log.isEnabledFor(logging.DEBUG):
                 log.debug(
                     "openai_compat_http ← HTTP %d (%dms) body:\n%s",
                     response.status_code,
-                    int(response.elapsed.total_seconds() * 1000),
+                    int((time.perf_counter() - started) * 1000),
                     _redact(response.text[:4000]),
                 )
             # **The status is the payload.** An over-long prompt comes
@@ -459,7 +515,7 @@ class OpenAiCompatibleHttpEngine:
             log.debug(
                 "openai_compat_http ← HTTP %d (%dms) body:\n%s",
                 response.status_code,
-                int(response.elapsed.total_seconds() * 1000),
+                int((time.perf_counter() - started) * 1000),
                 json.dumps(body, indent=2, ensure_ascii=False),
             )
 
@@ -496,7 +552,7 @@ class OpenAiCompatibleHttpEngine:
             requestId=request.requestId,
             backend=self.backend_kind,
             modelId=str(body.get("model") or self._model_id),
-            latencyMs=int(response.elapsed.total_seconds() * 1000),
+            latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
@@ -529,7 +585,7 @@ class OpenAiCompatibleHttpEngine:
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
 
-        started = time.monotonic()
+        started = time.perf_counter()
         filtered = ThinkingFilter() if self._thinking_mode == "off" else None
         emitted: list[str] = []
         # Did upstream actually say it was finished? Iterating a closed
@@ -546,73 +602,70 @@ class OpenAiCompatibleHttpEngine:
         call_parts: dict[int, dict[str, str]] = {}
         served_model = self._model_id
 
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
-        ) as client:
-            try:
-                async with client.stream(
-                    "POST",
-                    "/v1/chat/completions",
-                    headers={**self._headers(), "Accept": "text/event-stream"},
-                    json=payload,
-                ) as response:
-                    if response.status_code >= 400:
-                        body = await response.aread()
-                        # Nothing has been streamed yet, so this can
-                        # still be a status code -- see the same raise in
-                        # `generate`.
-                        raise CliError(
-                            f"openai_compat_http returned {response.status_code}: "
-                            f"{_redact(body.decode('utf-8', 'replace')[:500])}",
-                            upstream_status=response.status_code,
-                        )
-                    async for line in response.aiter_lines():
-                        data = _sse_data(line)
-                        if data is None:
-                            continue
-                        if data == "[DONE]":
+        client = self._client()
+        try:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers={**self._headers(), "Accept": "text/event-stream"},
+                json=payload,
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    # Nothing has been streamed yet, so this can
+                    # still be a status code -- see the same raise in
+                    # `generate`.
+                    raise CliError(
+                        f"openai_compat_http returned {response.status_code}: "
+                        f"{_redact(body.decode('utf-8', 'replace')[:500])}",
+                        upstream_status=response.status_code,
+                    )
+                async for line in response.aiter_lines():
+                    data = _sse_data(line)
+                    if data is None:
+                        continue
+                    if data == "[DONE]":
+                        saw_terminator = True
+                        break
+                    try:
+                        event = json.loads(data)
+                    except ValueError:
+                        # A malformed frame mid-stream is not worth
+                        # failing a half-delivered answer over.
+                        log.debug("openai_compat_http: unparseable SSE frame %r", data[:200])
+                        continue
+                    served_model = str(event.get("model") or served_model)
+                    if event.get("usage"):
+                        usage_payload = event["usage"]
+                    for choice in event.get("choices") or []:
+                        if choice.get("finish_reason"):
+                            finish_reason = str(choice["finish_reason"])
                             saw_terminator = True
-                            break
-                        try:
-                            event = json.loads(data)
-                        except ValueError:
-                            # A malformed frame mid-stream is not worth
-                            # failing a half-delivered answer over.
-                            log.debug("openai_compat_http: unparseable SSE frame %r", data[:200])
+                        delta = choice.get("delta") or {}
+                        # Tool-call fragments ride their own frame.
+                        # Forwarded rather than accumulated here: the
+                        # gateway has to emit them as OpenAI deltas
+                        # anyway, and buffering them to the end of
+                        # the stream would defeat the point of
+                        # streaming a call the caller wants to start
+                        # dispatching. We also accumulate a copy so
+                        # the terminal `done` carries whole calls,
+                        # for the non-streaming half of the contract.
+                        raw_calls = delta.get("tool_calls")
+                        if raw_calls:
+                            fragments = _tool_call_deltas_from_wire(raw_calls)
+                            if fragments:
+                                _accumulate_tool_calls(call_parts, raw_calls)
+                                yield Chunk(toolCalls=fragments)
+                        text = (delta.get("content")) or ""
+                        if not text:
                             continue
-                        served_model = str(event.get("model") or served_model)
-                        if event.get("usage"):
-                            usage_payload = event["usage"]
-                        for choice in event.get("choices") or []:
-                            if choice.get("finish_reason"):
-                                finish_reason = str(choice["finish_reason"])
-                                saw_terminator = True
-                            delta = choice.get("delta") or {}
-                            # Tool-call fragments ride their own frame.
-                            # Forwarded rather than accumulated here: the
-                            # gateway has to emit them as OpenAI deltas
-                            # anyway, and buffering them to the end of
-                            # the stream would defeat the point of
-                            # streaming a call the caller wants to start
-                            # dispatching. We also accumulate a copy so
-                            # the terminal `done` carries whole calls,
-                            # for the non-streaming half of the contract.
-                            raw_calls = delta.get("tool_calls")
-                            if raw_calls:
-                                fragments = _tool_call_deltas_from_wire(raw_calls)
-                                if fragments:
-                                    _accumulate_tool_calls(call_parts, raw_calls)
-                                    yield Chunk(toolCalls=fragments)
-                            text = (delta.get("content")) or ""
-                            if not text:
-                                continue
-                            visible = filtered.feed(text) if filtered is not None else text
-                            if visible:
-                                emitted.append(visible)
-                                yield Chunk(text=visible)
-            except httpx.HTTPError as e:
-                raise CliError(f"openai_compat_http stream failed: {e}") from e
+                        visible = filtered.feed(text) if filtered is not None else text
+                        if visible:
+                            emitted.append(visible)
+                            yield Chunk(text=visible)
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http stream failed: {e}") from e
 
         if not saw_terminator:
             # **Found by M10's acceptance run, which fixtures could not
@@ -651,7 +704,7 @@ class OpenAiCompatibleHttpEngine:
                 requestId=request.requestId,
                 backend=self.backend_kind,
                 modelId=served_model,
-                latencyMs=int((time.monotonic() - started) * 1000),
+                latencyMs=int((time.perf_counter() - started) * 1000),
             ),
         )
 
@@ -663,19 +716,14 @@ class OpenAiCompatibleHttpEngine:
         caller sees identical behaviour whether or not this particular
         backend implements `encoding_format` -- and several do not.
         """
-        started = time.monotonic()
+        started = time.perf_counter()
         payload: dict[str, Any] = {"model": self._model_id, "input": inputs}
 
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=httpx.Timeout(self._timeout_seconds, connect=10.0),
-        ) as client:
-            try:
-                response = await client.post(
-                    "/v1/embeddings", headers=self._headers(), json=payload
-                )
-            except httpx.HTTPError as e:
-                raise CliError(f"openai_compat_http embeddings request failed: {e}") from e
+        client = self._client()
+        try:
+            response = await client.post("/v1/embeddings", headers=self._headers(), json=payload)
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http embeddings request failed: {e}") from e
 
         if response.status_code >= 400:
             raise CliError(
@@ -696,7 +744,7 @@ class OpenAiCompatibleHttpEngine:
             modelId=str(body.get("model") or self._model_id),
             backend=self.backend_kind,
             usage=_usage_from_envelope(body.get("usage") or {}),
-            latencyMs=int((time.monotonic() - started) * 1000),
+            latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
     async def probe_embeddings(self) -> bool:
@@ -785,7 +833,7 @@ class OpenAiCompatibleHttpEngine:
         happens inside the refresh that a request triggered, so the
         whole cycle shares one short deadline and the answer is cached.
         """
-        now = time.monotonic()
+        now = time.perf_counter()
         if self._context_window_checked_at is not None:
             ttl = _CONTEXT_TTL_SECONDS if self._context_window is not None else _CONTEXT_MISS_TTL
             if now - self._context_window_checked_at < ttl:
@@ -794,23 +842,20 @@ class OpenAiCompatibleHttpEngine:
         deadline = now + _CONTEXT_PROBE_BUDGET_SECONDS
         found: int | None = None
         try:
-            async with httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=httpx.Timeout(_CONTEXT_PROBE_BUDGET_SECONDS, connect=2.0),
-            ) as client:
-                for source in (self._ctx_llama_cpp, self._ctx_vllm, self._ctx_ollama):
-                    if time.monotonic() >= deadline:
-                        break
-                    try:
-                        found = await source(client)
-                    except (httpx.HTTPError, ValueError, TypeError, KeyError):
-                        found = None
-                    if found is not None:
-                        break
+            client = self._client()
+            for source in (self._ctx_llama_cpp, self._ctx_vllm, self._ctx_ollama):
+                if time.perf_counter() >= deadline:
+                    break
+                try:
+                    found = await source(client)
+                except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                    found = None
+                if found is not None:
+                    break
         except (httpx.HTTPError, ValueError):
             found = None
 
-        self._context_window_checked_at = time.monotonic()
+        self._context_window_checked_at = time.perf_counter()
         # A probe that found nothing does not erase what an earlier one
         # found. Ollama drops a model out of `/api/ps` the moment it
         # idles out, and the window it will get on the next load is
@@ -833,7 +878,9 @@ class OpenAiCompatibleHttpEngine:
         The agent reads the same field off supervised runtimes; this
         reads it from wherever the driver points, supervised or not.
         """
-        response = await client.get("/props", headers=self._headers())
+        response = await client.get(
+            "/props", headers=self._headers(), timeout=_CONTEXT_PROBE_TIMEOUT
+        )
         if response.status_code >= 400:
             return None
         props = response.json()
@@ -852,7 +899,9 @@ class OpenAiCompatibleHttpEngine:
         entry, because a vLLM serving several models would otherwise
         hand back a window belonging to a different one.
         """
-        response = await client.get("/v1/models", headers=self._headers())
+        response = await client.get(
+            "/v1/models", headers=self._headers(), timeout=_CONTEXT_PROBE_TIMEOUT
+        )
         if response.status_code >= 400:
             return None
         body = response.json()
@@ -872,7 +921,11 @@ class OpenAiCompatibleHttpEngine:
         loaded, which is why a miss is cached briefly and never
         overwrites a previous hit.
         """
-        response = await client.get("/api/ps", headers={"Accept": "application/json"})
+        response = await client.get(
+            "/api/ps",
+            headers={"Accept": "application/json"},
+            timeout=_CONTEXT_PROBE_TIMEOUT,
+        )
         if response.status_code >= 400:
             return None
         body = response.json()
@@ -902,11 +955,9 @@ class OpenAiCompatibleHttpEngine:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         try:
-            async with httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=httpx.Timeout(15.0, connect=5.0),
-            ) as client:
-                response = await client.get("/v1/models", headers=headers)
+            response = await self._client().get(
+                "/v1/models", headers=headers, timeout=httpx.Timeout(15.0, connect=5.0)
+            )
             if response.status_code >= 400:
                 return []
             body = response.json()
