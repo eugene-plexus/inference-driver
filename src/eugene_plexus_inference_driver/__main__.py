@@ -66,6 +66,14 @@ def main() -> None:
         host=settings.bind_host,
         port=port,
         log_level=log_level.lower(),
+        # **Trust no forwarding header from anyone.** uvicorn's default
+        # is `"127.0.0.1"`, and every request this component receives
+        # arrives over loopback -- from the gateway, from an agent, or
+        # from the browser's proxy. So the default let any caller set
+        # `scope["client"]`, in the access log and in whatever reads it
+        # next. Review §6.1 #1, roadmap R1.2; the agent's `peer.py`
+        # carries the argument.
+        forwarded_allow_ips=[],
     )
 
 
