@@ -63,7 +63,7 @@ from .._generated.models import (
 from ._prompt import messages_to_prompt
 from ._subprocess import CliError, run_cli, stream_cli_lines
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
-from .base import Chunk
+from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class CodexCliEngine:
         *,
         binary_path: str = "codex",
         model_id: str | None = None,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         thinking_mode: str = "auto",
     ) -> None:
         self._binary_path = binary_path
@@ -140,7 +140,7 @@ class CodexCliEngine:
         return cls(
             binary_path=str(get("codexCliPath") or "codex"),
             model_id=get("modelId") or None,
-            timeout_seconds=float(get("requestTimeoutSeconds") or 120),
+            timeout_seconds=float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS),
             thinking_mode=str(get("thinkingMode") or "auto"),
         )
 

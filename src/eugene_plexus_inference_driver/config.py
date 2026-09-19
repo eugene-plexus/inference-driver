@@ -34,6 +34,7 @@ from ._generated.models import (
     ConfigUpdateResult,
     ConfigValueType,
 )
+from .engines.base import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
 from .engines.openai_compat_http import OpenAiCompatibleHttpEngine
@@ -156,17 +157,27 @@ def _common_fields() -> list[ConfigField]:
             key="requestTimeoutSeconds",
             label="Backend timeout",
             description=(
-                "How long the driver will wait on a single LLM call "
-                "before giving up and returning an error. Long-running "
-                "CLI invocations and large reasoning models can take "
-                "a while; 120s is the v0.1 default. Bump it if you "
-                "see timeouts on complex prompts."
+                "How long this driver waits on a single call to its "
+                "backend. A backstop: the gateway holds the deadline "
+                "that normally decides, and this sits one minute above "
+                "it so the gateway's is the one that fires. Raise both "
+                "if a model on the processor needs longer. When it does "
+                "fire, the request is not retried on another backend — "
+                "the next one would take the same time on the same "
+                "prompt — so it comes back as one 504 saying so."
             ),
             category="network",
             valueType=ConfigValueType.duration,
-            default=120,
+            # **Above the gateway's 600 s on purpose (R2.5).** As found,
+            # this was 120 s against the gateway's 180 s, so the driver
+            # always fired first and the gateway's knob governed
+            # nothing: an operator who raised the documented setting saw
+            # no change, and the failure arrived as an anonymous
+            # transport error that the cascade then recomputed on every
+            # replica and every tier.
+            default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
             minimum=5,
-            maximum=900,
+            maximum=3600,
             requiresRestart=True,
         ),
     ]

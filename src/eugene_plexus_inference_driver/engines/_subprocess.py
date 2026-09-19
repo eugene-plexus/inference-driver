@@ -60,6 +60,43 @@ class CliError(RuntimeError):
         self.upstream_status = upstream_status
 
 
+class BackendTimeout(CliError):
+    """The deadline fired. **The backend has not failed; it has not finished.**
+
+    A `CliError` subclass, so every `except CliError` in the routes keeps
+    working -- what it adds is identity, and identity is the whole fix
+    (R2.5). Three things were wrong with a timeout arriving as an
+    ordinary transport error:
+
+    * **It was anonymous.** `str(httpx.ReadTimeout(""))` is the empty
+      string, so the driver's own message read literally
+      ``"openai_compat_http request failed: "`` -- a blank, for the one
+      failure whose cause is known exactly. The operator whose CPU box
+      needs four minutes cannot act on that.
+    * **It cascaded.** The gateway's taxonomy folds every
+      `httpx.HTTPError` into "transport, try the next backend", so the
+      same prompt was handed to the next replica and then the next tier,
+      each taking the same time to do the same work, and the caller was
+      told "every backend failed" at the sum of the deadlines with two
+      engines having computed the answer.
+    * **It named no knob.** `limit_seconds` is carried so the message
+      can say which deadline fired and what to raise.
+
+    A **connect** timeout is deliberately NOT one of these: nothing was
+    handed to an engine, so the next backend is a real rescue and that
+    one keeps cascading.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        upstream_status: int | None = None,
+        limit_seconds: float | None = None,
+    ) -> None:
+        super().__init__(*args, upstream_status=upstream_status)
+        self.limit_seconds = limit_seconds
+
+
 @dataclass
 class CliResult:
     stdout: bytes
@@ -131,12 +168,18 @@ async def stream_cli_lines(
         while True:
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
-                raise CliError(f"CLI {binary!r} did not finish within {timeout_seconds}s; killed")
+                raise BackendTimeout(
+                    f"CLI {binary!r} did not finish within {timeout_seconds}s; killed. "
+                    f"Raise requestTimeoutSeconds on this driver if it needs longer.",
+                    limit_seconds=timeout_seconds,
+                )
             try:
                 line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
             except TimeoutError as e:
-                raise CliError(
-                    f"CLI {binary!r} did not finish within {timeout_seconds}s; killed"
+                raise BackendTimeout(
+                    f"CLI {binary!r} did not finish within {timeout_seconds}s; killed. "
+                    f"Raise requestTimeoutSeconds on this driver if it needs longer.",
+                    limit_seconds=timeout_seconds,
                 ) from e
             if not line:
                 break
@@ -199,7 +242,11 @@ async def run_cli(
     except TimeoutError as e:
         proc.kill()
         await proc.wait()
-        raise CliError(f"CLI {argv[0]!r} did not respond within {timeout_seconds}s; killed") from e
+        raise BackendTimeout(
+            f"CLI {argv[0]!r} did not respond within {timeout_seconds}s; killed. "
+            f"Raise requestTimeoutSeconds on this driver if it needs longer.",
+            limit_seconds=timeout_seconds,
+        ) from e
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     return CliResult(

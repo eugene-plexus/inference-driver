@@ -34,6 +34,21 @@ from .._generated.models import (
     ToolCallDelta,
 )
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 660.0
+"""The one place this number is written (R2.5).
+
+It was written in four -- the schema default and each of the three
+engines' ``or 120`` -- which is how a number drifts. It lives here
+rather than in `config.py` because `config.py` imports the engines and
+not the other way round.
+
+**660 is deliberately ABOVE the gateway's 600.** Two deadlines sit on
+the path, and until R2.5 they were ordered the wrong way round: this
+one was 120 s against the gateway's 180 s, so the driver always fired
+first and the knob an operator was told to turn governed nothing. The
+front door owns the answer; this is the backstop behind it.
+"""
+
 
 class StreamChunk(Protocol):
     """One event in the SSE stream emitted by `BackendEngine.stream`."""

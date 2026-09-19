@@ -17,7 +17,8 @@ from .._generated.models import (
     GenerateResponse,
     Problem,
 )
-from ..engines._subprocess import CliError
+from ..disconnect import ClientGone, serve_while_connected
+from ..engines._subprocess import BackendTimeout, CliError
 
 if TYPE_CHECKING:
     from ..engines.base import BackendEngine
@@ -34,7 +35,9 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
     _refuse_unsupported_tools(engine, body)
     try:
-        return await engine.generate(body)
+        return await serve_while_connected(request, engine.generate(body), what="a generation")
+    except ClientGone as e:
+        raise _client_gone() from e
     except CliError as e:
         log.warning("backend invocation failed: %s", e)
         # `backend_kind` is BackendKind in production but tests may stub
@@ -68,9 +71,19 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
 
     try:
-        first = await anext(stream)
+        # **The window Starlette does not cover.** Everything below this
+        # point is inside `StreamingResponse`, which races the body
+        # against `http.disconnect` itself. This await is not: it is
+        # deliberately before the response so an early failure can still
+        # be a status code, and on a cold engine it is the whole model
+        # load plus the prefill -- minutes, on exactly the box where a
+        # caller gives up.
+        first = await serve_while_connected(request, anext(stream), what="a streamed prefill")
     except StopAsyncIteration:
         first = None
+    except ClientGone as e:
+        await stream.aclose()
+        raise _client_gone() from e
     except CliError as e:
         # Nothing has been sent, so this can still be a status code.
         log.warning("backend invocation failed before the stream opened: %s", e)
@@ -86,7 +99,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
         except CliError as e:
             # The 200 is already sent; an error can only be a frame now.
             log.warning("backend failed mid-stream: %s", e)
-            yield _error_frame(str(e), kind_label)
+            yield _error_frame(str(e), kind_label, timed_out=isinstance(e, BackendTimeout))
         finally:
             # A client that disconnects abandons this generator, and the
             # engine's own `finally` is what kills the subprocess or
@@ -138,7 +151,11 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
         )
 
     try:
-        return await engine.embed(list(body.input))
+        return await serve_while_connected(
+            request, engine.embed(list(body.input)), what="an embedding"
+        )
+    except ClientGone as e:
+        raise _client_gone() from e
     except CliError as e:
         log.warning("embeddings invocation failed: %s", e)
         raise _backend_error(e, kind_label) from e
@@ -195,15 +212,44 @@ def _refuse_unsupported_tools(engine: BackendEngine, body: GenerateRequest) -> N
     )
 
 
-def _error_frame(detail: str, kind_label: str) -> str:
+def _error_frame(detail: str, kind_label: str, *, timed_out: bool = False) -> str:
+    """The failure as a frame, once the 200 is already on the wire.
+
+    Carries the same 504/502 split the status codes do, because a
+    caller that reads the frame is reading the only description of
+    the failure it will ever get -- and "still computing" and
+    "broken" are different instructions to whoever is watching.
+    """
     problem = Problem(
-        type="https://github.com/eugene-plexus/inference-driver#backend-error",
-        title="Backend error",
-        status=502,
+        type=(
+            "https://github.com/eugene-plexus/inference-driver#backend-timeout"
+            if timed_out
+            else "https://github.com/eugene-plexus/inference-driver#backend-error"
+        ),
+        title="Backend did not finish in time" if timed_out else "Backend error",
+        status=504 if timed_out else 502,
         detail=detail,
         component=f"inference-driver:{kind_label}",
     ).model_dump(exclude_none=True, mode="json")
     return f"event: error\ndata: {json.dumps(problem)}\n\n"
+
+
+def _client_gone() -> HTTPException:
+    """499, the status nginx invented for exactly this and nobody
+    standardised. Nothing will read it -- the socket is closed -- but it
+    is what the access log records, and "the caller left" and "we failed"
+    must not look the same there."""
+    return HTTPException(
+        status_code=499,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#client-disconnected",
+            title="Client disconnected",
+            status=499,
+            detail="The caller went away while this request was running; the backend "
+            "call was cancelled rather than left to finish into a closed socket.",
+            component="inference-driver",
+        ).model_dump(exclude_none=True),
+    )
 
 
 def _not_configured(adapter_error: str | None) -> HTTPException:
@@ -252,6 +298,28 @@ def _backend_error(e: Exception, kind_label: str) -> HTTPException:
     transport failure, where there is no status to carry and 502 is
     right.
     """
+    if isinstance(e, BackendTimeout):
+        # **Not 502, and the distinction is the whole of R2.5.** A 502
+        # tells the gateway "this backend is broken, the next one may
+        # not be", and the gateway acts on that by sending the same
+        # prompt to the next replica and then the next tier -- each
+        # taking the same time to do the same work, so a 30B on CPU was
+        # declared a total failure at the sum of the deadlines with two
+        # engines having computed the answer. A 504 says a deadline
+        # fired, which is a fact about the clock rather than about this
+        # backend, and is equally true of every other backend serving
+        # the model.
+        return HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#backend-timeout",
+                title="Backend did not finish in time",
+                status=504,
+                detail=str(e),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
+
     upstream = getattr(e, "upstream_status", None)
     rejected = (
         isinstance(upstream, int)

@@ -50,9 +50,9 @@ from .._generated.models import (
     Usage,
 )
 from .._http import client_for
-from ._subprocess import CliError
+from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
-from .base import Chunk
+from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk
 
 log = logging.getLogger(__name__)
 
@@ -214,6 +214,29 @@ def _sse_data(line: str) -> str | None:
     return line[5:].strip()
 
 
+def _timed_out(exc: httpx.TimeoutException, limit_seconds: float, what: str) -> BackendTimeout:
+    """The one failure whose cause we know exactly, said in words.
+
+    `str(httpx.ReadTimeout(""))` is the empty string -- httpx raises
+    these with no message -- so the driver's own error used to read
+    ``"openai_compat_http request failed: "`` and stop. Everything a
+    reader needs is here instead: which deadline fired, what it was set
+    to, what to turn, and that the engine is almost certainly still
+    computing rather than broken.
+
+    A **connect** timeout is not one of these. Nothing was ever handed
+    to the engine, so it is a dead host -- exactly what failover is for
+    -- and it stays an ordinary `CliError` on the cascading path.
+    """
+    return BackendTimeout(
+        f"openai_compat_http {what} did not answer within {limit_seconds:g}s "
+        f"({type(exc).__name__}). The backend was still working, not broken: a large model "
+        f"on CPU or a long answer can take minutes. Raise requestTimeoutSeconds on this "
+        f"driver (and on the gateway, which holds the shorter deadline of the two).",
+        limit_seconds=limit_seconds,
+    )
+
+
 class OpenAiCompatibleHttpEngine:
     """OpenAI-compatible HTTP engine. Provider-agnostic."""
 
@@ -239,7 +262,7 @@ class OpenAiCompatibleHttpEngine:
         api_key: str | None = None,
         base_url: str = "https://api.openai.com",
         model_id: str = "gpt-4o",
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         fixed_temperature_pattern: re.Pattern[str] | None = None,
         backend_kind: BackendKind = BackendKind.openai_api,
         thinking_mode: str = "auto",
@@ -383,7 +406,7 @@ class OpenAiCompatibleHttpEngine:
             api_key=str(get("apiKey") or "") or None,
             base_url=base_url,
             model_id=str(get("modelId") or "gpt-4o"),
-            timeout_seconds=float(get("requestTimeoutSeconds") or 120),
+            timeout_seconds=float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS),
             fixed_temperature_pattern=fixed_temperature_pattern,
             backend_kind=backend_kind,
             thinking_mode=str(get("thinkingMode") or "auto"),
@@ -484,8 +507,16 @@ class OpenAiCompatibleHttpEngine:
                 headers=headers,
                 json=payload,
             )
+        except httpx.ConnectTimeout as e:
+            # A host that never accepted the connection is a DEAD host,
+            # not a slow one: nothing was handed to an engine, so the
+            # next backend is a real rescue. Deliberately below the
+            # `TimeoutException` branch it would otherwise match.
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the completion") from e
         except httpx.HTTPError as e:
-            raise CliError(f"openai_compat_http request failed: {e}") from e
+            raise CliError(f"openai_compat_http request failed: {e!r}") from e
 
         if response.status_code >= 400:
             if log.isEnabledFor(logging.DEBUG):
@@ -664,8 +695,12 @@ class OpenAiCompatibleHttpEngine:
                         if visible:
                             emitted.append(visible)
                             yield Chunk(text=visible)
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the stream") from e
         except httpx.HTTPError as e:
-            raise CliError(f"openai_compat_http stream failed: {e}") from e
+            raise CliError(f"openai_compat_http stream failed: {e!r}") from e
 
         if not saw_terminator:
             # **Found by M10's acceptance run, which fixtures could not
@@ -722,8 +757,12 @@ class OpenAiCompatibleHttpEngine:
         client = self._client()
         try:
             response = await client.post("/v1/embeddings", headers=self._headers(), json=payload)
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the embeddings request") from e
         except httpx.HTTPError as e:
-            raise CliError(f"openai_compat_http embeddings request failed: {e}") from e
+            raise CliError(f"openai_compat_http embeddings request failed: {e!r}") from e
 
         if response.status_code >= 400:
             raise CliError(
