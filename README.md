@@ -155,6 +155,14 @@ shape adaptation, degraded-mode startup, and subprocess encoding on Windows.
 CLI live tests are gated behind `EUGENE_PLEXUS_DRIVER_LIVE_CLI=1` and API live
 tests behind `EUGENE_PLEXUS_DRIVER_LIVE_API=1`.
 
+## CLI environment
+
+CLI subprocesses, including streaming calls, inherit backend credentials and proxy
+settings but no `EUGENE_PLEXUS_*` variables. UTF-8 settings still apply. This prevents
+accidental control-plane credential inheritance; it does not sandbox a CLI running
+as the driver's OS user. The driver's own asymmetric signing-key separation remains
+part of roadmap R7.
+
 ## License
 
 Apache 2.0 — see [`LICENSE`](LICENSE).

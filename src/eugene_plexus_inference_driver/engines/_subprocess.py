@@ -32,8 +32,12 @@ _UTF8_ENV: dict[str, str] = {
 
 
 def _utf8_subprocess_env() -> dict[str, str]:
-    """Return os.environ overlaid with UTF-8 hints for the child."""
-    env = os.environ.copy()
+    """Keep backend credentials and UTF-8 hints, but no Plexus credentials."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("EUGENE_PLEXUS_")
+    }
     env.update(_UTF8_ENV)
     return env
 
