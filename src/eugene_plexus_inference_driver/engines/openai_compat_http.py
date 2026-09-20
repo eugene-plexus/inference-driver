@@ -174,7 +174,14 @@ def _is_plausible_chat_model(model_id: str) -> bool:
 _FINISH_REASON_MAP = {
     "stop": FinishReason.stop,
     "length": FinishReason.length,
-    "content_filter": FinishReason.error,
+    # **Its own value since 2026-09-19**, having been folded into
+    # `error` since M0. Two different states with two different
+    # remedies: `error` means the generation was truncated because
+    # something broke and a retry may work, `content_filter` means a
+    # classifier stopped it on purpose and a retry will not. Folded
+    # together the gateway could only render the pair as `stop`, so a
+    # refusal reached the caller as a natural end.
+    "content_filter": FinishReason.content_filter,
     # Both were `FinishReason.stop` until tool calling landed, which is
     # the shape of the whole gap: a backend that HAD made a tool call
     # reported a clean natural stop, and the calls themselves were
@@ -281,6 +288,7 @@ class OpenAiCompatibleHttpEngine:
         self._model_id = model_id
         self._timeout_seconds = timeout_seconds
         self._fixed_temperature_pattern = fixed_temperature_pattern
+        self._warned_dropped: set[str] = set()
         self._temperature_is_fixed = fixed_temperature_pattern is not None and bool(
             fixed_temperature_pattern.match(model_id)
         )
@@ -436,6 +444,31 @@ class OpenAiCompatibleHttpEngine:
             payload[_max_tokens_field_for(self._base_url)] = request.maxTokens
         if request.temperature is not None and not self._temperature_is_fixed:
             payload["temperature"] = float(request.temperature)
+        # **Carried since 2026-09-19.** `GenerateRequest` had no field
+        # for either until then, so `gateway.yaml`'s promise that both
+        # were passed through to backends that support them was
+        # unfulfillable and nothing was logged. They ride through
+        # untouched, exactly as `temperature` does and for the same
+        # reason: the gateway owns every parameter that changes what
+        # the model says, and a driver never substitutes one.
+        #
+        # `top_p` is dropped by the same flag that drops `temperature`,
+        # and only by that flag. OpenAI's reasoning models reject both
+        # -- the sampler is not the caller's to tune there -- so
+        # sending it would be the 400 that flag exists to avoid. The
+        # seed is NOT dropped with them: those models accept it, and
+        # widening the drop to every sampling parameter because two
+        # travel together would be the over-correction.
+        if request.topP is not None and not self._temperature_is_fixed:
+            payload["top_p"] = float(request.topP)
+        elif request.topP is not None:
+            self._warn_dropped("top_p")
+        # `is not None` and not truthiness: **`seed=0` is a real seed**
+        # and a falsy one, and dropping it would answer a request for a
+        # reproducible result with a different answer every time --
+        # which is the whole of what this field was doing before today.
+        if request.seed is not None:
+            payload["seed"] = int(request.seed)
         if request.stop:
             payload["stop"] = list(request.stop)
         # Tools ride through untouched. We do not validate the JSON
@@ -459,6 +492,25 @@ class OpenAiCompatibleHttpEngine:
                 mode="json", exclude_none=True
             )
         return payload
+
+    def _warn_dropped(self, field: str) -> None:
+        """Say it once per field per engine, not once per request.
+
+        The contract promises a parameter we cannot carry is "dropped
+        with a warning". A warning on every request would be a log line
+        per token-generating call on a busy backend, which is how a
+        real warning becomes something an operator filters out.
+        """
+        if field in self._warned_dropped:
+            return
+        self._warned_dropped.add(field)
+        log.warning(
+            "model %r does not accept `%s`; the driver is omitting it on every "
+            "request and letting the model use its own default. This is said "
+            "once per parameter for the life of this engine.",
+            self._model_id,
+            field,
+        )
 
     def _headers(self) -> dict[str, str]:
         # No key means no header, not `Bearer None`. Providers that need

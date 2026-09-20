@@ -21,6 +21,7 @@ classmethods (`field_specs`, `from_config`) let `config.py` and
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -222,3 +223,44 @@ class BackendEngine(Protocol):
         (transport error, bad auth) — the schema falls back to free-text.
         """
         ...
+
+
+log = logging.getLogger(__name__)
+
+
+def warn_dropped_sampling(
+    request: GenerateRequest, *, engine: str, model_id: str, warned: set[str]
+) -> None:
+    """Say which output-affecting parameters this backend cannot carry.
+
+    The gateway owns `topP` and `seed` and sends them explicitly; an
+    agentic CLI has no knob for either, because the harness on the other
+    side of the pipe owns the sampler. The contract's answer to that is
+    "dropped with a logged warning" rather than a refusal -- refusing
+    would fail a request the backend can perfectly well answer -- so the
+    one thing that must not happen is what happened before 2026-09-19,
+    which is nothing at all.
+
+    **Once per parameter per engine, not once per request.** A line on
+    every call is a line per generation on a busy backend, and a warning
+    at that rate is one an operator filters out, which costs the warning
+    its only job.
+
+    `maxTokens` and `temperature` are deliberately NOT in here: the
+    contract has said since M0 that adapters whose backends do not
+    expose those ignore them **silently**, and changing that under cover
+    of this fix would be a behaviour change nobody asked for.
+    """
+    for field, value in (("topP", request.topP), ("seed", request.seed)):
+        if value is None or field in warned:
+            continue
+        warned.add(field)
+        log.warning(
+            "%s cannot carry `%s` to %r -- the harness on the other side of the "
+            "pipe owns its own sampler -- so the parameter was dropped and the "
+            "request was answered. Said once per parameter for the life of this "
+            "engine.",
+            engine,
+            field,
+            model_id,
+        )

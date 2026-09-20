@@ -52,7 +52,7 @@ from .._generated.models import (
 from ._prompt import messages_to_prompt
 from ._subprocess import CliError, run_cli, stream_cli_lines
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
-from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk
+from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, warn_dropped_sampling
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ class ClaudeCodeCliEngine:
         self._model_id = model_id
         self._timeout_seconds = timeout_seconds
         self._thinking_mode = thinking_mode or "auto"
+        self._warned_sampling: set[str] = set()
 
     @classmethod
     def field_specs(cls, *, applicable_providers: list[str]) -> list[ConfigField]:
@@ -143,6 +144,12 @@ class ClaudeCodeCliEngine:
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        warn_dropped_sampling(
+            request,
+            engine="claude_code_cli",
+            model_id=self._model_id or "the CLI's own default model",
+            warned=self._warned_sampling,
+        )
         # Apply the operator's thinkingMode by mutating the system
         # message before splitting / serialization. Claude Code itself
         # doesn't emit <think> tags inline (its thinking goes via the
@@ -260,6 +267,13 @@ class ClaudeCodeCliEngine:
         `--verbose` is not optional: Claude Code refuses
         `--output-format stream-json` under `--print` without it.
         """
+        warn_dropped_sampling(
+            request,
+            engine="claude_code_cli",
+            model_id=self._model_id or "the CLI's own default model",
+            warned=self._warned_sampling,
+        )
+
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         system_messages = [m for m in messages if m.role == Role.system]
         other_messages = [m for m in messages if m.role != Role.system]
