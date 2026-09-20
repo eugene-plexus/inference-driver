@@ -1,23 +1,8 @@
-"""Auth state for the inference-driver's verify-only role.
-
-Built once at startup from the env vars the agent threads in when
-it spawns this child:
-
-  * `EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
-    key used to validate inbound bearer tokens.
-  * `EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN` — long-lived JWT (`aud:
-    service:inference-driver`). The inference-driver currently
-    makes no outbound calls to peer components (LLM backend calls are
-    a separate trust boundary), so this is captured but unused in
-    v0.2. Reserved for v0.3 if hemispheres start reading memory.
-  * `EUGENE_PLEXUS_DRIVER_MASTER_KEY` — base64 of the 32-byte secretbox
-    key. Used by Phase 6 to decrypt the at-rest envelope around
-    `apiKey` config values; not consumed in this phase.
-
-If `AUTH_SIGNING_KEY` is unset, the driver runs in `auth_disabled=True`
-mode: route dependencies short-circuit and let everything through.
-That's the dev/standalone path. Production via the agent always
-supplies the env var.
+"""Verifier bootstrap: AUTH_VERIFY_KEY is base64 public Ed25519 PEM.
+AUTH_SIGNING_KEY accepts only a legacy 32-byte HS256 key during upgrade.
+Never supply both. SERVICE_TOKEN is minted by the supervising agent;
+MASTER_KEY is a separate at-rest encryption credential. Missing both
+verification inputs retains the existing standalone/dev mode.
 """
 
 from __future__ import annotations
@@ -25,6 +10,8 @@ from __future__ import annotations
 import base64
 import logging
 from dataclasses import dataclass
+
+from . import security
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +23,7 @@ class AuthState:
     (per-restart key rotation is the v0.2 revocation story)."""
 
     signing_key: bytes | None
-    """32-byte HMAC key, or None when auth is disabled."""
+    """Public Ed25519 PEM or legacy HMAC key; None when auth is disabled."""
 
     service_token: str | None
     """Outbound bearer token. Not consumed in v0.2 — the driver doesn't
@@ -71,6 +58,7 @@ def load_auth_state(
     signing_key_b64: str | None,
     service_token: str | None,
     master_key_b64: str | None,
+    verify_key_b64: str | None = None,
 ) -> AuthState:
     """Build an `AuthState` from the three env-var inputs.
 
@@ -79,14 +67,26 @@ def load_auth_state(
     inconsistent partial-auth configurations — a missing piece is
     almost always a wiring bug we want loud rather than silently 401-y.
     """
-    signing_key = _decode_b64_key(signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY")
+    signing_key: bytes | None
+    if verify_key_b64 is not None:
+        if signing_key_b64 is not None:
+            raise ValueError("both AUTH_VERIFY_KEY and legacy AUTH_SIGNING_KEY are set")
+        try:
+            raw = base64.b64decode(verify_key_b64, validate=True)
+            if not raw.startswith(b"-----BEGIN PUBLIC KEY-----"):
+                raise ValueError("public PEM required")
+            signing_key = security.verification_key(raw)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("AUTH_VERIFY_KEY must contain base64 Ed25519 public PEM") from exc
+    else:
+        signing_key = _decode_b64_key(signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY")
     master_key = _decode_b64_key(master_key_b64, expected_len=32, label="MASTER_KEY")
 
     if signing_key is None:
         if service_token or master_key:
             raise ValueError(
                 "auth env vars inconsistent: SERVICE_TOKEN or MASTER_KEY is set but "
-                "AUTH_SIGNING_KEY is not — refusing to start in a partially-auth state"
+                "neither verification key is set — refusing a partially-auth state"
             )
         log.warning(
             "EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY not set — running unauthenticated "

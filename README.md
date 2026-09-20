@@ -160,8 +160,11 @@ tests behind `EUGENE_PLEXUS_DRIVER_LIVE_API=1`.
 CLI subprocesses, including streaming calls, inherit backend credentials and proxy
 settings but no `EUGENE_PLEXUS_*` variables. UTF-8 settings still apply. This prevents
 accidental control-plane credential inheritance; it does not sandbox a CLI running
-as the driver's OS user. The driver's own asymmetric signing-key separation remains
-part of roadmap R7.
+as the driver's OS user. In Ed25519 mode the driver receives only public verification
+PEM through `EUGENE_PLEXUS_DRIVER_AUTH_VERIFY_KEY`, plus its service token and separate
+master encryption key. Legacy HS256 bootstrap remains available until the install's
+explicit key rotation; update every component before rotating. Private signing PEM
+is never accepted by the driver.
 
 ## License
 
