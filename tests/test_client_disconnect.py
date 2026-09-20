@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from eugene_plexus_inference_driver._generated.models import (
@@ -70,6 +71,18 @@ class _HangingAdapter:
     async def stream(self, request: GenerateRequest) -> AsyncIterator[Chunk]:
         await self._hang()
         yield Chunk(text="never")
+
+
+class _AnsweringAdapter(_HangingAdapter):
+    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        await asyncio.sleep(0)
+        return GenerateResponse(
+            content="the answer",
+            finishReason=FinishReason.stop,
+            backend="openai_compat_http",
+            modelId="m",
+            latencyMs=1,
+        )
 
 
 _SCOPE: dict[str, Any] = {
@@ -176,17 +189,7 @@ async def test_a_disconnect_during_the_prefill_cancels_the_stream() -> None:
 async def test_a_caller_that_stays_gets_its_answer() -> None:
     """The control: the watcher must not cancel a live request."""
 
-    class _Fast(_HangingAdapter):
-        async def generate(self, request: GenerateRequest) -> GenerateResponse:
-            return GenerateResponse(
-                content="the answer",
-                finishReason=FinishReason.stop,
-                backend="openai_compat_http",
-                modelId="m",
-                latencyMs=1,
-            )
-
-    adapter = _Fast()
+    adapter = _AnsweringAdapter()
     app = _app(adapter)
     gone = asyncio.Event()  # never set
     body = GenerateRequest(messages=[{"role": "user", "content": "hi"}])
@@ -194,7 +197,7 @@ async def test_a_caller_that_stays_gets_its_answer() -> None:
     assert result.content == "the answer"
 
 
-def test_the_watcher_does_not_hang_a_plain_request(client) -> None:  # type: ignore[no-untyped-def]
+def test_the_watcher_does_not_hang_a_plain_request(client: TestClient) -> None:
     """The trap this cost, pinned.
 
     The first version used `Request.is_disconnected()`, which peeks at
@@ -206,11 +209,15 @@ def test_the_watcher_does_not_hang_a_plain_request(client) -> None:  # type: ign
     asserted "an ordinary request still returns", so the failure looked
     like an infrastructure problem rather than like this change.
     """
+    # The subject is TestClient's receive channel, not a locally installed
+    # Claude CLI or an authenticated subscription. Return a real success.
+    client.app.state.adapter = _AnsweringAdapter()
     response = client.post(
         "/v1/generate",
         json={"messages": [{"role": "user", "content": "hi"}]},
     )
-    assert response.status_code < 500, response.text
+    assert response.status_code == 200, response.text
+    assert response.json()["content"] == "the answer"
 
 
 async def test_the_watcher_returns_only_for_a_DISCONNECT() -> None:
