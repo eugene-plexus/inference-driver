@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -36,6 +38,16 @@ async def info(request: Request) -> DriverInfo:
     engine = request.app.state.adapter
     if engine is not None:
         backend = engine.backend_kind
+        # The gateway reconfirms locality/settings within four seconds before
+        # waking a stopped runtime. Optional backend probes must not serialize
+        # their timeouts or let an embedding probe use the generation deadline.
+        # Keep known engine policy available; unconfirmed capabilities stay
+        # conservative, and cancelling a probe does not cache a false answer.
+        image_input, context_window, embeddings = await asyncio.gather(
+            _bounded_probe(_image_input(engine), False),
+            _bounded_probe(_context_window(engine), None),
+            _bounded_probe(_embeddings(engine), None),
+        )
         return DriverInfo(
             locality=engine_locality(engine),
             localOnlyEnforced=True,
@@ -47,7 +59,7 @@ async def info(request: Request) -> DriverInfo:
             # tell a UI nothing.
             capabilities=Capabilities(
                 supportedSettings=list(getattr(engine, "supported_settings", [])),
-                imageInput=await _image_input(engine),
+                imageInput=image_input,
                 streaming=bool(getattr(engine, "supports_streaming", False)),
                 toolCalling=bool(getattr(engine, "supports_tool_calling", False)),
                 # Contracted at M0, populated by nothing until step 7 --
@@ -58,13 +70,13 @@ async def info(request: Request) -> DriverInfo:
                 # ordinary local setup there is. Probed from the backend
                 # and cached by the engine; None stays None rather than
                 # becoming a guess.
-                maxContextTokens=await _context_window(engine),
+                maxContextTokens=context_window,
                 # The third capability flag this project contracted and
                 # left unpopulated -- `streaming` was the first (M10),
                 # `maxContextTokens` the second (step 7). Determined by
                 # asking the backend, because nothing exposes it: see
                 # `probe_embeddings`.
-                embeddings=await _embeddings(engine),
+                embeddings=embeddings,
             ),
             backend=backend,
             provider=provider_key,
@@ -110,6 +122,14 @@ async def info(request: Request) -> DriverInfo:
         runtime=runtime,
         version=__version__,
     )
+
+
+async def _bounded_probe(probe: Awaitable[Any], fallback: Any) -> Any:
+    try:
+        async with asyncio.timeout(2.5):
+            return await probe
+    except TimeoutError:
+        return fallback
 
 
 async def _context_window(engine: Any) -> int | None:
