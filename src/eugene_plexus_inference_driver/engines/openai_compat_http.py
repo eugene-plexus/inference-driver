@@ -55,7 +55,12 @@ from ..failures import request_id, retry_after
 from ..images import content_wire, has_images
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
-from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, refuse_unsupported_settings
+from .base import (
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_STREAM_STALL_SECONDS,
+    Chunk,
+    refuse_unsupported_settings,
+)
 
 log = logging.getLogger(__name__)
 _IMAGE_ERROR_HINT = (
@@ -252,6 +257,31 @@ def _timed_out(exc: httpx.TimeoutException, limit_seconds: float, what: str) -> 
     )
 
 
+def _stalled(stall_seconds: float, emitted_chars: int) -> BackendTimeout:
+    """The backend WAS answering and went silent on an open socket.
+
+    Not `_timed_out`'s case: there the whole request took too long and
+    the engine is presumed still computing. Here the engine had started
+    streaming -- it owed the next token within `streamStallSeconds` and
+    sent nothing, no token, no finish reason, no close. Holding on
+    costs the caller the rest of the request budget for an answer that
+    is not coming; ending it names what happened.
+
+    A `BackendTimeout` on purpose: mid-stream the gateway is committed
+    (M10), so this can only ever surface as the stream's terminal
+    `error` frame with the 504 identity -- never as a natural end, and
+    never as a 502 inviting a cascade that cannot happen.
+    """
+    return BackendTimeout(
+        f"openai_compat_http stream went silent for {stall_seconds:g}s mid-answer, "
+        f"after {emitted_chars} characters. The backend stopped producing tokens without "
+        f"closing the stream or sending a finish reason. If this backend legitimately "
+        f"pauses that long between tokens, raise streamStallSeconds on this driver "
+        f"(0 disables the check).",
+        limit_seconds=stall_seconds,
+    )
+
+
 class OpenAiCompatibleHttpEngine:
     """OpenAI-compatible HTTP engine. Provider-agnostic."""
 
@@ -278,6 +308,7 @@ class OpenAiCompatibleHttpEngine:
         base_url: str = "https://api.openai.com",
         model_id: str = "gpt-4o",
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
         fixed_temperature_pattern: re.Pattern[str] | None = None,
         backend_kind: BackendKind = BackendKind.openai_api,
         thinking_mode: str = "auto",
@@ -295,6 +326,7 @@ class OpenAiCompatibleHttpEngine:
         self._base_url = base_url.rstrip("/")
         self._model_id = model_id
         self._timeout_seconds = timeout_seconds
+        self._stall_seconds = stall_seconds
         self._fixed_temperature_pattern = fixed_temperature_pattern
         self._warned_dropped: set[str] = set()
         self._temperature_is_fixed = fixed_temperature_pattern is not None and bool(
@@ -389,6 +421,31 @@ class OpenAiCompatibleHttpEngine:
                 requiresRestart=True,
                 showWhen=show_when,
             ),
+            ConfigField(
+                key="streamStallSeconds",
+                label="Stream stall timeout",
+                description=(
+                    "How long a streamed answer may go silent between "
+                    "tokens before this driver declares the backend "
+                    "stalled and ends the stream with an error. The "
+                    "clock starts at the first token — the quiet model "
+                    "load and prompt reading before it are covered by "
+                    "the backend timeout instead — so a slow machine is "
+                    "not punished for a slow start, only for going "
+                    "quiet mid-answer. Be generous for a model running "
+                    "on the processor, where tokens can be seconds "
+                    "apart. 0 turns the check off. Set per driver: a "
+                    "fast card and a CPU box can each hold their own "
+                    "number."
+                ),
+                category="network",
+                valueType=ConfigValueType.duration,
+                default=DEFAULT_STREAM_STALL_SECONDS,
+                minimum=0,
+                maximum=600,
+                requiresRestart=True,
+                showWhen=show_when,
+            ),
         ]
 
     @classmethod
@@ -418,11 +475,20 @@ class OpenAiCompatibleHttpEngine:
                 "for an endpoint that is not one. For named providers this is a "
                 "registry bug — file an issue."
             )
+        # `0 or DEFAULT` is DEFAULT -- the seed=0 mistake (R3.4). Zero
+        # here means "the operator turned the stall check off" and must
+        # arrive as zero, so only absence falls back.
+        raw_stall = get("streamStallSeconds")
         return cls(
             api_key=str(get("apiKey") or "") or None,
             base_url=base_url,
             model_id=str(get("modelId") or "gpt-4o"),
             timeout_seconds=float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            stall_seconds=(
+                DEFAULT_STREAM_STALL_SECONDS
+                if raw_stall is None or raw_stall == ""
+                else float(raw_stall)
+            ),
             fixed_temperature_pattern=fixed_temperature_pattern,
             backend_kind=backend_kind,
             thinking_mode=str(get("thinkingMode") or "auto"),
@@ -746,10 +812,44 @@ class OpenAiCompatibleHttpEngine:
                         upstream_status=response.status_code,
                         retry_after_seconds=retry_after(response.headers.get("Retry-After")),
                     )
-                async for line in response.aiter_lines():
+                lines = response.aiter_lines()
+                # The stall clock arms at the first DATA frame, not the
+                # first line: before a token arrives the silence is a
+                # legitimate model load plus prompt reading -- minutes
+                # on a CPU box -- and the request budget governs it.
+                # Any line at all resets the clock afterwards, so a
+                # backend emitting keepalives is never called stalled.
+                saw_first_data = False
+                while True:
+                    try:
+                        if saw_first_data and self._stall_seconds > 0:
+                            try:
+                                async with asyncio.timeout(self._stall_seconds):
+                                    line = await anext(lines)
+                            except TimeoutError as stall:
+                                if saw_terminator:
+                                    # The answer is complete -- a
+                                    # finish_reason arrived and only the
+                                    # [DONE] marker is being withheld.
+                                    # Failing a whole answer over a
+                                    # missing goodbye would be the
+                                    # over-correction.
+                                    log.debug(
+                                        "stream stalled after its finish_reason; "
+                                        "treating as complete"
+                                    )
+                                    break
+                                raise _stalled(
+                                    self._stall_seconds, len("".join(emitted))
+                                ) from stall
+                        else:
+                            line = await anext(lines)
+                    except StopAsyncIteration:
+                        break
                     data = _sse_data(line)
                     if data is None:
                         continue
+                    saw_first_data = True
                     if data == "[DONE]":
                         saw_terminator = True
                         break

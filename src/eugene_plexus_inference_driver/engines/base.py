@@ -50,6 +50,29 @@ first and the knob an operator was told to turn governed nothing. The
 front door owns the answer; this is the backstop behind it.
 """
 
+DEFAULT_STREAM_STALL_SECONDS = 30.0
+"""How long a stream may go silent BETWEEN tokens before it is stalled.
+
+Different in kind from `DEFAULT_REQUEST_TIMEOUT_SECONDS`: that one
+bounds the whole request, this one bounds the gap between consecutive
+frames once a backend has started answering. Without it a backend that
+emits three tokens and goes silent on an open socket holds the caller
+for the full request budget -- eleven minutes of nothing, the most
+commonly reported streaming failure in production gateways.
+
+The clock starts at the FIRST frame, never before it: the silence
+before a first token is a legitimate cold model load plus prompt
+reading, minutes long on a CPU box, and is governed by the request
+budget. After a token, decode is steady on every engine we front --
+30 s of mid-answer silence is generous even for a large model on the
+processor. Per driver via `streamStallSeconds`; 0 disables.
+
+The driver alone measures this, not the gateway: past the first token
+the gateway cannot fail over anyway (M10 -- splicing two models is a
+wrong answer that looks right), so a gateway timer would buy no rescue
+and would blame the driver hop for the engine's stall.
+"""
+
 
 class StreamChunk(Protocol):
     """One event in the SSE stream emitted by `BackendEngine.stream`."""
