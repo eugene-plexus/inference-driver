@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Request
 
@@ -92,6 +92,13 @@ def build_engine_with(
     # invariant in `type[]`), but every registered class implements
     # `BackendEngine` — annotate the return through a local cast.
     engine: BackendEngine = provider.engine_class.from_config(get, **kwargs)
+    from .locality import classify
+
+    # Snapshot the trust decision with the engine that owns the destination.
+    # Editing saved config cannot relabel the still-running old adapter.
+    cast(Any, engine).routing_locality = classify(
+        provider_key, get("backendLocality"), managed=bool(kwargs.get("runtime_url"))
+    )
     return engine
 
 

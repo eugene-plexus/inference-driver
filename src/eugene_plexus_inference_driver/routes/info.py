@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from .. import __version__
 from .._generated.models import BackendKind, Capabilities, DriverInfo, Problem
 from ..config import ConfigStore
+from ..locality import engine_locality
 
 router = APIRouter(tags=["meta"])
 
@@ -36,6 +37,8 @@ async def info(request: Request) -> DriverInfo:
     if engine is not None:
         backend = engine.backend_kind
         return DriverInfo(
+            locality=engine_locality(engine),
+            localOnlyEnforced=True,
             # Contracted since M0 and populated since M10, when there was
             # finally something true to say: `streaming` means "emits
             # genuinely incremental tokens", which is False for a backend
@@ -97,6 +100,7 @@ async def info(request: Request) -> DriverInfo:
         ) from e
 
     return DriverInfo(
+        localOnlyEnforced=True,
         backend=backend,
         provider=provider_key,
         modelId=store.get("modelId") or None,

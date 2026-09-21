@@ -21,6 +21,7 @@ from .._generated.models import (
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
 from ..images import ImageRefusal, has_images, validate_messages
+from ..locality import enforce
 
 if TYPE_CHECKING:
     from ..engines.base import BackendEngine
@@ -35,6 +36,7 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body)
     await _validate_content(engine, body)
     try:
@@ -68,6 +70,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body)
     await _validate_content(engine, body)
 
@@ -129,6 +132,7 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    enforce(engine, body.localOnly)
 
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
     probe = getattr(engine, "probe_embeddings", None)
