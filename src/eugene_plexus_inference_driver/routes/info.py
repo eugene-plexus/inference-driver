@@ -46,6 +46,7 @@ async def info(request: Request) -> DriverInfo:
             # endpoint works. A flag that said True for everything would
             # tell a UI nothing.
             capabilities=Capabilities(
+                supportedSettings=list(getattr(engine, "supported_settings", [])),
                 imageInput=await _image_input(engine),
                 streaming=bool(getattr(engine, "supports_streaming", False)),
                 toolCalling=bool(getattr(engine, "supports_tool_calling", False)),

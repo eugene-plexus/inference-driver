@@ -17,9 +17,11 @@ from .._generated.models import (
     GenerateRequest,
     GenerateResponse,
     Problem,
+    RetryDisposition,
 )
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
+from ..failures import disposition, request_id
 from ..images import ImageRefusal, has_images, validate_messages
 from ..locality import enforce
 
@@ -106,7 +108,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
         except CliError as e:
             # The 200 is already sent; an error can only be a frame now.
             log.warning("backend failed mid-stream: %s", e)
-            yield _error_frame(str(e), kind_label, timed_out=isinstance(e, BackendTimeout))
+            yield "event: error\ndata: " + json.dumps(_backend_error(e, kind_label).detail) + "\n\n"
         finally:
             # A client that disconnects abandons this generator, and the
             # engine's own `finally` is what kills the subprocess or
@@ -158,6 +160,7 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
             ).model_dump(exclude_none=True),
         )
 
+    token = request_id.set(str(body.requestId) if body.requestId else None)
     try:
         return await serve_while_connected(
             request, engine.embed(list(body.input)), what="an embedding"
@@ -167,6 +170,8 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
     except CliError as e:
         log.warning("embeddings invocation failed: %s", e)
         raise _backend_error(e, kind_label) from e
+    finally:
+        request_id.reset(token)
 
 
 def _frame(chunk: Any) -> str:
@@ -266,6 +271,7 @@ def _not_configured(adapter_error: str | None) -> HTTPException:
         detail=Problem(
             type="https://github.com/eugene-plexus/inference-driver#engine-not-configured",
             title="Engine not configured",
+            retryDisposition=RetryDisposition.safe,
             status=503,
             detail=(
                 f"This driver has no working engine. {adapter_error or 'Unknown error.'} "
@@ -276,88 +282,33 @@ def _not_configured(adapter_error: str | None) -> HTTPException:
     )
 
 
-# Backend 4xx codes that say "not now" rather than "not ever". These
-# keep the 502 they have always had, so the gateway's priority-list
-# cascade still fires on them -- a rate-limited cloud provider falling
-# through to a local engine is the case failover was built for, and the
-# smoke test that motivated it was exactly an OpenRouter 429.
-_RETRYABLE_BACKEND_STATUSES = frozenset({408, 409, 425, 429})
-
-
 def _backend_error(e: Exception, kind_label: str) -> HTTPException:
-    """A backend failure, as the status the layer above should act on.
-
-    **Two buckets, and the split is the whole point.** The gateway
-    cascades a 5xx to the next backend in the slot and hard-fails a 4xx,
-    because a request the backend rejected is one the next backend would
-    reject identically. That rule is only as good as this function: when
-    every backend failure became a 502, the gateway cascaded through
-    every replica and every tier of a request that could not succeed
-    anywhere, then handed the caller a retryable error.
-
-    The case that matters is an over-long prompt. `llama-server` answers
-    one with a 400 naming both numbers -- `n_prompt_tokens` and `n_ctx`
-    -- which is a better answer than anything this layer could compute,
-    and it used to arrive as "every backend serving this model failed".
-    A harness reading a 502 retries the same prompt; a harness reading a
-    400 fixes it. Deciding which one it sees is this function's job.
-
-    `upstream_status` is None for a subprocess backend and for a
-    transport failure, where there is no status to carry and 502 is
-    right.
-    """
-    if isinstance(e, BackendTimeout):
-        # **Not 502, and the distinction is the whole of R2.5.** A 502
-        # tells the gateway "this backend is broken, the next one may
-        # not be", and the gateway acts on that by sending the same
-        # prompt to the next replica and then the next tier -- each
-        # taking the same time to do the same work, so a 30B on CPU was
-        # declared a total failure at the sum of the deadlines with two
-        # engines having computed the answer. A 504 says a deadline
-        # fired, which is a fact about the clock rather than about this
-        # backend, and is equally true of every other backend serving
-        # the model.
-        return HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/inference-driver#backend-timeout",
-                title="Backend did not finish in time",
-                status=504,
-                detail=str(e),
-                component=f"inference-driver:{kind_label}",
-            ).model_dump(exclude_none=True),
-        )
-
-    upstream = getattr(e, "upstream_status", None)
-    rejected = (
-        isinstance(upstream, int)
-        and 400 <= upstream < 500
-        and upstream not in _RETRYABLE_BACKEND_STATUSES
-    )
-    if rejected:
-        return HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/inference-driver#backend-rejected-request",
-                title="Backend rejected the request",
-                status=400,
-                detail=(
-                    f"The backend refused this request with HTTP {upstream}, so it was not "
-                    f"retried against another backend -- the next one would refuse it too. "
-                    f"A prompt longer than the context window is the usual cause and the "
-                    f"backend's own message below says so exactly. {e}"
-                ),
-                component=f"inference-driver:{kind_label}",
-            ).model_dump(exclude_none=True),
+    outcome = disposition(e)
+    code = 504 if isinstance(e, BackendTimeout) else 400 if outcome == "terminal" else 502
+    delay = getattr(e, "retry_after_seconds", None)
+    message = str(e)
+    if outcome == "indeterminate":
+        message += (
+            " Outcome unknown: work may have occurred. "
+            "Eugene will not automatically replay this request."
         )
     return HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
+        status_code=code,
+        headers={"Retry-After": str(int(delay + 0.999))} if delay is not None else None,
         detail=Problem(
-            type="https://github.com/eugene-plexus/inference-driver#backend-error",
-            title="Backend error",
-            status=502,
-            detail=str(e),
+            type="https://github.com/eugene-plexus/inference-driver#backend-rejected-request"
+            if outcome == "terminal"
+            else "https://github.com/eugene-plexus/inference-driver#backend-error",
+            title="Backend rejected the request"
+            if outcome == "terminal"
+            else "Backend did not finish in time"
+            if code == 504
+            else "Backend error",
+            status=code,
+            detail=message,
             component=f"inference-driver:{kind_label}",
+            retryDisposition=RetryDisposition(outcome),
+            retryAfterSeconds=delay,
         ).model_dump(exclude_none=True),
     )
 

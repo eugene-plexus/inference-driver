@@ -59,9 +59,15 @@ class CliError(RuntimeError):
     is no status to carry and 502 is the honest answer.
     """
 
-    def __init__(self, *args: object, upstream_status: int | None = None) -> None:
+    def __init__(
+        self,
+        *args: object,
+        upstream_status: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         super().__init__(*args)
         self.upstream_status = upstream_status
+        self.retry_after_seconds = retry_after_seconds
 
 
 class BackendTimeout(CliError):

@@ -51,6 +51,7 @@ from .._generated.models import (
     Usage,
 )
 from .._http import client_for
+from ..failures import request_id, retry_after
 from ..images import content_wire, has_images
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
@@ -430,6 +431,24 @@ class OpenAiCompatibleHttpEngine:
             runtime=runtime_name if runtime_url else None,
         )
 
+    @property
+    def supported_settings(self) -> list[str]:
+        fields = [
+            "maxTokens",
+            "temperature",
+            "topP",
+            "seed",
+            "stop",
+            "tools",
+            "toolChoice",
+            "responseFormat",
+        ]
+        return [
+            field
+            for field in fields
+            if not (self._temperature_is_fixed and field in {"temperature", "topP"})
+        ]
+
     def _payload_for(self, request: GenerateRequest) -> dict[str, Any]:
         """The chat-completions body for this request.
 
@@ -560,7 +579,10 @@ class OpenAiCompatibleHttpEngine:
                 json.dumps(payload, indent=2, ensure_ascii=False),
             )
 
-        headers = self._headers()
+        headers = {
+            **self._headers(),
+            **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+        }
 
         client = self._client()
         try:
@@ -597,6 +619,7 @@ class OpenAiCompatibleHttpEngine:
                 f"openai_compat_http returned {response.status_code}: "
                 f"{_redact(response.text[:500]) if not image_request else _IMAGE_ERROR_HINT}",
                 upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
             )
 
         try:
@@ -701,7 +724,11 @@ class OpenAiCompatibleHttpEngine:
             async with client.stream(
                 "POST",
                 "/v1/chat/completions",
-                headers={**self._headers(), "Accept": "text/event-stream"},
+                headers={
+                    **self._headers(),
+                    "Accept": "text/event-stream",
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
                 json=payload,
             ) as response:
                 if response.status_code >= 400:
@@ -717,6 +744,7 @@ class OpenAiCompatibleHttpEngine:
                     raise CliError(
                         f"openai_compat_http returned {response.status_code}: {detail}",
                         upstream_status=response.status_code,
+                        retry_after_seconds=retry_after(response.headers.get("Retry-After")),
                     )
                 async for line in response.aiter_lines():
                     data = _sse_data(line)
@@ -823,7 +851,14 @@ class OpenAiCompatibleHttpEngine:
 
         client = self._client()
         try:
-            response = await client.post("/v1/embeddings", headers=self._headers(), json=payload)
+            response = await client.post(
+                "/v1/embeddings",
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request_id.get())} if request_id.get() else {}),
+                },
+                json=payload,
+            )
         except httpx.ConnectTimeout as e:
             raise CliError(f"openai_compat_http could not connect: {e!r}") from e
         except httpx.TimeoutException as e:
@@ -836,6 +871,7 @@ class OpenAiCompatibleHttpEngine:
                 f"openai_compat_http returned {response.status_code} for embeddings: "
                 f"{_redact(response.text[:500])}",
                 upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
             )
         try:
             body = response.json()
