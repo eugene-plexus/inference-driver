@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from .._generated.models import (
     EmbedRequest,
@@ -19,6 +20,7 @@ from .._generated.models import (
 )
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
+from ..images import ImageRefusal, has_images, validate_messages
 
 if TYPE_CHECKING:
     from ..engines.base import BackendEngine
@@ -34,6 +36,7 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
     _refuse_unsupported_tools(engine, body)
+    await _validate_content(engine, body)
     try:
         return await serve_while_connected(request, engine.generate(body), what="a generation")
     except ClientGone as e:
@@ -66,6 +69,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
     _refuse_unsupported_tools(engine, body)
+    await _validate_content(engine, body)
 
     stream = engine.stream(body)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
@@ -352,3 +356,26 @@ def _backend_error(e: Exception, kind_label: str) -> HTTPException:
             component=f"inference-driver:{kind_label}",
         ).model_dump(exclude_none=True),
     )
+
+
+async def _validate_content(engine: Any, body: GenerateRequest) -> None:
+    try:
+        await run_in_threadpool(validate_messages, body.messages)
+    except ImageRefusal as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"title": "Invalid image input", "status": 400, "detail": str(exc)},
+        ) from None
+    if not has_images(body.messages):
+        return
+    probe = getattr(engine, "probe_image_input", None)
+    if probe is None or not await probe():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "title": "Image input not supported",
+                "status": 400,
+                "detail": "This backend has no confirmed vision model loaded. Select a vision "
+                "model with its projector loaded; capabilities.imageInput must be true.",
+            },
+        )

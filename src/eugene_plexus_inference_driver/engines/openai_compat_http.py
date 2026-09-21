@@ -23,6 +23,7 @@ read from config (`apiKey`, sensitive) with a fallback to the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -50,11 +51,17 @@ from .._generated.models import (
     Usage,
 )
 from .._http import client_for
+from ..images import content_wire, has_images
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
 from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, refuse_unsupported_settings
 
 log = logging.getLogger(__name__)
+_IMAGE_ERROR_HINT = (
+    "Image request refused by the backend. Check the loaded vision model/projector "
+    "and available context; try a smaller image or shorter conversation. "
+    "Upstream body omitted to protect attachment data."
+)
 
 # How long a discovered context window is trusted before the backend is
 # asked again. Generous because the number only moves when an engine is
@@ -538,6 +545,7 @@ class OpenAiCompatibleHttpEngine:
         # than the thing being measured.
         started = time.perf_counter()
         payload = self._payload_for(request)
+        image_request = has_images(request.messages)
 
         # DEBUG-level full-payload trace. The gateway's copy-trace
         # captures what we sent it; this captures what WE send upstream
@@ -545,7 +553,7 @@ class OpenAiCompatibleHttpEngine:
         # post-param-shaping). When operators flip to DEBUG to chase
         # "is the LLM actually seeing what I think it's seeing", this
         # is the load-bearing log line. Auth header omitted on purpose.
-        if log.isEnabledFor(logging.DEBUG):
+        if log.isEnabledFor(logging.DEBUG) and not image_request:
             log.debug(
                 "openai_compat_http → POST %s/v1/chat/completions\n%s",
                 self._base_url,
@@ -573,7 +581,7 @@ class OpenAiCompatibleHttpEngine:
             raise CliError(f"openai_compat_http request failed: {e!r}") from e
 
         if response.status_code >= 400:
-            if log.isEnabledFor(logging.DEBUG):
+            if log.isEnabledFor(logging.DEBUG) and not image_request:
                 log.debug(
                     "openai_compat_http ← HTTP %d (%dms) body:\n%s",
                     response.status_code,
@@ -587,16 +595,16 @@ class OpenAiCompatibleHttpEngine:
             # made an exact refusal look like a broken backend.
             raise CliError(
                 f"openai_compat_http returned {response.status_code}: "
-                f"{_redact(response.text[:500])}",
+                f"{_redact(response.text[:500]) if not image_request else _IMAGE_ERROR_HINT}",
                 upstream_status=response.status_code,
             )
 
         try:
             body = response.json()
         except ValueError as e:
-            raise CliError(f"openai_compat_http returned non-JSON: {response.text[:200]!r}") from e
+            raise CliError("openai_compat_http returned non-JSON") from e
 
-        if log.isEnabledFor(logging.DEBUG):
+        if log.isEnabledFor(logging.DEBUG) and not image_request:
             log.debug(
                 "openai_compat_http ← HTTP %d (%dms) body:\n%s",
                 response.status_code,
@@ -606,7 +614,7 @@ class OpenAiCompatibleHttpEngine:
 
         choices = body.get("choices") or []
         if not choices:
-            raise CliError(f"openai_compat_http returned no choices: {body!r}")
+            raise CliError("openai_compat_http returned no choices")
 
         first = choices[0] or {}
         message = first.get("message") or {}
@@ -619,7 +627,7 @@ class OpenAiCompatibleHttpEngine:
         # neither is a backend malfunction, not an empty answer.
         if not isinstance(content, str):
             if not tool_calls:
-                raise CliError(f"openai_compat_http response missing string content: {body!r}")
+                raise CliError("openai_compat_http response missing string content")
             content = None
         elif self._thinking_mode == "off":
             # Defensive strip of <think>...</think> when the operator opted
@@ -667,6 +675,7 @@ class OpenAiCompatibleHttpEngine:
         disconnect looks like from here.
         """
         payload = self._payload_for(request)
+        image_request = has_images(request.messages)
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
 
@@ -700,9 +709,13 @@ class OpenAiCompatibleHttpEngine:
                     # Nothing has been streamed yet, so this can
                     # still be a status code -- see the same raise in
                     # `generate`.
+                    detail = (
+                        _IMAGE_ERROR_HINT
+                        if image_request
+                        else _redact(body.decode("utf-8", "replace")[:500])
+                    )
                     raise CliError(
-                        f"openai_compat_http returned {response.status_code}: "
-                        f"{_redact(body.decode('utf-8', 'replace')[:500])}",
+                        f"openai_compat_http returned {response.status_code}: {detail}",
                         upstream_status=response.status_code,
                     )
                 async for line in response.aiter_lines():
@@ -717,7 +730,7 @@ class OpenAiCompatibleHttpEngine:
                     except ValueError:
                         # A malformed frame mid-stream is not worth
                         # failing a half-delivered answer over.
-                        log.debug("openai_compat_http: unparseable SSE frame %r", data[:200])
+                        log.debug("openai_compat_http: unparseable SSE frame (contents omitted)")
                         continue
                     served_model = str(event.get("model") or served_model)
                     if event.get("usage"):
@@ -883,6 +896,34 @@ class OpenAiCompatibleHttpEngine:
         log.info("backend at %s serves embeddings", self._base_url)
         self._embeddings = True
         return True
+
+    async def probe_image_input(self) -> bool:
+        """Confirm the loaded llama.cpp model without caching across restarts."""
+        try:
+            async with asyncio.timeout(2.0):
+                client = self._client()
+                response = await client.get("/props", headers=self._headers(), timeout=2.0)
+                if response.status_code != 200:
+                    return False
+                props = response.json()
+                if not isinstance(props, dict):
+                    return False
+                modalities = props.get("modalities")
+                if not isinstance(modalities, dict) or modalities.get("vision") is not True:
+                    return False
+                response = await client.get("/v1/models", headers=self._headers(), timeout=2.0)
+                if response.status_code != 200:
+                    return False
+                body = response.json()
+                models = body.get("data") if isinstance(body, dict) else None
+                return bool(
+                    isinstance(models, list)
+                    and len(models) == 1
+                    and isinstance(models[0], dict)
+                    and models[0].get("id") == self._model_id
+                )
+        except (httpx.HTTPError, ValueError, TimeoutError):
+            return False
 
     async def context_window(self) -> int | None:
         """The context window this backend resolved, read back from it.
@@ -1096,7 +1137,7 @@ def _to_openai_messages(messages: list[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in messages:
         role = getattr(m, "role", None)
-        content = getattr(m, "content", None)
+        content = content_wire(getattr(m, "content", None))
         if role == Role.system:
             out.append({"role": "system", "content": content or ""})
         elif role == Role.user:

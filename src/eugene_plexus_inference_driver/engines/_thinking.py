@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 
 from .._generated.models import Message, Role
+from ._prompt import text_content
 
 # **Two spellings, and R3 is where that was learned.** `<think>` is what
 # the DeepSeek/Qwen/MiniMax family emits; `<thinking>` is what
@@ -111,7 +112,7 @@ def apply_thinking_mode(messages: list[Message], thinking_mode: str | None) -> l
     # is not a thing anyone sends, but the type now says it could be.
     for i, msg in enumerate(out):
         if msg.role == Role.system:
-            combined = f"{(msg.content or '').rstrip()}\n\n{directive}"
+            combined = f"{text_content(msg.content).rstrip()}\n\n{directive}"
             out[i] = msg.model_copy(update={"content": combined})
             return out
     out.insert(0, Message(role=Role.system, content=directive))

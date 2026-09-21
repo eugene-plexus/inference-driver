@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 
 from . import __version__
 from .auth_state import load_auth_state
@@ -212,6 +212,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # Pydantic's default response includes input values, including attachments.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": {
+                    "title": "Invalid request",
+                    "status": 422,
+                    "detail": "body: has an invalid, missing or unsupported value.",
+                }
+            },
+        )
+
     # Health stays unauthenticated — supervisors and load balancers need
     # to probe it without holding credentials.
     app.include_router(health_routes.router)
@@ -231,4 +248,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(config_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
 
+    from .body_limit import InferenceBodyLimit
+
+    app.add_middleware(
+        InferenceBodyLimit, paths={"/v1/generate", "/v1/generate/stream"}, driver=True
+    )
     return app

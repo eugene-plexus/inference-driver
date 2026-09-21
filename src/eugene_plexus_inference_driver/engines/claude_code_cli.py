@@ -49,7 +49,7 @@ from .._generated.models import (
     Role,
     Usage,
 )
-from ._prompt import messages_to_prompt
+from ._prompt import messages_to_prompt, text_content
 from ._subprocess import CliError, run_cli, stream_cli_lines
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
 from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, warn_dropped_sampling
@@ -165,7 +165,7 @@ class ClaudeCodeCliEngine:
         # text inside the user-message argv.
         system_messages = [m for m in messages if m.role == Role.system]
         other_messages = [m for m in messages if m.role != Role.system]
-        system_prompt = "\n\n".join(m.content or "" for m in system_messages).strip()
+        system_prompt = "\n\n".join(text_content(m.content) for m in system_messages).strip()
         user_prompt = messages_to_prompt(other_messages)
 
         # The user-prompt transcript can contain newlines (paragraph breaks
@@ -277,7 +277,7 @@ class ClaudeCodeCliEngine:
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         system_messages = [m for m in messages if m.role == Role.system]
         other_messages = [m for m in messages if m.role != Role.system]
-        system_prompt = "\n\n".join(m.content or "" for m in system_messages).strip()
+        system_prompt = "\n\n".join(text_content(m.content) for m in system_messages).strip()
         user_prompt = messages_to_prompt(other_messages)
 
         argv = self._build_argv(system_prompt=system_prompt, stream=True)

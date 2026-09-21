@@ -43,6 +43,7 @@ async def info(request: Request) -> DriverInfo:
             # endpoint works. A flag that said True for everything would
             # tell a UI nothing.
             capabilities=Capabilities(
+                imageInput=await _image_input(engine),
                 streaming=bool(getattr(engine, "supports_streaming", False)),
                 toolCalling=bool(getattr(engine, "supports_tool_calling", False)),
                 # Contracted at M0, populated by nothing until step 7 --
@@ -143,3 +144,13 @@ async def _embeddings(engine: Any) -> bool | None:
     except Exception:  # see docstring: /v1/info must not fail over a capability
         log.debug("embeddings probe failed; reporting unknown", exc_info=True)
         return None
+
+
+async def _image_input(engine: Any) -> bool:
+    probe = getattr(engine, "probe_image_input", None)
+    if probe is None:
+        return False
+    try:
+        return await probe() is True
+    except Exception:
+        return False
