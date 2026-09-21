@@ -52,7 +52,7 @@ from .._generated.models import (
 from .._http import client_for
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
-from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk
+from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, refuse_unsupported_settings
 
 log = logging.getLogger(__name__)
 
@@ -431,6 +431,8 @@ class OpenAiCompatibleHttpEngine:
         the only symptom would be a streamed answer differing from a
         non-streamed one for the same request.
         """
+        if self._temperature_is_fixed:
+            refuse_unsupported_settings(request, unsupported={"temperature", "topP"})
         # Apply the operator's thinkingMode by mutating the system
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
@@ -489,7 +491,7 @@ class OpenAiCompatibleHttpEngine:
             )
         if request.responseFormat is not None:
             payload["response_format"] = request.responseFormat.model_dump(
-                mode="json", exclude_none=True
+                mode="json", by_alias=True, exclude_none=True
             )
         return payload
 

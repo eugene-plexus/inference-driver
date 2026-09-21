@@ -29,6 +29,7 @@ from eugene_plexus_inference_driver._generated.models import (
     FunctionDefinition,
     GenerateRequest,
     Message,
+    ResponseFormat,
     Role,
     Tool,
     ToolCall,
@@ -38,6 +39,42 @@ from eugene_plexus_inference_driver.engines.openai_compat_http import OpenAiComp
 pytestmark = pytest.mark.anyio
 
 BASE = "http://127.0.0.1:11434"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@respx.mock
+async def test_json_schema_uses_wire_alias(stream: bool) -> None:
+    fmt = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    route = respx.post(f"{BASE}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, text="data: [DONE]\n\n")
+        if stream
+        else httpx.Response(200, json=_plain_reply('{"x":1}'))
+    )
+    engine = _engine()
+    try:
+        request = _ask(responseFormat=ResponseFormat.model_validate(fmt))
+        if stream:
+            _ = [chunk async for chunk in engine.stream(request)]
+        else:
+            await engine.generate(request)
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["response_format"] == fmt
+        assert "callerSettings" not in sent
+    finally:
+        await engine.aclose()
+
 
 WEATHER_TOOL = Tool(
     type="function",

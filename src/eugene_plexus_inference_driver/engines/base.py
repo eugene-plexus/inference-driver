@@ -228,6 +228,25 @@ class BackendEngine(Protocol):
 log = logging.getLogger(__name__)
 
 
+def refuse_unsupported_settings(request: GenerateRequest, *, unsupported: set[str]) -> None:
+    """An explicit caller constraint cannot be treated as an adapter default."""
+    from ._subprocess import CliError
+
+    names = {
+        "maxTokens": "max_tokens/max_completion_tokens",
+        "topP": "top_p",
+        "toolChoice": "tool_choice",
+        "responseFormat": "response_format",
+    }
+    for field in request.callerSettings or []:
+        if field in unsupported:
+            raise CliError(
+                f"{names.get(field, field)}: this engine cannot honor this explicit setting; "
+                "remove it or select a backend that supports it.",
+                upstream_status=400,
+            )
+
+
 def warn_dropped_sampling(
     request: GenerateRequest, *, engine: str, model_id: str, warned: set[str]
 ) -> None:
@@ -246,11 +265,23 @@ def warn_dropped_sampling(
     at that rate is one an operator filters out, which costs the warning
     its only job.
 
-    `maxTokens` and `temperature` are deliberately NOT in here: the
-    contract has said since M0 that adapters whose backends do not
-    expose those ignore them **silently**, and changing that under cover
-    of this fix would be a behaviour change nobody asked for.
+    A2: callerSettings distinguishes explicit constraints from inherited defaults.
+    CLI engines now refuse explicit controls they cannot honor before spawning.
+    Implicit profile/default settings retain the legacy behavior described above.
     """
+    refuse_unsupported_settings(
+        request,
+        unsupported={
+            "maxTokens",
+            "temperature",
+            "topP",
+            "seed",
+            "stop",
+            "tools",
+            "toolChoice",
+            "responseFormat",
+        },
+    )
     for field, value in (("topP", request.topP), ("seed", request.seed)):
         if value is None or field in warned:
             continue
