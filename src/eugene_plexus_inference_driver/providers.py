@@ -91,12 +91,14 @@ def _custom_backend_fields() -> list[ConfigField]:
             key="baseUrl",
             label="Base URL",
             description=(
-                "HTTP base of an OpenAI-compatible endpoint that is *not* a "
-                "runtime this install supervises — a remote LM Studio, an "
-                "engine somebody else operates, a self-hosted server (e.g. "
-                "`https://my-vllm.example.com`). The driver appends "
-                "`/v1/chat/completions` automatically. Ignored when "
-                "`runtimeName` is set. One of the two is required."
+                "HTTP base of an endpoint that is *not* a runtime this "
+                "install supervises — a remote LM Studio, an engine "
+                "somebody else operates, a self-hosted server (e.g. "
+                "`https://my-vllm.example.com`). The driver appends the "
+                "protocol's own path automatically: `/v1/chat/completions` "
+                "for an OpenAI-compatible server, `/v1/systemone` for a "
+                "System One decision server. Ignored when `runtimeName` is "
+                "set. One of the two is required."
             ),
             category="adapter",
             valueType=ConfigValueType.url,
