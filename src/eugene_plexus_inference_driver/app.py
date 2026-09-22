@@ -257,7 +257,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from .body_limit import InferenceBodyLimit
 
+    # Every route that parses a request body the gateway forwards, not
+    # only generation: an embeddings batch or a decision's state is read
+    # and parsed whole just the same, so an unbounded one is the same
+    # memory exhaustion. A new body-taking inference route belongs here.
     app.add_middleware(
-        InferenceBodyLimit, paths={"/v1/generate", "/v1/generate/stream"}, driver=True
+        InferenceBodyLimit,
+        paths={"/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide"},
+        driver=True,
     )
     return app
