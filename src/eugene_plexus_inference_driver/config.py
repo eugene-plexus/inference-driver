@@ -24,7 +24,7 @@ from typing import Any
 
 import yaml
 
-from . import security
+from . import _private_files, security
 from ._generated.models import (
     ConfigDocument,
     ConfigField,
@@ -529,5 +529,10 @@ class ConfigStore:
                 on_disk[key] = envelope.to_dict()
             else:
                 on_disk[key] = value
-        with self._path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(on_disk, f, sort_keys=True, default_flow_style=False)
+        # 0600 and replaced rather than rewritten: that plaintext window
+        # above is an API key on disk, and a truncate-then-write killed
+        # halfway is a driver that boots having forgotten it. See
+        # `_private_files`.
+        _private_files.write_private_text(
+            self._path, yaml.safe_dump(on_disk, sort_keys=True, default_flow_style=False)
+        )
