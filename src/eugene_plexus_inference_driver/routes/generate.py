@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from .._generated.models import (
+    DecisionRequest,
+    DecisionResponse,
     EmbedRequest,
     EmbedResponse,
     GenerateRequest,
@@ -21,6 +23,7 @@ from .._generated.models import (
 )
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
+from ..engines.systemone_http import validate_questions
 from ..failures import disposition, request_id
 from ..images import ImageRefusal, has_images, validate_messages
 from ..locality import enforce
@@ -38,6 +41,7 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    _refuse_non_chat(engine)
     enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body)
     await _validate_content(engine, body)
@@ -72,6 +76,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    _refuse_non_chat(engine)
     enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body)
     await _validate_content(engine, body)
@@ -172,6 +177,95 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
         raise _backend_error(e, kind_label) from e
     finally:
         request_id.reset(token)
+
+
+@router.post("/v1/decide", response_model=DecisionResponse)
+async def decide(request: Request, body: DecisionRequest) -> DecisionResponse:
+    """One state, named typed questions, validated structured answers.
+
+    **Deliberately NOT wrapped in `serve_while_connected`.** For chat, a
+    departed caller means cancelling the backend call — the socket
+    closes and an interruptible engine stops. A decision backend is the
+    opposite case: Kev's server is single-slot and cannot shed work, so
+    cancelling our HTTP request frees nothing — the backend keeps
+    computing — while making the driver LOOK free. Capacity must remain
+    occupied while known local work continues, so the call runs to
+    completion and the answer is discarded with the connection, which is
+    exactly what over-admission protection requires.
+    """
+    engine: BackendEngine | None = request.app.state.adapter
+    if engine is None:
+        raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    if not getattr(engine, "decision_kinds", None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#decisions-unsupported",
+                title="This backend does not answer typed decisions",
+                status=400,
+                detail=(
+                    f"This driver's backend ({kind_label}) serves chat, not the System One "
+                    "decision protocol — use POST /v1/generate for conversations, or point "
+                    "the decision at a model served by a systemone_http driver."
+                ),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
+    enforce(engine, body.localOnly)
+
+    # The pinned protocol refuses unknown fields rather than dropping
+    # them, and pydantic has already shed any by the time `body` exists —
+    # so the check runs against the RAW question objects.
+    raw = await request.json()
+    violations = validate_questions(raw.get("questions"))
+    if violations:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#decision-protocol",
+                title="Decision request violates the pinned protocol",
+                status=400,
+                detail="; ".join(violations),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
+
+    token = request_id.set(str(body.requestId) if body.requestId else None)
+    try:
+        # `decide` is not on the BackendEngine protocol — only the
+        # System One engine has it, and the capability gate above is the
+        # runtime proof. A protocol method would force a stub on engines
+        # that must refuse instead.
+        result: DecisionResponse = await cast(Any, engine).decide(body)
+        return result
+    except CliError as e:
+        log.warning("decision invocation failed: %s", e)
+        raise _backend_error(e, kind_label) from e
+    finally:
+        request_id.reset(token)
+
+
+def _refuse_non_chat(engine: BackendEngine) -> None:
+    """A decision backend refuses chat with the door's name, not a
+    protocol error from inside a backend that never spoke chat."""
+    if getattr(engine, "chat_capable", True):
+        return
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#chat-unsupported",
+            title="This backend answers typed decisions, not chat",
+            status=400,
+            detail=(
+                f"This driver's backend ({kind_label}) serves the System One decision "
+                "protocol. Send decisions to POST /v1/systemone on the gateway; for a "
+                "conversation, name a chat model instead."
+            ),
+            component=f"inference-driver:{kind_label}",
+        ).model_dump(exclude_none=True),
+    )
 
 
 def _frame(chunk: Any) -> str:

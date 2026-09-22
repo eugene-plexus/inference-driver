@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, cast
 
 import anyio.to_thread
 from fastapi import APIRouter, Request
@@ -85,14 +85,52 @@ async def test_config(
             error=f"engine construction failed: {e}",
         )
 
-    test_request = GenerateRequest(
-        messages=[Message(role=Role.user, content="Reply with exactly: PING")],
-    )
     # This engine is a throwaway and owns its own connection pool, so it
     # is closed whichever way the test ends. Without this, every PATCH
     # validated through here would leak one pool for the life of the
     # process -- which is why `_client()` is lazy rather than eager.
     try:
+        # A decision engine cannot chat, so its round-trip is the
+        # operation it actually serves: one tiny noul question. Testing
+        # it with generate() would report a healthy Kev as broken.
+        if getattr(engine, "decision_kinds", None):
+            from .._generated.models import (
+                DecisionQuestion,
+                DecisionRequest,
+            )
+            from .._generated.models import (
+                Type1 as DecisionType,
+            )
+
+            decision_request = DecisionRequest(
+                state="ping",
+                questions={
+                    "ok": DecisionQuestion(
+                        type=DecisionType.noul, instructions="Is the state exactly 'ping'?"
+                    )
+                },
+            )
+            try:
+                decided = await cast(Any, engine).decide(decision_request)
+            except Exception as e:
+                return ConfigTestResult(
+                    ok=False,
+                    component="inference-driver",
+                    latencyMs=int((time.perf_counter() - start) * 1000),
+                    error=f"{engine.backend_kind.value} decide failed: {e}",
+                )
+            answer = decided.answers["ok"]
+            return ConfigTestResult(
+                ok=True,
+                component="inference-driver",
+                latencyMs=int((time.perf_counter() - start) * 1000),
+                summary=f"{engine.backend_kind.value} decided in {decided.latencyMs or 0}ms.",
+                sampleOutput=f"noul={answer.noul}",
+            )
+
+        test_request = GenerateRequest(
+            messages=[Message(role=Role.user, content="Reply with exactly: PING")],
+        )
         try:
             response = await engine.generate(test_request)
         except Exception as e:

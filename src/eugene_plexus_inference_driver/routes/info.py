@@ -10,7 +10,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 
 from .. import __version__
-from .._generated.models import BackendKind, Capabilities, DriverInfo, Problem
+from .._generated.models import (
+    BackendKind,
+    Capabilities,
+    DecisionCapability,
+    DriverInfo,
+    Problem,
+)
 from ..config import ConfigStore
 from ..locality import engine_locality
 
@@ -77,6 +83,10 @@ async def info(request: Request) -> DriverInfo:
                 # asking the backend, because nothing exposes it: see
                 # `probe_embeddings`.
                 embeddings=embeddings,
+                # Absent means chat-capable — every pre-decision backend —
+                # so only a decision engine changes anything by saying no.
+                chatCapable=bool(getattr(engine, "chat_capable", True)),
+                decision=_decision_capability(engine),
             ),
             backend=backend,
             provider=provider_key,
@@ -181,3 +191,16 @@ async def _image_input(engine: Any) -> bool:
         return await probe() is True
     except Exception:
         return False
+
+
+def _decision_capability(engine: Any) -> DecisionCapability | None:
+    """Present iff this engine decides — its absence is how the gateway
+    knows not to route `/v1/systemone` here."""
+    kinds = getattr(engine, "decision_kinds", None)
+    if not kinds:
+        return None
+    return DecisionCapability(
+        kinds=list(kinds),
+        maxOptions=255,
+        maxConcurrent=getattr(engine, "decision_max_concurrent", None),
+    )

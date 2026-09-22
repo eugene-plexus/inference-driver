@@ -38,6 +38,7 @@ from .engines.base import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
 from .engines.openai_compat_http import OpenAiCompatibleHttpEngine
+from .engines.systemone_http import SystemOneHttpEngine
 from .providers import PROVIDERS, collect_extra_field_specs, providers_using
 
 log = logging.getLogger(__name__)
@@ -239,7 +240,12 @@ def _build_fields() -> list[ConfigField]:
     so the UI shows credentials first, then the model picker."""
     out: list[ConfigField] = [_provider_field()]
     seen: set[type] = set()
-    for engine_cls in (ClaudeCodeCliEngine, CodexCliEngine, OpenAiCompatibleHttpEngine):
+    for engine_cls in (
+        ClaudeCodeCliEngine,
+        CodexCliEngine,
+        OpenAiCompatibleHttpEngine,
+        SystemOneHttpEngine,
+    ):
         if engine_cls in seen:
             continue
         seen.add(engine_cls)

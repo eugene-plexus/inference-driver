@@ -24,6 +24,7 @@ from .engines.openai_compat_http import (
     OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
 )
+from .engines.systemone_http import SystemOneHttpEngine
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,13 @@ class Provider:
 def _custom_backend_fields() -> list[ConfigField]:
     from ._generated.models import ConfigFieldShowWhen, ConfigValueType
 
-    only_custom = ConfigFieldShowWhen(key="provider", equals="openai_compat_custom")
+    # Shared by both BYO providers: the chat one and the System One one.
+    # Defined once and attached to one registry entry, because
+    # `collect_extra_field_specs` unions the lists and two providers
+    # each declaring `baseUrl` would be two fields with one key.
+    only_custom = ConfigFieldShowWhen(
+        key="provider", equals=["openai_compat_custom", "systemone_custom"]
+    )
     return [
         ConfigField(
             key="runtimeName",
@@ -222,6 +229,31 @@ PROVIDERS: dict[str, Provider] = {
             "filter_models": False,
         },
         extra_field_specs=_custom_backend_fields(),
+    ),
+    "typesafe": Provider(
+        key="typesafe",
+        label="TypeSafe (hosted Jev)",
+        engine_class=SystemOneHttpEngine,
+        engine_kwargs={
+            "default_base_url": "https://api.typesafe.ai",
+            # The hosted provider requires a key; constructing without
+            # one would only defer the refusal to the first request.
+            "auth_required": True,
+        },
+    ),
+    "systemone_custom": Provider(
+        key="systemone_custom",
+        label="Custom System One URL (Kev, or another decision server)",
+        engine_class=SystemOneHttpEngine,
+        engine_kwargs={
+            # No default — a supervised Kev runtime arrives by
+            # `runtimeName`, anything else by `baseUrl`.
+            "default_base_url": None,
+            # A local decision server (Kev binds loopback with no auth,
+            # by upstream's own design) is the headline case; a key, if
+            # the endpoint wants one, still rides `apiKey`.
+            "auth_required": False,
+        },
     ),
 }
 
