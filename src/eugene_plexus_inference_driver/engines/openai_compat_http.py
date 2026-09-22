@@ -307,6 +307,7 @@ class OpenAiCompatibleHttpEngine:
         api_key: str | None = None,
         base_url: str = "https://api.openai.com",
         model_id: str = "gpt-4o",
+        upstream_model_id: str | None = None,
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
         fixed_temperature_pattern: re.Pattern[str] | None = None,
@@ -325,12 +326,23 @@ class OpenAiCompatibleHttpEngine:
         self._api_key = resolved_key
         self._base_url = base_url.rstrip("/")
         self._model_id = model_id
+        #: What the backend is actually asked for. Resolved ONCE, here,
+        #: and used at exactly the wire boundary (`_payload_for`, the
+        #: embed payload, and the probes that match a backend's own
+        #: model listing). Everything a caller sees — /v1/info,
+        #: GenerateResponse, the stream's terminal frame, EmbedResponse —
+        #: reports `_model_id`, the public identity the gateway routes
+        #: on. Defaulting to the public id keeps every install that
+        #: predates the split byte-identical on the wire.
+        self._upstream_model_id = upstream_model_id or model_id
         self._timeout_seconds = timeout_seconds
         self._stall_seconds = stall_seconds
         self._fixed_temperature_pattern = fixed_temperature_pattern
         self._warned_dropped: set[str] = set()
+        # Matched against the upstream id — the pattern describes what
+        # the BACKEND rejects, and the backend only ever sees that name.
         self._temperature_is_fixed = fixed_temperature_pattern is not None and bool(
-            fixed_temperature_pattern.match(model_id)
+            fixed_temperature_pattern.match(self._upstream_model_id)
         )
         if self._temperature_is_fixed:
             log.warning(
@@ -483,6 +495,7 @@ class OpenAiCompatibleHttpEngine:
             api_key=str(get("apiKey") or "") or None,
             base_url=base_url,
             model_id=str(get("modelId") or "gpt-4o"),
+            upstream_model_id=str(get("upstreamModelId") or "") or None,
             timeout_seconds=float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS),
             stall_seconds=(
                 DEFAULT_STREAM_STALL_SECONDS
@@ -531,7 +544,7 @@ class OpenAiCompatibleHttpEngine:
         # inline `<think>` blocks leaking into chat responses.
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         payload: dict[str, Any] = {
-            "model": self._model_id,
+            "model": self._upstream_model_id,
             "messages": _to_openai_messages(messages),
         }
         if request.maxTokens is not None:
@@ -586,6 +599,25 @@ class OpenAiCompatibleHttpEngine:
                 mode="json", by_alias=True, exclude_none=True
             )
         return payload
+
+    def _public_model_id(self, reported: object) -> str:
+        """The model identity a caller sees on a response.
+
+        When this engine translates (`upstreamModelId` set and
+        different), the backend's own name for itself — `default_model`,
+        an absolute path — is exactly what must NOT be echoed: two MLX
+        runtimes serving different models would collapse into one name,
+        which is the collision the split exists to prevent. So a
+        translating engine always answers with the public id.
+
+        When nothing is translated, the backend's echo is kept, as it
+        always was: a backend that reports serving something other than
+        what was configured is telling the truth about what answered,
+        and hiding that would un-diagnose a misconfigured endpoint.
+        """
+        if self._upstream_model_id != self._model_id:
+            return self._model_id
+        return str(reported or self._model_id)
 
     def _warn_dropped(self, field: str) -> None:
         """Say it once per field per engine, not once per request.
@@ -733,7 +765,7 @@ class OpenAiCompatibleHttpEngine:
             usage=_usage_from_envelope(body.get("usage") or {}),
             requestId=request.requestId,
             backend=self.backend_kind,
-            modelId=str(body.get("model") or self._model_id),
+            modelId=self._public_model_id(body.get("model")),
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
@@ -860,7 +892,7 @@ class OpenAiCompatibleHttpEngine:
                         # failing a half-delivered answer over.
                         log.debug("openai_compat_http: unparseable SSE frame (contents omitted)")
                         continue
-                    served_model = str(event.get("model") or served_model)
+                    served_model = self._public_model_id(event.get("model") or served_model)
                     if event.get("usage"):
                         usage_payload = event["usage"]
                     for choice in event.get("choices") or []:
@@ -947,7 +979,7 @@ class OpenAiCompatibleHttpEngine:
         backend implements `encoding_format` -- and several do not.
         """
         started = time.perf_counter()
-        payload: dict[str, Any] = {"model": self._model_id, "input": inputs}
+        payload: dict[str, Any] = {"model": self._upstream_model_id, "input": inputs}
 
         client = self._client()
         try:
@@ -983,7 +1015,7 @@ class OpenAiCompatibleHttpEngine:
         vectors = _vectors_from_envelope(body, expected=len(inputs))
         return EmbedResponse(
             embeddings=vectors,
-            modelId=str(body.get("model") or self._model_id),
+            modelId=self._public_model_id(body.get("model")),
             backend=self.backend_kind,
             usage=_usage_from_envelope(body.get("usage") or {}),
             latencyMs=int((time.perf_counter() - started) * 1000),
@@ -1056,7 +1088,7 @@ class OpenAiCompatibleHttpEngine:
                     isinstance(models, list)
                     and len(models) == 1
                     and isinstance(models[0], dict)
-                    and models[0].get("id") == self._model_id
+                    and models[0].get("id") == self._upstream_model_id
                 )
         except (httpx.HTTPError, ValueError, TimeoutError):
             return False
@@ -1179,7 +1211,7 @@ class OpenAiCompatibleHttpEngine:
         if not isinstance(data, list):
             return None
         cards = [c for c in data if isinstance(c, dict)]
-        card = _only_or_named(cards, self._model_id, keys=("id",))
+        card = _only_or_named(cards, self._upstream_model_id, keys=("id",))
         value = card.get("max_model_len") if card else None
         return value if isinstance(value, int) and value > 0 else None
 
@@ -1203,7 +1235,7 @@ class OpenAiCompatibleHttpEngine:
         if not isinstance(models, list):
             return None
         entries = [m for m in models if isinstance(m, dict)]
-        entry = _only_or_named(entries, self._model_id, keys=("name", "model"))
+        entry = _only_or_named(entries, self._upstream_model_id, keys=("name", "model"))
         value = entry.get("context_length") if entry else None
         return value if isinstance(value, int) and value > 0 else None
 

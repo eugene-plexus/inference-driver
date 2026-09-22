@@ -81,6 +81,7 @@ async def info(request: Request) -> DriverInfo:
             backend=backend,
             provider=provider_key,
             modelId=store.get("modelId") or None,
+            upstreamModelId=store.get("upstreamModelId") or None,
             # Off the live engine: only set when the URL was genuinely
             # resolved from a runtime, so a stale name on a CLI provider
             # does not claim a runtime it is not fronting.
@@ -117,6 +118,7 @@ async def info(request: Request) -> DriverInfo:
         backend=backend,
         provider=provider_key,
         modelId=store.get("modelId") or None,
+        upstreamModelId=store.get("upstreamModelId") or None,
         # Degraded: the configured intent, so a driver that failed to
         # resolve its runtime still says which one it was meant to front.
         runtime=runtime,

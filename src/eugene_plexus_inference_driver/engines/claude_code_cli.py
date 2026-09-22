@@ -104,11 +104,16 @@ class ClaudeCodeCliEngine:
         *,
         binary_path: str = "claude",
         model_id: str | None = None,
+        upstream_model_id: str | None = None,
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         thinking_mode: str = "auto",
     ) -> None:
         self._binary_path = binary_path
         self._model_id = model_id
+        # What the CLI is asked for, when the public alias is not the
+        # provider's own model name. Wire boundary only: responses and
+        # logs keep the public `_model_id`.
+        self._upstream_model_id = upstream_model_id or model_id
         self._timeout_seconds = timeout_seconds
         self._thinking_mode = thinking_mode or "auto"
         self._warned_sampling: set[str] = set()
@@ -139,6 +144,7 @@ class ClaudeCodeCliEngine:
         return cls(
             binary_path=str(get("claudeCodeCliPath") or "claude"),
             model_id=get("modelId") or None,
+            upstream_model_id=get("upstreamModelId") or None,
             timeout_seconds=float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS),
             thinking_mode=str(get("thinkingMode") or "auto"),
         )
@@ -397,8 +403,8 @@ class ClaudeCodeCliEngine:
             argv += ["--include-partial-messages", "--verbose"]
         if system_prompt:
             argv += ["--system-prompt", system_prompt]
-        if self._model_id:
-            argv += ["--model", self._model_id]
+        if self._upstream_model_id:
+            argv += ["--model", self._upstream_model_id]
         # No positional prompt; user prompt is piped via stdin.
         return argv
 

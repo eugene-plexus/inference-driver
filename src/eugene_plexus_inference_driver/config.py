@@ -100,6 +100,34 @@ def _modelid_field() -> ConfigField:
     )
 
 
+def _upstream_modelid_field() -> ConfigField:
+    """The backend half of the model-identity split.
+
+    Almost every install leaves this unset and the backend is asked for
+    `modelId` verbatim, exactly as before the field existed. It exists
+    for backends whose served name is not ours to choose — an MLX
+    runtime answers only to upstream's `default_model` sentinel — where
+    the public alias in `modelId` must stay the routing key while the
+    wire asks for something else.
+    """
+    return ConfigField(
+        key="upstreamModelId",
+        label="Upstream model name",
+        description=(
+            "What this driver actually asks its backend for, when that "
+            "differs from the public Model above. Leave empty to send "
+            "the Model value verbatim (the normal case). Supervised MLX "
+            'runtimes set this to "default_model" automatically, because '
+            "mlx_lm.server has no flag to serve a chosen name. Never "
+            "used for routing, and never reported on responses — callers "
+            "always see the public Model."
+        ),
+        category="adapter",
+        valueType=ConfigValueType.string,
+        requiresRestart=True,
+    )
+
+
 def _common_fields() -> list[ConfigField]:
     """Provider-agnostic fields — logging and timeouts.
 
@@ -221,6 +249,7 @@ def _build_fields() -> list[ConfigField]:
         out.extend(engine_cls.field_specs(applicable_providers=applicable))
     out.extend(collect_extra_field_specs())
     out.append(_modelid_field())
+    out.append(_upstream_modelid_field())
     out.extend(_common_fields())
     return out
 
@@ -255,8 +284,15 @@ def as_schema(*, available_models: list[str] | None = None) -> ConfigSchema:
     """
     fields = list(FIELDS)
     if available_models:
+        # Both halves of the identity split get the discovered list: the
+        # names come from the backend, so they are upstream names — but
+        # in the common no-split case `modelId` IS the upstream name,
+        # and dropping its suggestions would regress every existing
+        # install to teach a field almost nobody sets.
         fields = [
-            _with_model_suggestions(f, available_models) if f.key == "modelId" else f
+            _with_model_suggestions(f, available_models)
+            if f.key in ("modelId", "upstreamModelId")
+            else f
             for f in fields
         ]
     return ConfigSchema(
