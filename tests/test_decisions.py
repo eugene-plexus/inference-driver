@@ -411,3 +411,27 @@ async def test_list_models_reads_the_kev_shape() -> None:
         )
     )
     assert await _engine().list_models() == ["kev-latest"]
+
+
+@respx.mock
+def test_config_test_uses_the_operation_the_engine_serves(tmp_path, monkeypatch) -> None:
+    """POST /v1/config/test on a decision driver runs one tiny noul
+    question instead of generate() — which would report a healthy Kev as
+    broken, since a decision engine refuses chat by design."""
+    respx.post(f"{BASE}/v1/systemone").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "model": "decisions",
+                "answers": {"ok": {"type": "noul", "noul": 1.0}},
+                "usage": {"input_tokens": 4, "output_tokens": 2},
+                "latency_ms": 3.0,
+            },
+        )
+    )
+    with _decision_app_client(tmp_path, monkeypatch) as client:
+        response = client.post("/v1/config/test", json={})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True, body
+    assert "noul=1.0" in (body.get("sampleOutput") or ""), body
