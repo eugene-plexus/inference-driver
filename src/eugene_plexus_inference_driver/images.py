@@ -10,7 +10,12 @@ from typing import Any
 
 from PIL import Image
 
-MAX_IMAGES = 4
+#: A ceiling, not the policy. The gateway's `maxImagesPerRequest` decides how
+#: many images a request may carry (12 by default, counted across the whole
+#: conversation) and cannot be set above this. It was a fixed four here and
+#: at the gateway until 2026-09-23, which refused a Claude Code session on
+#: every turn after its fifth screenshot.
+MAX_IMAGES = 64
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_PIXELS = 16_000_000
@@ -57,7 +62,7 @@ def validate_messages(messages: Any) -> None:
             contains_image = True
             count += 1
             if count > MAX_IMAGES:
-                raise ImageRefusal(field, "at most four images are allowed per request")
+                raise ImageRefusal(field, f"at most {MAX_IMAGES} images are allowed per request")
             total += _validate_image(part["image_url"]["url"], field)
             if total > MAX_TOTAL_BYTES:
                 raise ImageRefusal(field, "images exceed the 10 MiB decoded request limit")

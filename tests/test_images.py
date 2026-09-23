@@ -147,3 +147,30 @@ def test_direct_driver_chunked_body_is_bounded(client, monkeypatch):
     response = client.post("/v1/generate", content=iter([b" " * 80, b" " * 80]))
     assert response.status_code == 413
     assert "16 MiB" in response.text
+
+
+def _with_images(count):
+    body = request()
+    picture = body["messages"][0]["content"][1]
+    body["messages"][0]["content"] = [body["messages"][0]["content"][0]] + [picture] * count
+    return body
+
+
+def test_the_gateways_default_of_twelve_passes_the_drivers_ceiling():
+    """Four until 2026-09-23. The gateway's `maxImagesPerRequest` is the
+    policy now (12 by default); this is only the ceiling it cannot exceed."""
+    from eugene_plexus_inference_driver import images
+
+    parsed = GenerateRequest.model_validate(_with_images(12))
+    images.validate_messages(parsed.messages)
+    assert images.MAX_IMAGES == 64
+
+
+@respx.mock
+def test_more_than_the_ceiling_is_refused_before_any_network(app):
+    with TestClient(app) as client:
+        app.state.adapter = engine()
+        response = client.post("/v1/generate", json=_with_images(65))
+    assert response.status_code == 400
+    assert "at most 64 images" in response.text
+    assert not respx.calls
