@@ -20,9 +20,11 @@ from .._generated.models import (
     GenerateResponse,
     Problem,
     RetryDisposition,
+    TokenCount,
 )
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
+from ..engines.base import TokenCountUnsupported
 from ..engines.systemone_http import validate_questions
 from ..failures import disposition, request_id
 from ..images import ImageRefusal, has_images, validate_messages
@@ -123,6 +125,51 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
             await stream.aclose()
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@router.post("/v1/generate/count", response_model=TokenCount)
+async def count_prompt_tokens(request: Request, body: GenerateRequest) -> TokenCount:
+    """The prompt `/v1/generate` would send, counted by the backend, generating nothing.
+
+    The same refusals as a generation, in the same order, so a count is
+    never answered for a request that would not be served. What only a
+    count can say -- *this backend cannot count exactly* -- is a 501,
+    which the gateway turns into "count it some other way" rather than
+    a failure, because nothing failed.
+    """
+    engine: BackendEngine | None = request.app.state.adapter
+    if engine is None:
+        raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    _refuse_non_chat(engine)
+    enforce(engine, body.localOnly)
+    _refuse_unsupported_tools(engine, body)
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    counter = getattr(engine, "count_prompt_tokens", None)
+    if counter is None:
+        raise _cannot_count(f"{kind_label} has no prompt to count without generating", kind_label)
+    try:
+        counted = await serve_while_connected(request, counter(body), what="a token count")
+    except TokenCountUnsupported as e:
+        raise _cannot_count(str(e), kind_label) from e
+    except ClientGone as e:
+        raise _client_gone() from e
+    except CliError as e:
+        log.warning("token count failed: %s", e)
+        raise _backend_error(e, kind_label) from e
+    return TokenCount(promptTokens=counted)
+
+
+def _cannot_count(reason: str, kind_label: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#token-count-unsupported",
+            title="This backend cannot count this prompt without generating",
+            status=501,
+            detail=f"Cannot count exactly: {reason}. Nothing was sent to the model.",
+            component=f"inference-driver:{kind_label}",
+        ).model_dump(exclude_none=True),
+    )
 
 
 @router.post("/v1/embed", response_model=EmbedResponse)

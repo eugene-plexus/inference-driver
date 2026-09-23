@@ -74,6 +74,16 @@ and would blame the driver hop for the engine's stall.
 """
 
 
+class TokenCountUnsupported(Exception):
+    """This backend cannot count a prompt exactly without generating.
+
+    Not a `CliError`, because nothing failed: the backend is healthy and
+    has no way to answer the question, and the caller -- the gateway's
+    `count_tokens` -- turns this into "count it some other way" rather
+    than into a backend error that would cascade or alarm anyone.
+    """
+
+
 class StreamChunk(Protocol):
     """One event in the SSE stream emitted by `BackendEngine.stream`."""
 

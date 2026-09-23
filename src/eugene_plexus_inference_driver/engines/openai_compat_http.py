@@ -59,8 +59,14 @@ from .base import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_STREAM_STALL_SECONDS,
     Chunk,
+    TokenCountUnsupported,
     refuse_unsupported_settings,
 )
+
+# A count is two small HTTP calls handled beside the slots, never a
+# prefill, so it gets a short deadline of its own rather than the
+# minutes a generation is allowed.
+_COUNT_TIMEOUT_SECONDS = 30.0
 
 log = logging.getLogger(__name__)
 _IMAGE_ERROR_HINT = (
@@ -1153,6 +1159,75 @@ class OpenAiCompatibleHttpEngine:
             usage=_usage_from_envelope(body.get("usage") or {}),
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
+
+    async def count_prompt_tokens(self, request: GenerateRequest) -> int:
+        """The prompt this request would send, counted by the backend itself.
+
+        **The same payload `generate` sends** -- `_payload_for`, so the
+        thinking directive and every shaped setting are in it -- rendered
+        by llama.cpp's `/apply-template` and counted by its `/tokenize`
+        with the special tokens the completion path adds. Measured exact
+        against a one-token generation's `prompt_tokens` on Gemma 4 E4B
+        and Qwen3 (see the test module). Nothing is generated.
+
+        Raises `TokenCountUnsupported` where the count could not be exact:
+        an image (the template renders a marker; the projector decides
+        the cost), OpenAI's own API, and any backend without the template
+        endpoint. A backend that is down or rejects the request raises
+        `CliError`, as `generate` would.
+        """
+        if has_images(request.messages):
+            raise TokenCountUnsupported(
+                "an image's token cost is decided by the projector when it encodes the "
+                "picture, and the chat template renders only a marker for it"
+            )
+        if _is_openai_endpoint(self._base_url):
+            raise TokenCountUnsupported("OpenAI's own API cannot count a chat prompt here")
+        payload = self._payload_for(request)
+        client = self._client()
+        try:
+            rendered = await client.post(
+                "/apply-template",
+                headers=self._headers(),
+                json=payload,
+                timeout=_COUNT_TIMEOUT_SECONDS,
+            )
+            if rendered.status_code in (404, 405, 501):
+                raise TokenCountUnsupported(
+                    f"this backend has no /apply-template (HTTP {rendered.status_code}); "
+                    "only llama.cpp's llama-server can count a chat prompt without generating"
+                )
+            if rendered.status_code >= 400:
+                raise CliError(
+                    f"openai_compat_http /apply-template returned {rendered.status_code}: "
+                    f"{_redact(rendered.text[:500])}",
+                    upstream_status=rendered.status_code,
+                )
+            prompt = rendered.json().get("prompt")
+            if not isinstance(prompt, str):
+                raise CliError("openai_compat_http /apply-template returned no prompt")
+            counted = await client.post(
+                "/tokenize",
+                headers=self._headers(),
+                json={"content": prompt, "add_special": True},
+                timeout=_COUNT_TIMEOUT_SECONDS,
+            )
+            if counted.status_code >= 400:
+                raise CliError(
+                    f"openai_compat_http /tokenize returned {counted.status_code}: "
+                    f"{_redact(counted.text[:500])}",
+                    upstream_status=counted.status_code,
+                )
+            tokens = counted.json().get("tokens")
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, _COUNT_TIMEOUT_SECONDS, "the token count") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http token count failed: {e!r}") from e
+        except ValueError as e:
+            raise CliError("openai_compat_http token count returned non-JSON") from e
+        if not isinstance(tokens, list):
+            raise CliError("openai_compat_http /tokenize returned no tokens")
+        return len(tokens)
 
     async def probe_embeddings(self) -> bool:
         """Whether this backend will embed, determined by asking it to.

@@ -1,0 +1,1 @@
+{"prompt":"<|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Get weather<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Oslo?<turn|>\n<|turn>model\n"}
