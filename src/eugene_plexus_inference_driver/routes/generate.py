@@ -274,13 +274,16 @@ def _frame(chunk: Any) -> str:
         result = getattr(chunk, "result", None)
         payload = result.model_dump(exclude_none=True, mode="json") if result else {}
         return f"event: done\ndata: {json.dumps(payload)}\n\n"
-    # A token frame carries text or tool-call fragments, never both:
-    # upstream sends them in separate deltas, and merging them here
-    # would invent a shape no backend produces and no client expects.
+    # A token frame carries text, reasoning or tool-call fragments, one
+    # kind only: upstream sends them in separate deltas, and merging them
+    # here would invent a shape no backend produces and no client expects.
     calls = getattr(chunk, "toolCalls", None)
     if calls:
         fragments = [c.model_dump(exclude_none=True, mode="json") for c in calls]
         return f"event: token\ndata: {json.dumps({'toolCalls': fragments})}\n\n"
+    reasoning = getattr(chunk, "reasoning", "")
+    if reasoning:
+        return f"event: token\ndata: {json.dumps({'reasoning': reasoning})}\n\n"
     return f"event: token\ndata: {json.dumps({'text': getattr(chunk, 'text', '')})}\n\n"
 
 

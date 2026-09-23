@@ -104,11 +104,18 @@ class Chunk:
     """
 
     text: str = ""
+    reasoning: str = ""
+    """A fragment of the model's reasoning, from a backend that streams
+    it separately from the answer (`reasoning_content` on llama.cpp,
+    `reasoning` on vLLM). Its own kind of frame, like `toolCalls`:
+    before 2026-09-23 these deltas were read past, so a reasoning model
+    that thought until `max_tokens` streamed nothing at all."""
     toolCalls: list[ToolCallDelta] | None = None
     """Tool-call fragments on this frame, when the backend is streaming
-    a call rather than text. A frame carries text or fragments, never
-    both -- upstream sends them in separate deltas and combining them
-    here would invent a shape no backend produces."""
+    a call rather than text. A frame carries text, reasoning or
+    fragments, never two of them -- upstream sends them in separate
+    deltas and combining them here would invent a shape no backend
+    produces."""
     done: bool = False
     result: GenerateResponse | None = None
 
@@ -260,6 +267,11 @@ def refuse_unsupported_settings(request: GenerateRequest, *, unsupported: set[st
         "topP": "top_p",
         "toolChoice": "tool_choice",
         "responseFormat": "response_format",
+        "topK": "top_k",
+        "minP": "min_p",
+        "frequencyPenalty": "frequency_penalty",
+        "presencePenalty": "presence_penalty",
+        "parallelToolCalls": "parallel_tool_calls",
     }
     for field in request.callerSettings or []:
         if field in unsupported:
@@ -303,6 +315,15 @@ def warn_dropped_sampling(
             "tools",
             "toolChoice",
             "responseFormat",
+            # 2026-09-23. The harness owns its sampler and its own tool
+            # loop, so none of these has anywhere to go -- and each one
+            # changes the answer, so an explicit one is refused, never
+            # quietly dropped.
+            "topK",
+            "minP",
+            "frequencyPenalty",
+            "presencePenalty",
+            "parallelToolCalls",
         },
     )
     for field, value in (("topP", request.topP), ("seed", request.seed)):

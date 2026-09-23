@@ -214,7 +214,62 @@ def _max_tokens_field_for(base_url: str) -> str:
     still implement the older spec and only understand `max_tokens`.
     Pick by base URL: openai.com → new field; anything else → legacy.
     """
-    return "max_completion_tokens" if "openai.com" in base_url.lower() else "max_tokens"
+    return "max_completion_tokens" if _is_openai_endpoint(base_url) else "max_tokens"
+
+
+def _is_openai_endpoint(base_url: str) -> bool:
+    """OpenAI's own API, rather than something that speaks its shape.
+
+    The one backend behind this engine known to REJECT the local-engine
+    extensions: it answers `top_k` with "Unrecognized request argument
+    supplied", and a history message carrying `reasoning_content` with
+    an unexpected-property 400. Everything else -- llama.cpp, vLLM,
+    Ollama, LM Studio -- either reads them or ignores them.
+    """
+    return "openai.com" in base_url.lower()
+
+
+# Settings OpenAI's own endpoint does not take. Refused when explicit and
+# left out of `supported_settings`, so the gateway routes around this
+# backend instead of trying it and failing.
+_LOCAL_ENGINE_SETTINGS = frozenset({"topK", "minP"})
+
+# Settings a fixed-sampler model rejects along with `temperature`: OpenAI's
+# reasoning models refuse the penalties as they refuse the sampler itself.
+_FIXED_SAMPLER_SETTINGS = frozenset({"temperature", "topP", "frequencyPenalty", "presencePenalty"})
+
+
+def _reasoning_of(obj: dict[str, Any]) -> str | None:
+    """A message's or delta's separately-reported reasoning, if any.
+
+    **Two spellings, both measured.** llama.cpp b10948 sends
+    `reasoning_content` (DeepSeek's name) and vLLM 0.29 sends
+    `reasoning` -- it renamed the field and now treats the old one as a
+    deprecated alias on input. A reader of only one of them discards
+    the other engine's thinking exactly as this adapter discarded both
+    before 2026-09-23.
+    """
+    for key in ("reasoning_content", "reasoning"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _stop_sequence(choice: dict[str, Any], request: GenerateRequest) -> str | None:
+    """Which requested stop string ended the answer, if the backend says.
+
+    vLLM puts it in `stop_reason`; **llama.cpp b10948 does not report it
+    at all** (measured: its choice carries `finish_reason`, `index` and
+    `message`), so behind llama.cpp this is always None. A `stop_reason`
+    that is a token id -- vLLM's EOS case -- or a string the caller never
+    asked for is not a stop sequence, and naming it as one would put a
+    value in the caller's hands that matches nothing it sent.
+    """
+    reason = choice.get("stop_reason")
+    if isinstance(reason, str) and request.stop and reason in request.stop:
+        return reason
+    return None
 
 
 def _sse_data(line: str) -> str | None:
@@ -521,12 +576,28 @@ class OpenAiCompatibleHttpEngine:
             "tools",
             "toolChoice",
             "responseFormat",
+            "topK",
+            "minP",
+            "frequencyPenalty",
+            "presencePenalty",
+            "parallelToolCalls",
         ]
-        return [
-            field
-            for field in fields
-            if not (self._temperature_is_fixed and field in {"temperature", "topP"})
-        ]
+        return [field for field in fields if field not in self._unsupported_settings()]
+
+    def _unsupported_settings(self) -> frozenset[str]:
+        """What this backend cannot carry, whoever asks.
+
+        One answer read by both `supported_settings` (so the gateway
+        routes around this backend) and `_payload_for` (so an explicit
+        request that reaches it anyway is refused before any HTTP). Two
+        separate lists would be two chances to disagree.
+        """
+        unsupported: set[str] = set()
+        if self._temperature_is_fixed:
+            unsupported |= _FIXED_SAMPLER_SETTINGS
+        if _is_openai_endpoint(self._base_url):
+            unsupported |= _LOCAL_ENGINE_SETTINGS
+        return frozenset(unsupported)
 
     def _payload_for(self, request: GenerateRequest) -> dict[str, Any]:
         """The chat-completions body for this request.
@@ -536,8 +607,9 @@ class OpenAiCompatibleHttpEngine:
         the only symptom would be a streamed answer differing from a
         non-streamed one for the same request.
         """
-        if self._temperature_is_fixed:
-            refuse_unsupported_settings(request, unsupported={"temperature", "topP"})
+        unsupported = self._unsupported_settings()
+        if unsupported:
+            refuse_unsupported_settings(request, unsupported=set(unsupported))
         # Apply the operator's thinkingMode by mutating the system
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
@@ -545,7 +617,9 @@ class OpenAiCompatibleHttpEngine:
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         payload: dict[str, Any] = {
             "model": self._upstream_model_id,
-            "messages": _to_openai_messages(messages),
+            "messages": _to_openai_messages(
+                messages, send_reasoning=not _is_openai_endpoint(self._base_url)
+            ),
         }
         if request.maxTokens is not None:
             payload[_max_tokens_field_for(self._base_url)] = request.maxTokens
@@ -578,6 +652,30 @@ class OpenAiCompatibleHttpEngine:
             payload["seed"] = int(request.seed)
         if request.stop:
             payload["stop"] = list(request.stop)
+        # **Carried since 2026-09-23**, with no field for any of them
+        # before -- so the gateway refused all five with a 400, although
+        # llama.cpp accepted every one of them on the capture that
+        # scoped this change. `is not None` throughout, for the seed=0
+        # reason: `top_k: 0` disables the cut and `parallel_tool_calls:
+        # false` asks for one call a turn, and both are falsy.
+        #
+        # What reaches here for a backend that cannot take one was not
+        # explicit (an explicit one was refused above), so it is omitted
+        # and said once -- the `temperature` rule, applied to its
+        # neighbours.
+        for field, key, value in (
+            ("topK", "top_k", request.topK),
+            ("minP", "min_p", request.minP),
+            ("frequencyPenalty", "frequency_penalty", request.frequencyPenalty),
+            ("presencePenalty", "presence_penalty", request.presencePenalty),
+            ("parallelToolCalls", "parallel_tool_calls", request.parallelToolCalls),
+        ):
+            if value is None:
+                continue
+            if field in unsupported:
+                self._warn_dropped(key)
+                continue
+            payload[key] = value
         # Tools ride through untouched. We do not validate the JSON
         # Schema in `parameters`, rewrite dialects, or reorder the list:
         # a backend that rejects a construct rejects it in its own
@@ -741,13 +839,18 @@ class OpenAiCompatibleHttpEngine:
         message = first.get("message") or {}
         content = message.get("content")
         tool_calls = _tool_calls_from_wire(message.get("tool_calls"))
+        reasoning = _reasoning_of(message)
         # **`content` is null on a tool-call-only turn**, and this used
         # to raise on exactly that response -- the concrete way a tool
-        # call failed here before the contract carried one. Text is
-        # still required when there are no calls: a response with
-        # neither is a backend malfunction, not an empty answer.
+        # call failed here before the contract carried one. **And on a
+        # reasoning-only turn**: vLLM gives a model that thought until
+        # `max_tokens` `content: null` with everything in `reasoning`,
+        # which this raised on until 2026-09-23 -- a 502 the gateway
+        # cascaded on, for a reply that was perfectly well formed. A
+        # response with no text, no calls and no reasoning is still a
+        # backend malfunction, not an empty answer.
         if not isinstance(content, str):
-            if not tool_calls:
+            if not tool_calls and not reasoning:
                 raise CliError("openai_compat_http response missing string content")
             content = None
         elif self._thinking_mode == "off":
@@ -756,12 +859,20 @@ class OpenAiCompatibleHttpEngine:
             # _thinking.strip_thinking_blocks for the why.
             content = strip_thinking_blocks(content)
 
+        stop_sequence = _stop_sequence(first, request)
         return GenerateResponse(
             content=content,
+            # `off` withholds it on this path exactly as the stream
+            # withholds its frames: the operator said not to show
+            # reasoning, and a separate field is still showing it.
+            reasoning=reasoning if self._thinking_mode != "off" else None,
             toolCalls=tool_calls or None,
-            finishReason=_FINISH_REASON_MAP.get(
+            finishReason=FinishReason.stop_sequence
+            if stop_sequence is not None
+            else _FINISH_REASON_MAP.get(
                 str(first.get("finish_reason") or "stop"), FinishReason.stop
             ),
+            stopSequence=stop_sequence,
             usage=_usage_from_envelope(body.get("usage") or {}),
             requestId=request.requestId,
             backend=self.backend_kind,
@@ -803,6 +914,13 @@ class OpenAiCompatibleHttpEngine:
         started = time.perf_counter()
         filtered = ThinkingFilter() if self._thinking_mode == "off" else None
         emitted: list[str] = []
+        # Reasoning the backend streamed on its own channel. Forwarded
+        # frame by frame and kept for the terminal `done`, unless the
+        # operator's thinkingMode is `off`, in which case it is read
+        # past exactly as it was for everyone before 2026-09-23.
+        show_reasoning = self._thinking_mode != "off"
+        reasoned: list[str] = []
+        stop_sequence: str | None = None
         # Did upstream actually say it was finished? Iterating a closed
         # connection simply ends, so without one of these two markers a
         # backend that died mid-answer is indistinguishable from one that
@@ -872,7 +990,8 @@ class OpenAiCompatibleHttpEngine:
                                     )
                                     break
                                 raise _stalled(
-                                    self._stall_seconds, len("".join(emitted))
+                                    self._stall_seconds,
+                                    len("".join(emitted)) + len("".join(reasoned)),
                                 ) from stall
                         else:
                             line = await anext(lines)
@@ -899,7 +1018,16 @@ class OpenAiCompatibleHttpEngine:
                         if choice.get("finish_reason"):
                             finish_reason = str(choice["finish_reason"])
                             saw_terminator = True
+                            stop_sequence = _stop_sequence(choice, request)
                         delta = choice.get("delta") or {}
+                        # Reasoning rides its own frames, ahead of the
+                        # answer. Before 2026-09-23 this loop looked at
+                        # `content` alone, and a model that thought until
+                        # `max_tokens` produced a stream with nothing in it.
+                        thought = _reasoning_of(delta)
+                        if thought and show_reasoning:
+                            reasoned.append(thought)
+                            yield Chunk(reasoning=thought)
                         # Tool-call fragments ride their own frame.
                         # Forwarded rather than accumulated here: the
                         # gateway has to emit them as OpenAI deltas
@@ -942,7 +1070,8 @@ class OpenAiCompatibleHttpEngine:
             # frame instead of presenting half an answer as whole.
             raise CliError(
                 "openai_compat_http stream ended without [DONE] or a finish_reason "
-                f"after {len(''.join(emitted))} characters: the backend closed the "
+                f"after {len(''.join(emitted)) + len(''.join(reasoned))} characters: "
+                "the backend closed the "
                 "connection mid-answer"
             )
 
@@ -960,8 +1089,12 @@ class OpenAiCompatibleHttpEngine:
                 # None rather than "" when the turn was only tool calls,
                 # so the streamed and non-streamed shapes agree.
                 content=content if (content or not tool_calls) else None,
+                reasoning="".join(reasoned) or None,
                 toolCalls=tool_calls or None,
-                finishReason=_FINISH_REASON_MAP.get(finish_reason, FinishReason.stop),
+                finishReason=FinishReason.stop_sequence
+                if stop_sequence is not None
+                else _FINISH_REASON_MAP.get(finish_reason, FinishReason.stop),
+                stopSequence=stop_sequence,
                 usage=_usage_from_envelope(usage_payload),
                 requestId=request.requestId,
                 backend=self.backend_kind,
@@ -1287,8 +1420,16 @@ class OpenAiCompatibleHttpEngine:
         return ids
 
 
-def _to_openai_messages(messages: list[Any]) -> list[dict[str, Any]]:
+def _to_openai_messages(
+    messages: list[Any], *, send_reasoning: bool = True
+) -> list[dict[str, Any]]:
     """Map our Message[] to OpenAI chat-completions messages.
+
+    An assistant turn's `reasoning` goes back up as `reasoning_content`
+    -- the name llama.cpp reads (measured: it ignored `reasoning` on the
+    same request) and vLLM accepts as an alias -- unless the backend is
+    OpenAI's own API (`send_reasoning=False`), which refuses the
+    property.
 
     The `tool` role and an assistant turn's `toolCalls` are what make an
     agent loop possible: the harness sends back the assistant message
@@ -1315,6 +1456,9 @@ def _to_openai_messages(messages: list[Any]) -> list[dict[str, Any]]:
             calls = getattr(m, "toolCalls", None)
             if calls:
                 msg["tool_calls"] = [_tool_call_to_wire(c) for c in calls]
+            reasoning = getattr(m, "reasoning", None)
+            if send_reasoning and reasoning:
+                msg["reasoning_content"] = reasoning
             out.append(msg)
         elif role == Role.tool:
             out.append(
@@ -1514,7 +1658,20 @@ def _usage_from_envelope(usage: dict[str, Any]) -> Usage | None:
         promptTokens=prompt or 0,
         completionTokens=completion or 0,
         totalTokens=total if total is not None else (prompt or 0) + (completion or 0),
+        # OpenAI's detail objects, which llama.cpp (cached) and vLLM
+        # (both) fill in. Absent stays absent: a zero here would claim
+        # the backend counted and found none.
+        cachedPromptTokens=_detail(usage, "prompt_tokens_details", "cached_tokens"),
+        reasoningTokens=_detail(usage, "completion_tokens_details", "reasoning_tokens"),
     )
+
+
+def _detail(usage: dict[str, Any], group: str, key: str) -> int | None:
+    details = usage.get(group)
+    value = details.get(key) if isinstance(details, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _redact(text: str) -> str:
