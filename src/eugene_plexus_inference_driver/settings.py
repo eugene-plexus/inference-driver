@@ -34,17 +34,20 @@ class Settings(BaseSettings):
     `config_file` normally, so the next non-safe-mode boot picks up the
     repair. Per the safe-mode contract in specs/openapi/inference-driver.yaml."""
 
-    auth_verify_key: str | None = None
-    """Base64 public Ed25519 PEM from the agent. Exclusive with auth_signing_key."""
+    trust_bundle_file: str | None = None
+    """The trust bundle the agent keeps beside `node.yaml`, reloaded when it changes."""
 
-    auth_signing_key: str | None = None
-    """Legacy base64 32-byte HS256 key; used only until install rotation."""
+    trust_authority: str | None = None
+    """The public key that bundle must be signed by (base64url Ed25519)."""
+
+    auth_recipient: str | None = None
+    """This machine as a token's audience names it: `node:<name>`."""
 
     service_token: str | None = None
-    """Long-lived service JWT (EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN). Presented to
-    the agent when a `runtimeName` is resolved to a URL — reads on the
-    agent's `/v1/runtimes` accept any service token, the same rule that
-    lets the gateway resolve topology. The agent supplies it at spawn."""
+    """This driver's own token (EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN), addressed
+    to this machine alone. Presented to this machine's agent when a
+    `runtimeName` is resolved to a URL -- the agent's reads accept its own
+    children's tokens. Worth nothing on any other machine."""
 
     agent_url: str = "http://127.0.0.1:8079"
     """Agent endpoint a `runtimeName` is resolved against

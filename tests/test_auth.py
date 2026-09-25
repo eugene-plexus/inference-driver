@@ -1,74 +1,39 @@
-"""Tests for v0.2 bearer auth on the inference-driver.
+"""Bearer auth on the inference-driver, against this machine's trust bundle.
 
-Verify-only role — the agent issues tokens; this component just
-validates them. Tests construct JWTs directly via PyJWT against a
-known signing key (standing in for the agent) and assert the
-dependencies accept / reject the right shapes.
+Verify-only role: the driver holds no key (per-node token keys,
+2026-09-25). `FakeInstall` stands in for the agent and the root with a
+real bundle on disk, and these assert the dependencies accept and refuse
+the right shapes.
 
 Auth posture is selected by whether `app.state.auth_state` is
-pre-populated before the lifespan runs. Default fixtures leave it
-unset → lifespan reads env vars (empty) → `auth_disabled=True`, so
-existing tests keep working unchanged.
+pre-populated before the lifespan runs. Default fixtures leave it unset
+-> lifespan reads env vars (empty) -> `auth_disabled=True`.
 """
 
 from __future__ import annotations
 
-import secrets
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from eugene_plexus_inference_driver import tokens
 from eugene_plexus_inference_driver.app import create_app
-from eugene_plexus_inference_driver.auth_state import AuthState
+from eugene_plexus_inference_driver.auth_state import load_auth_state
 from eugene_plexus_inference_driver.settings import Settings
 
-_JWT_ALG = "HS256"
-
-
-def _issue(
-    *,
-    signing_key: bytes,
-    sub: str,
-    aud: str,
-    ttl_seconds: int = 60,
-    iat: int | None = None,
-) -> str:
-    """Mint a JWT exactly the way the agent would."""
-    issued_at = iat if iat is not None else int(time.time())
-    claims = {
-        "sub": sub,
-        "aud": aud,
-        "iat": issued_at,
-        "exp": issued_at + ttl_seconds,
-    }
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+from .conftest import FakeInstall
 
 
 @pytest.fixture
-def signing_key() -> bytes:
-    return secrets.token_bytes(32)
-
-
-@pytest.fixture
-def authed_app(tmp_path: Path, signing_key: bytes) -> FastAPI:
+def authed_app(tmp_path: Path, install: FakeInstall) -> FastAPI:
     settings = Settings(config_file=tmp_path / "config.yaml")
     app = create_app(settings=settings)
     # Pre-populate so the lifespan leaves it alone (hasattr is True).
-    app.state.auth_state = AuthState(
-        signing_key=signing_key,
-        service_token=_issue(
-            signing_key=signing_key,
-            sub="inference-driver",
-            aud="service:inference-driver",
-            ttl_seconds=365 * 24 * 3600,
-        ),
-        master_key=None,
-    )
+    app.state.auth_state = install.auth_state()
     return app
 
 
@@ -79,14 +44,14 @@ def authed_client(authed_app: FastAPI) -> Iterator[TestClient]:
 
 
 @pytest.fixture
-def operator_token(signing_key: bytes) -> str:
-    return _issue(signing_key=signing_key, sub="operator", aud="operator")
+def operator_token(install: FakeInstall) -> str:
+    return install.session()
 
 
 @pytest.fixture
-def orchestrator_service_token(signing_key: bytes) -> str:
-    """A typical inbound: gateway calling /v1/generate."""
-    return _issue(signing_key=signing_key, sub="gateway", aud="service:gateway")
+def orchestrator_service_token(install: FakeInstall) -> str:
+    """A typical inbound: the gateway beside this driver calling /v1/generate."""
+    return install.service("gateway")
 
 
 # --------------------------------------------------------------------------- #
@@ -123,26 +88,25 @@ def test_missing_bearer_rejects_with_401(authed_client: TestClient) -> None:
     assert response.json()["detail"]["component"] == "inference-driver"
 
 
-def test_wrong_signing_key_rejects(authed_client: TestClient) -> None:
-    other = secrets.token_bytes(32)
-    token = _issue(signing_key=other, sub="operator", aud="operator")
+def test_a_token_signed_by_a_key_the_bundle_does_not_list_rejects(
+    authed_client: TestClient, install: FakeInstall
+) -> None:
+    stranger = tokens.Signer(key=tokens.generate_private_key(), issuer="control")
+    token, _ = stranger.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=[install.recipient], ttl_seconds=60
+    )
     response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
 
 
 def test_garbage_bearer_rejects(authed_client: TestClient) -> None:
-    response = authed_client.get("/v1/config", headers={"Authorization": "Bearer not.a.real.jwt"})
+    response = authed_client.get("/v1/config", headers={"Authorization": "Bearer not.a.jwt"})
     assert response.status_code == 401
 
 
-def test_expired_token_rejects(authed_client: TestClient, signing_key: bytes) -> None:
-    expired = _issue(
-        signing_key=signing_key,
-        sub="operator",
-        aud="operator",
-        ttl_seconds=-600,  # past the 300 s clock-skew leeway, not merely past exp
-        iat=int(time.time()) - 120,
-    )
+def test_expired_token_rejects(authed_client: TestClient, install: FakeInstall) -> None:
+    # Past the 300 s clock-skew leeway, not merely past exp.
+    expired = install.session(ttl=60, now=int(time.time()) - 1000)
     response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {expired}"})
     assert response.status_code == 401
 
@@ -227,55 +191,56 @@ def test_operator_token_accepted_on_info(authed_client: TestClient, operator_tok
 # --------------------------------------------------------------------------- #
 
 
-def test_load_auth_state_disabled_when_no_signing_key() -> None:
-    from eugene_plexus_inference_driver.auth_state import load_auth_state
-
-    state = load_auth_state(signing_key_b64=None, service_token=None, master_key_b64=None)
-    assert state.auth_disabled is True
-
-
-def test_load_auth_state_rejects_partial_auth() -> None:
-    """SERVICE_TOKEN without AUTH_SIGNING_KEY is a configuration bug."""
-    from eugene_plexus_inference_driver.auth_state import load_auth_state
-
-    with pytest.raises(ValueError, match="inconsistent"):
-        load_auth_state(
-            signing_key_b64=None,
-            service_token="dummy",
-            master_key_b64=None,
-        )
-
-
-def test_load_auth_state_allows_signing_key_without_service_token(
-    signing_key: bytes,
+def test_a_gateway_on_another_machine_may_call_with_the_grant(
+    authed_client: TestClient, install: FakeInstall
 ) -> None:
-    """Unlike the gateway, the inference-driver doesn't need a
-    service token for outbound calls. AUTH_SIGNING_KEY alone is a valid
-    posture — the driver can validate inbound traffic without ever
-    needing to authenticate outbound."""
-    import base64
+    """The gateway on the control host calling a companion driver here."""
+    install.far_grants = ("gateway",)
+    install.publish()
+    token = install.foreign_service("gateway")
+    response = authed_client.get("/v1/info", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code != 401
 
-    from eugene_plexus_inference_driver.auth_state import load_auth_state
 
+def test_another_machines_components_call_nothing_here(
+    authed_client: TestClient, install: FakeInstall
+) -> None:
+    """No `service:*` wildcard: another machine's agent, and a gateway
+    token from a machine the operator never granted one, are refused."""
+    for token in (install.foreign_service("agent"), install.foreign_service("gateway")):
+        response = authed_client.get("/v1/info", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 401
+
+
+def test_load_auth_state_disabled_when_nothing_is_supplied() -> None:
     state = load_auth_state(
-        signing_key_b64=base64.b64encode(signing_key).decode("ascii"),
+        trust_bundle_file=None,
+        trust_authority=None,
+        auth_recipient=None,
         service_token=None,
         master_key_b64=None,
     )
-    assert state.signing_key == signing_key
-    assert state.service_token is None
-    assert state.auth_disabled is False
+    assert state.auth_disabled is True
 
 
-def test_load_auth_state_rejects_wrong_length_signing_key() -> None:
+@pytest.mark.parametrize(
+    "missing", ["trust_bundle_file", "trust_authority", "auth_recipient", "service_token"]
+)
+def test_load_auth_state_refuses_a_partial_environment(install: FakeInstall, missing: str) -> None:
+    env: dict[str, str | None] = {
+        "trust_bundle_file": str(install.bundle_path),
+        "trust_authority": install.authority,
+        "auth_recipient": install.recipient,
+        "service_token": install.service("inference-driver"),
+        "master_key_b64": None,
+    }
+    env[missing] = None
+    with pytest.raises(ValueError, match="missing"):
+        load_auth_state(**env)  # type: ignore[arg-type]
+
+
+def test_load_auth_state_rejects_a_misshaped_master_key(install: FakeInstall) -> None:
     import base64
 
-    from eugene_plexus_inference_driver.auth_state import load_auth_state
-
-    short = base64.b64encode(b"\x00" * 16).decode("ascii")
     with pytest.raises(ValueError, match="32 bytes"):
-        load_auth_state(
-            signing_key_b64=short,
-            service_token=None,
-            master_key_b64=None,
-        )
+        install.auth_state(master_key_b64=base64.b64encode(b"\x00" * 16).decode("ascii"))

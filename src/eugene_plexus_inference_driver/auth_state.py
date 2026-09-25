@@ -1,8 +1,22 @@
-"""Verifier bootstrap: AUTH_VERIFY_KEY is base64 public Ed25519 PEM.
-AUTH_SIGNING_KEY accepts only a legacy 32-byte HS256 key during upgrade.
-Never supply both. SERVICE_TOKEN is minted by the supervising agent;
-MASTER_KEY is a separate at-rest encryption credential. Missing both
-verification inputs retains the existing standalone/dev mode.
+"""Verifier bootstrap: the trust bundle this driver checks tokens against.
+
+Per-node token keys (2026-09-25; `specs/docs/design/per-node-token-keys.md`).
+The supervising agent hands this process four things and no key:
+
+* `TRUST_BUNDLE_FILE` -- the bundle the agent keeps and rewrites when
+  the control root publishes a new one; reloaded when it changes;
+* `TRUST_AUTHORITY` -- the key that bundle must be signed by, so a file
+  anyone else wrote is refused;
+* `AUTH_RECIPIENT` -- which machine this is (`node:<name>`), the
+  audience a token must name to be accepted here;
+* `SERVICE_TOKEN` -- this driver's own token, addressed to this
+  machine alone, which it shows this machine's agent to resolve a
+  runtime's address.
+
+`MASTER_KEY` is the separate at-rest encryption credential. With none of
+the first four, the driver runs unauthenticated (dev/standalone), as it
+always has; with some but not all, it refuses to start rather than run
+half-authenticated.
 """
 
 from __future__ import annotations
@@ -11,32 +25,45 @@ import base64
 import logging
 from dataclasses import dataclass
 
-from . import security
+from . import tokens
 
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class AuthState:
-    """Process-wide auth posture. Immutable for the driver's lifetime —
-    rotating the signing key requires a restart, which is by design
-    (per-restart key rotation is the v0.2 revocation story)."""
+    """Process-wide auth posture."""
 
-    signing_key: bytes | None
-    """Public Ed25519 PEM or legacy HMAC key; None when auth is disabled."""
+    bundle: tokens.BundleFile | None
+    """The trust bundle; None when auth is disabled."""
+
+    recipient: str | None
+    """This machine, as a token's audience names it."""
 
     service_token: str | None
-    """Outbound bearer token. Not consumed in v0.2 — the driver doesn't
-    call peer components. Captured for v0.3 use."""
+    """This driver's own token, good on this machine only."""
 
     master_key: bytes | None
-    """At-rest secretbox key. Only set when the operator has logged in
-    at the agent. Phase 6 uses this to decrypt config-stored apiKey
-    values; Phase 4 leaves it untouched."""
+    """At-rest secretbox key, when the operator has unlocked the agent."""
+
+    authority: str | None = None
+    """The key the bundle is signed by: the control root's, or a standalone node's."""
 
     @property
     def auth_disabled(self) -> bool:
-        return self.signing_key is None
+        return self.bundle is None
+
+    def verify(self, token: str, *, classes: tuple[str, ...]) -> tokens.Claims:
+        """Every check `tokens.verify` makes, against the bundle as it is now."""
+        if self.bundle is None or self.recipient is None:
+            raise tokens.TokenError("this driver verifies nothing: it runs without auth")
+        bundle = self.bundle.get()
+        if bundle is None:
+            raise tokens.TokenError(
+                "this driver holds no trust bundle it can read yet; its agent keeps one "
+                "beside node.yaml"
+            )
+        return tokens.verify(token, bundle=bundle, recipient=self.recipient, classes=classes)
 
 
 def _decode_b64_key(value: str | None, *, expected_len: int, label: str) -> bytes | None:
@@ -55,47 +82,46 @@ def _decode_b64_key(value: str | None, *, expected_len: int, label: str) -> byte
 
 def load_auth_state(
     *,
-    signing_key_b64: str | None,
+    trust_bundle_file: str | None,
+    trust_authority: str | None,
+    auth_recipient: str | None,
     service_token: str | None,
     master_key_b64: str | None,
-    verify_key_b64: str | None = None,
 ) -> AuthState:
-    """Build an `AuthState` from the three env-var inputs.
-
-    Returns auth-disabled state when no signing key is supplied (with
-    a one-shot warning so dev runs are obvious). Raises on
-    inconsistent partial-auth configurations — a missing piece is
-    almost always a wiring bug we want loud rather than silently 401-y.
-    """
-    signing_key: bytes | None
-    if verify_key_b64 is not None:
-        if signing_key_b64 is not None:
-            raise ValueError("both AUTH_VERIFY_KEY and legacy AUTH_SIGNING_KEY are set")
-        try:
-            raw = base64.b64decode(verify_key_b64, validate=True)
-            if not raw.startswith(b"-----BEGIN PUBLIC KEY-----"):
-                raise ValueError("public PEM required")
-            signing_key = security.verification_key(raw)
-        except (ValueError, TypeError) as exc:
-            raise ValueError("AUTH_VERIFY_KEY must contain base64 Ed25519 public PEM") from exc
-    else:
-        signing_key = _decode_b64_key(signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY")
+    """Build an `AuthState` from the environment the agent supplies."""
     master_key = _decode_b64_key(master_key_b64, expected_len=32, label="MASTER_KEY")
-
-    if signing_key is None:
-        if service_token or master_key:
+    given = {
+        "TRUST_BUNDLE_FILE": trust_bundle_file,
+        "TRUST_AUTHORITY": trust_authority,
+        "AUTH_RECIPIENT": auth_recipient,
+        "SERVICE_TOKEN": service_token,
+    }
+    present = [name for name, value in given.items() if value]
+    if not present:
+        if master_key is not None:
             raise ValueError(
-                "auth env vars inconsistent: SERVICE_TOKEN or MASTER_KEY is set but "
-                "neither verification key is set — refusing a partially-auth state"
+                "MASTER_KEY is set but no trust bundle is -- refusing a partially-auth state"
             )
         log.warning(
-            "EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY not set — running unauthenticated "
-            "(dev/standalone mode). Production spawns via agent always supply this."
+            "EUGENE_PLEXUS_DRIVER_TRUST_BUNDLE_FILE not set -- running unauthenticated "
+            "(dev/standalone mode). Production spawns via the agent always supply it."
         )
-        return AuthState(signing_key=None, service_token=None, master_key=None)
-
+        return AuthState(bundle=None, recipient=None, service_token=None, master_key=None)
+    missing = [name for name, value in given.items() if not value]
+    if missing:
+        raise ValueError(
+            f"{', '.join(missing)} missing beside {', '.join(present)}: the agent hands a "
+            "child all four or none. Check the supervisor wiring."
+        )
+    assert trust_bundle_file and trust_authority and auth_recipient and service_token
+    try:
+        tokens.load_public(trust_authority)
+    except ValueError as exc:
+        raise ValueError(f"TRUST_AUTHORITY is not an Ed25519 public key: {exc}") from exc
     return AuthState(
-        signing_key=signing_key,
-        service_token=service_token or None,
+        bundle=tokens.BundleFile(trust_bundle_file, authority=trust_authority),
+        recipient=auth_recipient,
+        service_token=service_token,
         master_key=master_key,
+        authority=trust_authority,
     )

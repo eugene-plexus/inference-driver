@@ -119,8 +119,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # populate `app.state.auth_state`; production reads it from env.
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = load_auth_state(
-            signing_key_b64=settings.auth_signing_key,
-            verify_key_b64=settings.auth_verify_key,
+            trust_bundle_file=settings.trust_bundle_file,
+            trust_authority=settings.trust_authority,
+            auth_recipient=settings.auth_recipient,
             service_token=settings.service_token,
             master_key_b64=settings.master_key,
         )
