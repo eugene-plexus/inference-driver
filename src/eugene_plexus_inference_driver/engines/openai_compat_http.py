@@ -46,6 +46,8 @@ from .._generated.models import (
     GenerateRequest,
     GenerateResponse,
     Role,
+    Stage,
+    StreamProgress,
     ToolCall,
     ToolCallDelta,
     Usage,
@@ -101,6 +103,12 @@ _CONTEXT_PROBE_BUDGET_SECONDS = 2.0
 # than on the client -- otherwise one client would have to carry four
 # different budgets and the shortest would become everyone's.
 _CONTEXT_PROBE_TIMEOUT = httpx.Timeout(_CONTEXT_PROBE_BUDGET_SECONDS, connect=2.0)
+
+# The fewest seconds between two `working` progress frames made from SSE
+# keepalive comments. OpenRouter sends one every few seconds while a
+# model is queued or thinking; forwarding each would be a frame per
+# comment for a signal that only needs to say "still there".
+_KEEPALIVE_PROGRESS_SECONDS = 2.0
 
 
 def _only_or_named(
@@ -295,6 +303,31 @@ def _sse_data(line: str) -> str | None:
     return line[5:].strip()
 
 
+def _prompt_progress(read: dict[str, Any]) -> StreamProgress | None:
+    """llama.cpp's `prompt_progress` in the contract's words, or None.
+
+    Captured from b11215: `{"total", "cache", "processed", "time_ms"}`,
+    `processed` counting the cached tokens too, so it runs from `cache`
+    to `total`. A frame missing either end is not reported rather than
+    reported as zero.
+    """
+
+    def count(key: str) -> int | None:
+        value = read.get(key)
+        return int(value) if isinstance(value, int | float) and value >= 0 else None
+
+    total, processed = count("total"), count("processed")
+    if total is None or processed is None:
+        return None
+    return StreamProgress(
+        stage=Stage.prompt,
+        promptTokens=total,
+        cachedTokens=count("cache"),
+        processedTokens=processed,
+        elapsedMs=count("time_ms"),
+    )
+
+
 def _timed_out(exc: httpx.TimeoutException, limit_seconds: float, what: str) -> BackendTimeout:
     """The one failure whose cause we know exactly, said in words.
 
@@ -430,6 +463,13 @@ class OpenAiCompatibleHttpEngine:
         #: lifetime: it cannot change without the backend restarting,
         #: and the engine is rebuilt on every config change.
         self._embeddings: bool | None = None
+        #: Whether the backend answered as `llama-server`, the one backend
+        #: that says how far it has read a prompt. Learned from `/props`
+        #: by the context probe (or on the first stream that asks), and
+        #: None until something definite came back: a hosted API refuses
+        #: `return_progress` as an unknown field, so it is sent only on a
+        #: yes.
+        self._llama_cpp: bool | None = None
         #: This engine's one HTTP client, built on first use by
         #: `_client()`. See that method for why it is lazy and why the
         #: per-call deadlines do not live on it.
@@ -916,6 +956,13 @@ class OpenAiCompatibleHttpEngine:
         image_request = has_images(request.messages)
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
+        report = bool(request.reportProgress)
+        if report and await self._answers_as_llama_cpp():
+            # llama.cpp's own flag: a `prompt_progress` object on a frame
+            # per batch it reads. Measured on b11215: without it, 21 s of
+            # prompt reading on the processor produced no frame at all.
+            payload["return_progress"] = True
+        last_keepalive = 0.0
 
         started = time.perf_counter()
         filtered = ThinkingFilter() if self._thinking_mode == "off" else None
@@ -968,6 +1015,13 @@ class OpenAiCompatibleHttpEngine:
                         upstream_status=response.status_code,
                         retry_after_seconds=retry_after(response.headers.get("Retry-After")),
                     )
+                if report:
+                    # The response opened: the service has the request.
+                    # The one thing every HTTP backend says, a hosted API
+                    # included, and until the first token often the only
+                    # thing -- a cloud reasoning model can be silent for a
+                    # minute after this.
+                    yield Chunk(progress=StreamProgress(stage=Stage.working))
                 lines = response.aiter_lines()
                 # The stall clock arms at the first DATA frame, not the
                 # first line: before a token arrives the silence is a
@@ -975,6 +1029,10 @@ class OpenAiCompatibleHttpEngine:
                 # on a CPU box -- and the request budget governs it.
                 # Any line at all resets the clock afterwards, so a
                 # backend emitting keepalives is never called stalled.
+                # A frame that only reports prompt progress does not arm
+                # it: it is still the prompt being read, and a batch on a
+                # large model on the processor can take longer than the
+                # stall window.
                 saw_first_data = False
                 while True:
                     try:
@@ -1003,11 +1061,21 @@ class OpenAiCompatibleHttpEngine:
                             line = await anext(lines)
                     except StopAsyncIteration:
                         break
+                    if report and line.startswith(":"):
+                        # An SSE keepalive comment: the service saying it
+                        # is still working (OpenRouter's `: OPENROUTER
+                        # PROCESSING`). Said at most every couple of
+                        # seconds, however often the service says it.
+                        now = time.perf_counter()
+                        if now - last_keepalive >= _KEEPALIVE_PROGRESS_SECONDS:
+                            last_keepalive = now
+                            yield Chunk(progress=StreamProgress(stage=Stage.working))
+                        continue
                     data = _sse_data(line)
                     if data is None:
                         continue
-                    saw_first_data = True
                     if data == "[DONE]":
+                        saw_first_data = True
                         saw_terminator = True
                         break
                     try:
@@ -1015,8 +1083,17 @@ class OpenAiCompatibleHttpEngine:
                     except ValueError:
                         # A malformed frame mid-stream is not worth
                         # failing a half-delivered answer over.
+                        saw_first_data = True
                         log.debug("openai_compat_http: unparseable SSE frame (contents omitted)")
                         continue
+                    read = event.get("prompt_progress") if isinstance(event, dict) else None
+                    if isinstance(read, dict):
+                        if report:
+                            progress = _prompt_progress(read)
+                            if progress is not None:
+                                yield Chunk(progress=progress)
+                    else:
+                        saw_first_data = True
                     served_model = self._public_model_id(event.get("model") or served_model)
                     if event.get("usage"):
                         usage_payload = event["usage"]
@@ -1392,15 +1469,36 @@ class OpenAiCompatibleHttpEngine:
             "/props", headers=self._headers(), timeout=_CONTEXT_PROBE_TIMEOUT
         )
         if response.status_code >= 400:
+            # A definite no: whatever this is, it has no `/props`.
+            self._llama_cpp = False
             return None
         props = response.json()
         if not isinstance(props, dict):
+            self._llama_cpp = False
             return None
         settings = props.get("default_generation_settings")
         value = settings.get("n_ctx") if isinstance(settings, dict) else None
         if value is None:
             value = props.get("n_ctx")
-        return value if isinstance(value, int) and value > 0 else None
+        found = value if isinstance(value, int) and value > 0 else None
+        self._llama_cpp = found is not None
+        return found
+
+    async def _answers_as_llama_cpp(self) -> bool:
+        """Whether `return_progress` may be sent, asking `/props` once if unknown.
+
+        Usually answered already: the context probe behind `/v1/info`,
+        which the gateway polls before it routes anything here, reads the
+        same endpoint. Asked here only for a stream that reached a fresh
+        driver first. A transport failure leaves the answer unknown, and
+        unknown is no -- the flag is only ever sent on a yes.
+        """
+        if self._llama_cpp is None:
+            try:
+                await self._ctx_llama_cpp(self._client())
+            except (httpx.HTTPError, ValueError):
+                log.debug("could not tell whether %s is llama.cpp", self._base_url)
+        return self._llama_cpp is True
 
     async def _ctx_vllm(self, client: httpx.AsyncClient) -> int | None:
         """`GET /v1/models` -- vLLM puts `max_model_len` on each card.

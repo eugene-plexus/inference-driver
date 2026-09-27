@@ -58,6 +58,8 @@ from .._generated.models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
+    Stage,
+    StreamProgress,
     Usage,
 )
 from ._prompt import messages_to_prompt
@@ -191,9 +193,16 @@ class CodexCliEngine:
             )
 
         if result.returncode != 0:
+            # Codex says why on stdout, as an `error` / `turn.failed`
+            # event; stderr is its own log noise. Measured 2026-09-27: a
+            # model the installed CLI is too old for exits 1 with
+            # "Reading additional input from stdin..." and a models-cache
+            # warning on stderr, and "requires a newer version of Codex"
+            # only in the events.
+            reason = _failure_in(result.stdout.decode(errors="replace").splitlines())
             raise CliError(
                 f"codex exited {result.returncode}: "
-                f"{result.stderr.decode(errors='replace').strip() or '<no stderr>'}"
+                f"{reason or result.stderr.decode(errors='replace').strip() or '<no stderr>'}"
             )
 
         text_parts: list[str] = []
@@ -283,37 +292,69 @@ class CodexCliEngine:
 
         started = time.perf_counter()
         text_parts: list[str] = []
+        thoughts: list[str] = []
         usage_event: dict[str, Any] | None = None
         saw_any_event = False
+        failure: str | None = None
+        report = bool(request.reportProgress)
+        show_reasoning = self._thinking_mode != "off"
 
-        async for raw_line in stream_cli_lines(argv, timeout_seconds=self._timeout_seconds):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                # Codex interleaves non-JSON log lines on stdout when its
-                # auth is unhappy; skip rather than fail the turn.
-                continue
-            if not isinstance(event, dict):
-                continue
-            saw_any_event = True
-            event_type = event.get("type")
-            if event_type == "item.completed":
-                item = event.get("item") or {}
-                if isinstance(item, dict) and item.get("type") == "agent_message":
+        lines = stream_cli_lines(argv, timeout_seconds=self._timeout_seconds)
+        try:
+            async for raw_line in lines:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Codex interleaves non-JSON log lines on stdout when its
+                    # auth is unhappy; skip rather than fail the turn.
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                saw_any_event = True
+                event_type = event.get("type")
+                if event_type == "turn.started":
+                    if report:
+                        yield Chunk(progress=StreamProgress(stage=Stage.working))
+                elif event_type == "item.started":
+                    item = event.get("item") or {}
+                    tool = _tool_of(item) if isinstance(item, dict) else None
+                    if report and tool is not None:
+                        yield Chunk(progress=StreamProgress(stage=Stage.tool, tool=tool))
+                elif event_type == "item.completed":
+                    item = event.get("item") or {}
+                    if not isinstance(item, dict):
+                        continue
                     text = item.get("text")
-                    if isinstance(text, str) and text:
+                    if not isinstance(text, str) or not text:
+                        continue
+                    if item.get("type") == "agent_message":
                         text_parts.append(text)
                         yield Chunk(text=text)
-            elif event_type == "turn.completed":
-                usage_event = event.get("usage")
+                    elif item.get("type") == "reasoning" and show_reasoning:
+                        # Codex's reasoning summary for a step, whole.
+                        thoughts.append(text)
+                        yield Chunk(reasoning=text)
+                elif event_type in ("error", "turn.failed"):
+                    failure = _failure_of(event) or failure
+                elif event_type == "turn.completed":
+                    usage_event = event.get("usage")
+        except CliError as e:
+            # A non-zero exit is raised after the last line, and its
+            # message is stderr -- log noise. The reason, when Codex gave
+            # one, is the event read above.
+            if failure:
+                raise CliError(f"codex failed: {failure}") from e
+            raise
 
         if not saw_any_event:
             raise CliError("codex emitted no parseable events")
         if not text_parts:
-            raise CliError("codex produced no agent_message item")
+            raise CliError(
+                f"codex failed: {failure}" if failure else "codex produced no agent_message item"
+            )
 
         content = "".join(text_parts)
         if self._thinking_mode == "off":
@@ -323,6 +364,7 @@ class CodexCliEngine:
             done=True,
             result=GenerateResponse(
                 content=content,
+                reasoning="\n\n".join(thoughts) or None,
                 finishReason=FinishReason.stop,
                 usage=_usage_from_codex(usage_event) if usage_event else None,
                 requestId=request.requestId,
@@ -375,6 +417,63 @@ class CodexCliEngine:
             argv += ["--model", self._upstream_model_id]
         argv.append(prompt)
         return argv
+
+
+#: Codex items that run something, by the name a person reads. From
+#: Codex's `exec --json` item types; `mcp_tool_call` names its own tool.
+#: Unverified against a live turn on 2026-09-27: the CLI on the box that
+#: wrote this was too old for its account's model.
+_TOOL_ITEMS = {
+    "command_execution": "command",
+    "file_change": "file change",
+    "web_search": "web search",
+}
+
+
+def _tool_of(item: dict[str, Any]) -> str | None:
+    kind = item.get("type")
+    if kind == "mcp_tool_call":
+        tool = item.get("tool")
+        return tool if isinstance(tool, str) and tool else "tool"
+    return _TOOL_ITEMS.get(str(kind))
+
+
+def _failure_of(event: dict[str, Any]) -> str | None:
+    """The reason an `error` or `turn.failed` event gives, innermost first.
+
+    Captured 2026-09-27: the message is itself a JSON string wrapping the
+    API's error -- `{"type":"error","status":400,"error":{"message":
+    "The 'gpt-6-astra' model requires a newer version of Codex..."}}` --
+    so the useful sentence is two levels down.
+    """
+    raw = event.get("message")
+    if raw is None and isinstance(event.get("error"), dict):
+        raw = event["error"].get("message")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        inner = json.loads(raw)
+    except ValueError:
+        return raw.strip()
+    if isinstance(inner, dict):
+        nested = inner.get("error")
+        found = nested.get("message") if isinstance(nested, dict) else inner.get("message")
+        if isinstance(found, str) and found:
+            return found
+    return raw.strip()
+
+
+def _failure_in(lines: list[str]) -> str | None:
+    """The last failure reason in a finished run's JSONL, if any."""
+    found: str | None = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") in ("error", "turn.failed"):
+            found = _failure_of(event) or found
+    return found
 
 
 def _usage_from_codex(usage: dict[str, Any] | None) -> Usage | None:

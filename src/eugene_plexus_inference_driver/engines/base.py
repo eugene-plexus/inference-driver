@@ -32,6 +32,7 @@ from .._generated.models import (
     EmbedResponse,
     GenerateRequest,
     GenerateResponse,
+    StreamProgress,
     ToolCallDelta,
 )
 
@@ -126,6 +127,12 @@ class Chunk:
     fragments, never two of them -- upstream sends them in separate
     deltas and combining them here would invent a shape no backend
     produces."""
+    progress: StreamProgress | None = None
+    """What the backend is doing while it produces no output -- reading
+    the prompt, holding the request, running one of its own tools. NOT
+    output: yielded only when the request set `reportProgress`, framed
+    as `event: progress`, and never the commit point one layer up. A
+    frame carrying it carries nothing else."""
     done: bool = False
     result: GenerateResponse | None = None
 

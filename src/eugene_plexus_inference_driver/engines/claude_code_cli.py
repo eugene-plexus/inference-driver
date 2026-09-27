@@ -47,6 +47,8 @@ from .._generated.models import (
     GenerateRequest,
     GenerateResponse,
     Role,
+    Stage,
+    StreamProgress,
     Usage,
 )
 from ._prompt import messages_to_prompt, text_content
@@ -292,7 +294,10 @@ class ClaudeCodeCliEngine:
 
         started = time.perf_counter()
         emitted: list[str] = []
+        thoughts: list[str] = []
         envelope: dict[str, Any] | None = None
+        report = bool(request.reportProgress)
+        show_reasoning = self._thinking_mode != "off"
 
         async for line in stream_cli_lines(
             argv,
@@ -314,15 +319,45 @@ class ClaudeCodeCliEngine:
             if kind == "result":
                 envelope = event
                 continue
+            if kind == "system":
+                # `init` when the CLI is up, `status: requesting` each
+                # time it sends the conversation to Anthropic -- again
+                # after every tool it runs. Captured from 2.1.207.
+                if report and event.get("subtype") in ("init", "status"):
+                    yield Chunk(progress=StreamProgress(stage=Stage.working))
+                continue
             if kind != "stream_event":
                 continue
             inner = event.get("event") or {}
+            if inner.get("type") == "content_block_start":
+                block = inner.get("content_block") or {}
+                if report and block.get("type") == "tool_use":
+                    # The agent starting one of its own tools: the thing
+                    # it can spend a minute on before it writes a word.
+                    # The name only; the arguments are the operator's
+                    # files and commands and are not carried.
+                    name = block.get("name")
+                    yield Chunk(
+                        progress=StreamProgress(
+                            stage=Stage.tool, tool=name if isinstance(name, str) else None
+                        )
+                    )
+                continue
             if inner.get("type") != "content_block_delta":
                 continue
             delta = inner.get("delta") or {}
-            # Only text. `thinking_delta` and `signature_delta` are the
-            # reasoning block and its attestation, neither of which is
-            # the answer.
+            if delta.get("type") == "thinking_delta":
+                # Claude's own reasoning, on its own channel -- forwarded
+                # as reasoning, as the HTTP engine forwards llama.cpp's.
+                # Until 2026-09-27 it was read past, so a Claude that
+                # thought for a minute showed nothing for that minute.
+                thought = delta.get("thinking")
+                if show_reasoning and isinstance(thought, str) and thought:
+                    thoughts.append(thought)
+                    yield Chunk(reasoning=thought)
+                continue
+            # Otherwise only text. `signature_delta` is the reasoning
+            # block's attestation, which is not the answer either.
             if delta.get("type") != "text_delta":
                 continue
             text = delta.get("text")
@@ -349,6 +384,7 @@ class ClaudeCodeCliEngine:
             done=True,
             result=GenerateResponse(
                 content=content,
+                reasoning="".join(thoughts) or None,
                 finishReason=_STOP_REASON_MAP.get(
                     str(envelope.get("stop_reason") or ""), FinishReason.stop
                 ),

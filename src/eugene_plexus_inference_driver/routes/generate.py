@@ -74,6 +74,12 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     That is the same rule the gateway applies one layer up, where it has
     sharper teeth: there, a failure before the first token can still
     cascade to another backend, and after it cannot.
+
+    **With `reportProgress` the first frame can be progress**, so the 200
+    commits while the backend is still reading the prompt and a failure
+    after that is an `event: error` frame. The gateway cascades on that
+    frame exactly as on a status code, because progress is not output --
+    which is why the caller has to ask for it.
     """
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
@@ -321,6 +327,12 @@ def _frame(chunk: Any) -> str:
         result = getattr(chunk, "result", None)
         payload = result.model_dump(exclude_none=True, mode="json") if result else {}
         return f"event: done\ndata: {json.dumps(payload)}\n\n"
+    # Not a token at all: what the backend is doing while it produces
+    # nothing. Its own event name, so a consumer that counts tokens, or
+    # takes the first one as the commit point, cannot mistake it for one.
+    progress = getattr(chunk, "progress", None)
+    if progress is not None:
+        return f"event: progress\ndata: {progress.model_dump_json(exclude_none=True)}\n\n"
     # A token frame carries text, reasoning or tool-call fragments, one
     # kind only: upstream sends them in separate deltas, and merging them
     # here would invent a shape no backend produces and no client expects.
