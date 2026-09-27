@@ -110,6 +110,10 @@ _CONTEXT_PROBE_TIMEOUT = httpx.Timeout(_CONTEXT_PROBE_BUDGET_SECONDS, connect=2.
 # comment for a signal that only needs to say "still there".
 _KEEPALIVE_PROGRESS_SECONDS = 2.0
 
+# The answers that mean "this server has no such endpoint", as opposed to
+# "not now". Only these settle that a backend is not `llama-server`.
+_NO_SUCH_PATH = frozenset({404, 405, 410, 501})
+
 
 def _only_or_named(
     entries: list[dict[str, Any]], model_id: str, *, keys: tuple[str, ...]
@@ -1468,9 +1472,16 @@ class OpenAiCompatibleHttpEngine:
         response = await client.get(
             "/props", headers=self._headers(), timeout=_CONTEXT_PROBE_TIMEOUT
         )
-        if response.status_code >= 400:
+        if response.status_code in _NO_SUCH_PATH:
             # A definite no: whatever this is, it has no `/props`.
             self._llama_cpp = False
+            return None
+        if response.status_code >= 400:
+            # **Not a no.** llama-server answers 503 while it is still
+            # loading its model, and the companion driver starts before
+            # that is done -- so this was the FIRST thing a fresh driver
+            # heard, and caching it as "not llama.cpp" switched progress
+            # off for the life of the engine. Found by the live run.
             return None
         props = response.json()
         if not isinstance(props, dict):

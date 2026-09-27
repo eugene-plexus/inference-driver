@@ -192,6 +192,27 @@ async def test_a_backend_that_cannot_be_asked_is_not_sent_the_flag() -> None:
 
 
 @respx.mock
+async def test_a_llamacpp_still_loading_is_asked_again() -> None:
+    # Found by the live run: llama-server answers /props with 503 while it
+    # loads, which is exactly when a companion driver first asks. That is
+    # "not yet", not "not llama.cpp".
+    props = respx.get(f"{BASE}/props")
+    props.side_effect = [
+        httpx.Response(503, json={"error": {"message": "Loading model"}}),
+        httpx.Response(200, json={"default_generation_settings": {"n_ctx": 8192}}),
+    ]
+    # The context probe tries vLLM's and Ollama's endpoints on a miss.
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(503))
+    respx.get(f"{BASE}/api/ps").mock(return_value=httpx.Response(404))
+    chat = respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_SSE))
+    engine = _engine()
+    assert await engine.context_window() is None
+    await _drain(engine, _ask())
+    assert _sent(chat)["return_progress"] is True
+    assert props.call_count == 2
+
+
+@respx.mock
 async def test_the_context_probe_already_answers_so_props_is_read_once() -> None:
     props = _props_llama()
     respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_SSE))
