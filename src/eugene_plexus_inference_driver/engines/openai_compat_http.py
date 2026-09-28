@@ -33,6 +33,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -64,6 +65,8 @@ from .._generated.models import (
     TranscribeRequest,
     TranscribeResponse,
     Usage,
+    VideoJob,
+    VideoRequest,
 )
 from .._http import client_for
 from ..audio_out import AudioAssembly
@@ -85,6 +88,8 @@ from ..speech import (
     streaming_wav_header,
 )
 from ..transcription import response_from
+from ..videos_out import VideoRefusal
+from ..videos_out import job_from as video_job_from
 from ._catalogue import (
     _LIST_TIMEOUT,
     _SHOW_CONCURRENCY,
@@ -98,6 +103,7 @@ from ._catalogue import (
     ollama_entry,
     upstream_words,
     with_openrouter_images,
+    with_openrouter_videos,
 )
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
@@ -983,6 +989,17 @@ class OpenAiCompatibleHttpEngine:
                 )
             else:
                 models = with_openrouter_images(models, images)
+            # P5: the video settings too, and supplementary in the same way.
+            try:
+                videos = await read("/v1/videos/models")
+            except (CatalogueError, httpx.HTTPError) as e:
+                log.warning(
+                    "OpenRouter's video model list could not be read (%s); video models are "
+                    "served without their listed settings until the next refresh",
+                    e,
+                )
+            else:
+                models = with_openrouter_videos(models, videos)
             return [self._with_fixed_temperature(m) for m in models]
         if source == "ollama":
             body = await read("/api/tags")
@@ -2086,6 +2103,136 @@ class OpenAiCompatibleHttpEngine:
             )
         except ValueError as e:
             raise CliError(f"openai_compat_http image stream ended badly: {e}") from e
+
+    def _video_source(self) -> None:
+        """Only OpenRouter makes videos here: OpenAI's video API shut down on
+        2026-09-24 (measured), and no other provider speaks a video shape."""
+        if self._catalogue_source != "openrouter":
+            raise VideoRefusal(
+                "This backend makes no videos: only an OpenRouter account does (OpenAI's own "
+                "video API shut down on 2026-09-24)."
+            )
+
+    async def video(self, request: VideoRequest, first_frame: bytes | None) -> VideoJob:
+        """Submit one video job to OpenRouter, in its own shape (P5).
+
+        `duration` is an integer and `size` one the model lists (another is
+        its 400, measured); the first frame is `frame_images` with
+        `frame_type: first_frame`. The answer is the job, `pending`.
+        """
+        self._video_source()
+        target = self.resolve_model(request.model)
+        if target.entry is not None and "video" not in (target.entry.surfaces or []):
+            raise VideoRefusal(
+                f"{target.id!r} makes no videos; choose a model with the video surface"
+            )
+        caps = (
+            target.entry.capabilities.video if target.entry and target.entry.capabilities else None
+        )
+        if (
+            request.firstFrame is not None
+            and first_frame is not None
+            and (caps is None or not caps.firstFrame)
+        ):
+            raise VideoRefusal(
+                f"input_reference: {target.id!r} takes no first frame, so the image would be "
+                "ignored"
+            )
+        payload: dict[str, Any] = {"model": target.upstream, "prompt": request.prompt}
+        if request.seconds is not None:
+            payload["duration"] = request.seconds
+        if request.size is not None:
+            payload["size"] = request.size
+        frame = request.firstFrame
+        if frame is not None:
+            payload["frame_images"] = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{frame.mediaType};base64,{frame.data}"},
+                    "frame_type": "first_frame",
+                }
+            ]
+        client = self._client()
+        try:
+            response = await client.post(
+                "/v1/videos",
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                json=payload,
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the video submit") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http video submit failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for a video submit: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+            )
+        try:
+            return video_job_from(response.json(), model_id=target.id)
+        except (ValueError, AttributeError) as e:
+            raise CliError(f"openai_compat_http video submit answer was not usable: {e}") from e
+
+    async def video_job(self, job_id: str) -> VideoJob:
+        """Poll one job. An unknown job is the backend's 404, relayed as one."""
+        self._video_source()
+        client = self._client()
+        try:
+            response = await client.get(
+                f"/v1/videos/{quote(job_id, safe='')}",
+                headers=self._headers(),
+                timeout=_LIST_TIMEOUT,
+            )
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http video poll failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for a video poll: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+            )
+        try:
+            return video_job_from(response.json(), model_id=None)
+        except (ValueError, AttributeError) as e:
+            raise CliError(f"openai_compat_http video poll answer was not usable: {e}") from e
+
+    async def video_content(self, job_id: str) -> AsyncGenerator[bytes, None]:
+        """A finished job's MP4, streamed as OpenRouter sends it (chunked, no
+        length; `Range` is ignored, measured). A refusal raises before any
+        byte is yielded."""
+        self._video_source()
+        client = self._client()
+        try:
+            async with client.stream(
+                "GET",
+                f"/v1/videos/{quote(job_id, safe='')}/content",
+                params={"index": 0},
+                headers={**self._headers(), "Accept": "video/mp4"},
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise CliError(
+                        f"openai_compat_http returned {response.status_code} for a video's "
+                        "content: "
+                        f"{_redact(body.decode('utf-8', 'replace')[:500])}",
+                        upstream_status=response.status_code,
+                    )
+                async for chunk in response.aiter_raw():
+                    if chunk:
+                        yield chunk
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the video download") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http video download failed: {e!r}") from e
 
     async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
         """`POST /v1/embeddings` upstream, in the shape OpenAI defined.

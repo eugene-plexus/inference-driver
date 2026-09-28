@@ -32,7 +32,7 @@ def test_a_chunked_body_past_the_limit_is_refused(
 
 #: Paths with a larger limit of their own (P3b's audio, P4's images): bounded
 #: all the same, which is what a missing row would lose.
-OWN_LIMIT = ["/v1/transcribe", "/v1/image", "/v1/image/stream"]
+OWN_LIMIT = ["/v1/transcribe", "/v1/image", "/v1/image/stream", "/v1/video"]
 
 
 @pytest.mark.parametrize("path", BOUNDED + OWN_LIMIT)

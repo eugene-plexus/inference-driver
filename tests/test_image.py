@@ -126,6 +126,9 @@ def _ready(client: TestClient) -> dict[str, Any]:
 def _openrouter(tmp_path: Path) -> TestClient:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
     respx.get(f"{OPENROUTER}/v1/images/models").mock(return_value=httpx.Response(200, json=IMAGES))
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     app = create_app(settings=Settings(config_file=_config(tmp_path, provider="openrouter")))
     client = TestClient(app)
     return client
@@ -564,6 +567,9 @@ def test_an_unreadable_images_listing_leaves_the_account_serving(tmp_path: Path)
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(404, text="Not Found")
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
     )
     app = create_app(settings=Settings(config_file=_config(tmp_path, provider="openrouter")))
     with TestClient(app) as client:

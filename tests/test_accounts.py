@@ -116,6 +116,9 @@ def test_an_openrouter_account_lists_its_models_not_one(openrouter_config: Path)
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
         info = _wait_for_catalogue(client)
 
@@ -163,6 +166,9 @@ def test_models_false_leaves_the_list_out(openrouter_config: Path) -> None:
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
         _wait_for_catalogue(client)
         light = client.get("/v1/info", params={"models": "false"}).json()
@@ -182,6 +188,9 @@ def test_each_request_reaches_the_backend_as_the_model_it_named(openrouter_confi
         return_value=httpx.Response(200, json=OPENROUTER_LIST)
     )
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     sent: list[str] = []
@@ -219,6 +228,9 @@ def test_a_model_the_account_does_not_list_is_404_and_reaches_nothing(
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     chat = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion("x"))
     )
@@ -252,6 +264,9 @@ def test_a_speech_model_refuses_chat_with_what_it_is(openrouter_config: Path) ->
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     chat = respx.post(f"{OPENROUTER}/v1/chat/completions")
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
         _wait_for_catalogue(client)
@@ -270,6 +285,9 @@ def test_tools_go_only_to_a_model_whose_listing_takes_them(openrouter_config: Pa
         return_value=httpx.Response(200, json=OPENROUTER_LIST)
     )
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     chat = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
@@ -313,6 +331,9 @@ def test_an_explicit_setting_the_model_does_not_list_is_refused_not_dropped(
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     chat = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion("openai/gpt-oss-20b"))
     )
@@ -350,6 +371,9 @@ def test_patterns_apply_live_without_a_restart(openrouter_config: Path) -> None:
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion("mistralai/mistral-nemo"))
     )
@@ -380,6 +404,9 @@ def test_a_failed_read_keeps_the_last_good_list_and_says_why(
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
         _wait_for_catalogue(client)
         engine = client.app.state.adapter
@@ -402,6 +429,9 @@ def test_a_restart_with_the_upstream_down_still_serves_the_saved_list(
         return_value=httpx.Response(200, json=OPENROUTER_LIST)
     )
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
@@ -432,6 +462,9 @@ def test_a_saved_list_from_another_backend_is_not_served(tmp_path: Path) -> None
     )
     respx.get(f"{OPENROUTER}/v1/models/user").mock(side_effect=httpx.ConnectError("down"))
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     with TestClient(create_app(settings=Settings(config_file=config))) as client:
@@ -515,6 +548,9 @@ def test_the_config_test_of_an_account_reads_its_list(openrouter_config: Path) -
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     chat = respx.post(f"{OPENROUTER}/v1/chat/completions")
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
         result = client.post("/v1/config/test").json()
@@ -591,6 +627,9 @@ def test_info_for_one_model_answers_that_entry_alone(openrouter_config: Path) ->
         return_value=httpx.Response(200, json=OPENROUTER_LIST)
     )
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:

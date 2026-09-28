@@ -86,6 +86,9 @@ def _openrouter(tmp_path: Path, answer: httpx.Response) -> tuple[TestClient, res
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     route = respx.post(f"{OPENROUTER}/v1/audio/transcriptions").mock(return_value=answer)
     app = create_app(settings=Settings(config_file=_config(tmp_path, provider="openrouter")))
     return TestClient(app), route

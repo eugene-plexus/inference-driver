@@ -49,6 +49,7 @@ from .._generated.models import Capabilities, DriverCatalogue, DriverModel
 from .._private_files import write_private_text
 from ..images_out import openai_caps, openrouter_caps
 from ..speech import ALL_FORMATS, OPENROUTER_FORMATS
+from ..videos_out import openrouter_caps as openrouter_video_caps
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +251,49 @@ def with_openrouter_images(models: list[DriverModel], body: Any) -> list[DriverM
     return models
 
 
+def with_openrouter_videos(models: list[DriverModel], body: Any) -> list[DriverModel]:
+    """OpenRouter's `GET /videos/models` laid over its account listing (P5),
+    as `with_openrouter_images` does for images: authoritative for the
+    `video` surface, and the only source of what each video model takes."""
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        raise CatalogueError("OpenRouter's video model list had no `data` array")
+    listed = {
+        entry["id"]: entry
+        for entry in data
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
+    for model in models:
+        entry = listed.get(model.id)
+        surfaces = [s for s in model.surfaces if s != "video"]
+        if entry is not None:
+            surfaces.append("video")
+            if model.capabilities is None:
+                model.capabilities = Capabilities()
+            model.capabilities.video = openrouter_video_caps(entry)
+        elif model.capabilities is not None:
+            model.capabilities.video = None
+        model.surfaces = surfaces
+    return models
+
+
+def shut_down(entry: dict[str, Any], today: _dt.date | None = None) -> bool:
+    """Whether OpenAI's list says this model's `shutdown_date` has passed.
+
+    OpenAI's `/v1/models` carries the date (56 of 134 on the account Troy
+    added, measured 2026-09-28), and a model past it serves nothing: `sora-2`
+    said 2026-09-24 and `/v1/videos` answered an empty 404.
+    """
+    raw = entry.get("shutdown_date")
+    if not isinstance(raw, str):
+        return False
+    try:
+        when = _dt.date.fromisoformat(raw[:10])
+    except ValueError:
+        return False
+    return when < (today or _dt.datetime.now(_dt.UTC).date())
+
+
 def ollama_entry(name: str, show: dict[str, Any] | None, defaults: EngineDefaults) -> DriverModel:
     """One pulled model. `capabilities` is on `/api/show` from Ollama 0.6;
     an older Ollama, or a failed show, inherits the driver's own answer."""
@@ -351,6 +395,8 @@ def from_openai_list(
     models: list[DriverModel] = []
     for entry in data:
         if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        if shut_down(entry):
             continue
         surfaces = classify(entry["id"]) if classify is not None else None
         model = _inherited(entry["id"], defaults, surfaces=surfaces)

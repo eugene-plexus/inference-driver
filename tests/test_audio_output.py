@@ -117,6 +117,9 @@ def _serve(account: Path, upstream: httpx.Response) -> tuple[TestClient, respx.R
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     route = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(return_value=upstream)
     return TestClient(create_app(settings=Settings(config_file=account))), route
 

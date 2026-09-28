@@ -112,6 +112,9 @@ def _openrouter(tmp_path: Path, upstream: httpx.Response):
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     route = respx.post(f"{OPENROUTER}/v1/audio/speech").mock(return_value=upstream)
     return TestClient(
         create_app(settings=Settings(config_file=_config(tmp_path, provider="openrouter")))

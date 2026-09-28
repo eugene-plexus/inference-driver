@@ -123,6 +123,9 @@ def test_the_part_reaches_the_backend_exactly_as_sent(account: Path, part: dict)
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion())
     )
@@ -143,6 +146,9 @@ def test_a_model_whose_listing_does_not_take_it_is_never_sent_it(
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion())
     )
@@ -160,6 +166,9 @@ def test_bare_base64_is_carried_as_the_data_url_openrouter_requires(account: Pat
     content*, while OpenAI's schema calls the field base64."""
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
@@ -199,6 +208,9 @@ def test_a_bad_attachment_is_refused_before_any_network(
 ) -> None:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions")
@@ -259,6 +271,9 @@ def test_a_cli_backend_refuses_audio_rather_than_flattening_it(app, stream) -> N
 def test_a_backend_echo_of_the_audio_is_not_exposed(account: Path) -> None:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
     respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
     body = ask(audio_part(), model="google/gemini-2.5-flash-lite")
