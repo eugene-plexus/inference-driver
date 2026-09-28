@@ -1,4 +1,5 @@
-"""POST /v1/transcribe: audio in, text out (P3b, 2026-09-28)."""
+"""POST /v1/transcribe: audio in, text out (P3b, 2026-09-28), and in
+English whatever was spoken with `translate` (P3-4)."""
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import CliError
 from ..failures import request_id
 from ..locality import enforce
+from ..transcription import TranscriptionRefusal
 from .generate import _backend_error, _client_gone, _not_configured, _resolve_model
 
 router = APIRouter(tags=["inference"])
@@ -37,14 +39,18 @@ def _refused(title: str, detail: str, kind: str, *, code: int = 400) -> HTTPExce
     )
 
 
-async def transcribes(engine: Any, surfaces: list[str] | None) -> bool:
-    """Whether this driver's backend transcribes this model: an account's
-    catalogue says per model; a single `llama-server` answers only with a
-    projector that hears (measured), which `/props` reports."""
+async def transcribes(engine: Any, surfaces: list[str] | None, *, translate: bool = False) -> bool:
+    """Whether this driver's backend transcribes this model -- or, with
+    `translate`, translates it: an account's catalogue says per model; a
+    single `llama-server` transcribes only with a projector that hears
+    (measured), which `/props` reports, and never translates (its
+    `/v1/audio/translations` is a 404, measured)."""
     if getattr(engine, "transcribe", None) is None:
         return False
     if surfaces is not None:
-        return "transcription" in surfaces
+        return ("translation" if translate else "transcription") in surfaces
+    if translate:
+        return False
     probe = getattr(engine, "probe_audio_input", None)
     try:
         return bool(probe is not None and await probe() is True)
@@ -56,8 +62,9 @@ async def transcribes(engine: Any, surfaces: list[str] | None) -> bool:
 async def transcribe(request: Request, body: TranscribeRequest) -> TranscribeResponse:
     """The transcript, from whichever backend this driver fronts.
 
-    **Refused, never guessed at**: a backend that does not transcribe gets
-    a 400 naming itself before any audio is sent.
+    **Refused, never guessed at**: a backend that does not transcribe (or,
+    for `translate`, translate) gets a 400 naming itself before any audio
+    is sent.
     """
     engine: Any = request.app.state.adapter
     if engine is None:
@@ -65,13 +72,30 @@ async def transcribe(request: Request, body: TranscribeRequest) -> TranscribeRes
     entry = _resolve_model(engine, body.model)
     enforce(engine, body.localOnly)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
-    if not await transcribes(engine, entry.surfaces if entry is not None else None):
+    surfaces = entry.surfaces if entry is not None else None
+    if body.translate and not await transcribes(engine, surfaces, translate=True):
+        raise _refused(
+            "This backend does not translate",
+            f"This driver's backend ({kind_label}) does not translate this model, so no audio "
+            "was sent. Only OpenAI's whisper models translate; GET /v1/info reports each "
+            "model's surfaces.",
+            "translation-unsupported",
+        )
+    if not body.translate and not await transcribes(engine, surfaces):
         raise _refused(
             "This backend does not transcribe",
             f"This driver's backend ({kind_label}) does not transcribe this model, so no audio "
             "was sent. GET /v1/info reports each model's surfaces; a llama-server "
             "transcribes only with a projector that hears.",
             "transcription-unsupported",
+        )
+    if body.translate and (body.language or body.timestampGranularities):
+        field = "language" if body.language else "timestampGranularities"
+        raise _refused(
+            "Not a translation setting",
+            f"{field}: a translation takes neither a language (the text is English) nor "
+            "timestamp granularities, as OpenAI's does not.",
+            "bad-request",
         )
     try:
         audio = base64.b64decode(body.audio.data, validate=True)
@@ -100,6 +124,10 @@ async def transcribe(request: Request, body: TranscribeRequest) -> TranscribeRes
         return answer
     except ClientGone as e:
         raise _client_gone() from e
+    except TranscriptionRefusal as e:
+        raise _refused(
+            "Transcription request refused", f"{e}. No audio was sent.", "transcription-refused"
+        ) from None
     except CliError as e:
         log.warning("transcription failed: %s", e)
         raise _backend_error(e, kind_label) from e

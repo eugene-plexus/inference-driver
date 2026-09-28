@@ -239,6 +239,13 @@ def _eleven(
     route = respx.post(url__regex=rf"{ELEVEN}/v1/text-to-speech/.*/stream").mock(
         return_value=upstream or _audio(MP3)
     )
+    # A speech-only key (P3-1's listing is tested in test_transcription.py):
+    # speech-to-text is named, and this key may not use it.
+    respx.post(f"{ELEVEN}/v1/speech-to-text").mock(
+        return_value=httpx.Response(
+            401, json={"detail": {"message": "missing the permission speech_to_text"}}
+        )
+    )
     config = _config(tmp_path, provider="elevenlabs")
     return TestClient(create_app(settings=Settings(config_file=config))), route
 

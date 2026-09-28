@@ -12,6 +12,12 @@ from typing import Any
 
 from ._generated.models import TranscribeResponse, TranscriptionUsage
 
+
+class TranscriptionRefusal(ValueError):
+    """A transcription this driver refuses before any audio leaves: a
+    setting the backend would silently drop, or one it cannot make."""
+
+
 #: `llama-server` b11235 with Qwen3-ASR answers `"language English<asr_text>The
 #: quick brown fox..."` (measured 2026-09-28). The same model on OpenRouter
 #: answers the text alone, so the prefix is llama.cpp not parsing the model's

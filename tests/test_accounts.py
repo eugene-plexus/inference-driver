@@ -609,7 +609,10 @@ def test_openais_own_list_is_sorted_by_surface_not_filtered() -> None:
     assert classify_openai_model("o3-mini") == ["chat"]
     assert classify_openai_model("text-embedding-3-large") == ["embeddings"]
     assert classify_openai_model("tts-1-hd") == ["speech"]
-    assert classify_openai_model("whisper-1") == ["transcription"]
+    # Only whisper translates (P3-4): OpenAI answers /audio/translations 404
+    # for its gpt-4o transcribe models (measured).
+    assert classify_openai_model("whisper-1") == ["transcription", "translation"]
+    assert classify_openai_model("gpt-4o-mini-transcribe") == ["transcription"]
     assert classify_openai_model("gpt-image-1") == ["image"]
     assert classify_openai_model("chatgpt-image-latest") == ["image"]
     assert classify_openai_model("omni-moderation-latest") == ["moderation"]

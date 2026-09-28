@@ -1,11 +1,11 @@
-"""ElevenLabs' own API, for speech (P3a, 2026-09-28).
+"""ElevenLabs' own API, for speech (P3a) and transcription (P3-1), 2026-09-28.
 
 Nothing about ElevenLabs is OpenAI-shaped (design §0.4): the key rides in
 `xi-api-key`, the voice is in the path, the output format is a query
 parameter, and the body is `text`, `model_id` and `voice_settings`. This
-engine is the translation behind `POST /v1/speak`, so the gateway's
-`/v1/audio/speech` -- and the OpenAI SDK pointed at it -- speaks through
-ElevenLabs unchanged.
+engine is the translation behind `POST /v1/speak` and `POST /v1/transcribe`,
+so the gateway's `/v1/audio/speech` and `/v1/audio/transcriptions` -- and the
+OpenAI SDK pointed at them -- work through ElevenLabs unchanged.
 
 **An account, and it needs `models_read` (call P3-2).** The models are the
 account's own list (`GET /v1/models`, the ones that can do text to speech).
@@ -15,14 +15,19 @@ a message naming it (measured), which is the sentence an operator needs.
 Voices are read from `GET /v1/voices` when `voices_read` allows and are
 passed through either way (P3-3).
 
-Speech only: no chat, no embeddings, no transcription (P3-1 defers
-ElevenLabs' speech-to-text).
+**Its speech-to-text models are listed nowhere but its own refusal** (P3-1):
+see `_transcription_models`. They are offered only to a key that may use
+them, as P3-2 offers speech models only to a key that may list them.
+
+No chat, no embeddings, and no translation: ElevenLabs transcribes in the
+language spoken.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -44,10 +49,15 @@ from .._generated.models import (
     GenerateResponse,
     SpeakRequest,
     SpeechFormat,
+    TimestampGranularity,
+    TranscribeRequest,
+    TranscribeResponse,
+    TranscriptionUsage,
 )
 from .._http import client_for
 from ..failures import retry_after
 from ..speech import ELEVENLABS_FORMATS, SpeechRefusal, refuse_format, streaming_wav_header
+from ..transcription import TranscriptionRefusal
 from ._catalogue import Catalogue, CatalogueError, upstream_words
 from ._subprocess import BackendTimeout, CliError
 from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, ModelNotServed, ModelRequired
@@ -65,6 +75,40 @@ _OUTPUT_FORMATS: dict[SpeechFormat, str] = {
 
 _LIST_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
+#: A model id ElevenLabs does not have, sent to hear it name the ones it does.
+_LIST_PROBE_MODEL = "eugene-plexus-lists-models"
+
+#: `'x' is not a valid model_id. Available models: 'scribe_v1', 'scribe_v2'`
+#: (measured 2026-09-28): the list is the quoted ids after the colon.
+_AVAILABLE = re.compile(r"Available models:(.*)\Z", re.DOTALL)
+_QUOTED = re.compile(r"'([^']+)'")
+
+
+def _named_models(response: httpx.Response) -> list[str]:
+    """The model ids ElevenLabs names when it refuses an unknown one."""
+    if response.status_code != 400:
+        return []
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return []
+    if not isinstance(detail, dict) or detail.get("code") != "unsupported_model":
+        return []
+    match = _AVAILABLE.search(str(detail.get("message") or ""))
+    return _QUOTED.findall(match.group(1)) if match else []
+
+
+def _refused_as_empty(response: httpx.Response) -> bool:
+    """Whether ElevenLabs refused a probe for its empty file, which it does
+    only after the key's permission passed (measured)."""
+    if response.status_code != 400:
+        return False
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(detail, dict) and detail.get("status") == "empty_file"
+
 
 @dataclass(frozen=True)
 class _Resolved:
@@ -72,7 +116,7 @@ class _Resolved:
 
 
 class ElevenLabsHttpEngine:
-    """Speech through ElevenLabs' text-to-speech route."""
+    """Speech and transcription through ElevenLabs' own routes."""
 
     backend_kind = BackendKind.elevenlabs_http
     chat_capable = False
@@ -107,6 +151,9 @@ class ElevenLabsHttpEngine:
         )
         #: Said once: a key that cannot list voices still speaks.
         self._voices_note_logged = False
+        #: Said once, and again after it recovers: why no transcription
+        #: model is offered.
+        self._transcription_note: str | None = None
 
     # -- construction -------------------------------------------------------
 
@@ -238,7 +285,75 @@ class ElevenLabsHttpEngine:
                     ),
                 )
             )
-        return models
+        try:
+            heard = await self._transcription_models()
+        except Exception as e:  # a supplementary list never costs the speech models
+            heard = self._no_transcription(f"its speech-to-text could not be read ({e!r})")
+        return models + heard
+
+    async def _transcription_models(self) -> list[DriverModel]:
+        """ElevenLabs' speech-to-text models, when this key may use them.
+
+        **Nothing lists them** (measured 2026-09-28): `/v1/models` holds the
+        text-to-speech models alone. What names them is ElevenLabs' refusal
+        of a model it does not know -- *"Available models: 'scribe_v1', ...,
+        'scribe_v2'"* -- given before any audio, at no cost, and even to a
+        wrong key, so it is ElevenLabs' list rather than this account's.
+
+        **The key is then asked with an empty file**: refused as empty when
+        it may transcribe, 401 naming `speech_to_text` when it may not
+        (measured). As P3-2 offers a speech model only to a key that can list
+        them, a transcription model is offered only to one that can use it.
+
+        **A failure here never costs the speech models**: it is said once,
+        and the list goes on without transcription.
+        """
+        client = self._client()
+        headers = self._headers()
+        try:
+            listed = await client.post(
+                "/v1/speech-to-text",
+                headers=headers,
+                data={"model_id": _LIST_PROBE_MODEL},
+                timeout=_LIST_TIMEOUT,
+            )
+            ids = _named_models(listed)
+            if not ids:
+                return self._no_transcription(
+                    f"ElevenLabs did not name its speech-to-text models "
+                    f"({listed.status_code}: {upstream_words(listed)})"
+                )
+            allowed = await client.post(
+                "/v1/speech-to-text",
+                headers=headers,
+                data={"model_id": ids[0]},
+                files={"file": ("empty.mp3", b"", "audio/mpeg")},
+                timeout=_LIST_TIMEOUT,
+            )
+        except httpx.HTTPError as e:
+            return self._no_transcription(f"ElevenLabs' speech-to-text could not be asked ({e!r})")
+        if not _refused_as_empty(allowed):
+            return self._no_transcription(
+                f"this key may not use ElevenLabs' speech-to-text ({allowed.status_code}: "
+                f"{upstream_words(allowed)}); give it the speech_to_text permission"
+            )
+        if self._transcription_note is not None:
+            log.info("ElevenLabs' speech-to-text models are offered again")
+        self._transcription_note = None
+        return [
+            DriverModel(
+                id=model_id,
+                surfaces=["transcription"],
+                capabilities=Capabilities(supportedSettings=[]),
+            )
+            for model_id in ids
+        ]
+
+    def _no_transcription(self, reason: str) -> list[DriverModel]:
+        if reason != self._transcription_note:
+            log.warning("No ElevenLabs transcription model is offered: %s.", reason)
+        self._transcription_note = reason
+        return []
 
     async def _voices(self) -> list[str] | None:
         """The account's voice ids, or None when the key cannot list them.
@@ -271,15 +386,24 @@ class ElevenLabsHttpEngine:
 
     def resolve_model(self, requested: str | None) -> _Resolved:
         """The shape the routes' model check reads, so a chat request naming
-        one of these models is told it answers speech, not a 404."""
-        return _Resolved(self.resolve_speech(requested))
+        one of these models is told what it answers, not a 404."""
+        return _Resolved(self._resolve(requested))
 
-    def resolve_speech(self, requested: str | None) -> DriverModel:
+    def _resolve(self, requested: str | None) -> DriverModel:
         if not requested:
             raise ModelRequired("name one of this ElevenLabs account's models")
         entry = self.catalogue.find(requested)
         if entry is None:
             raise ModelNotServed(requested, served=len(self.catalogue.exposed()))
+        return entry
+
+    def resolve_speech(self, requested: str | None) -> DriverModel:
+        entry = self._resolve(requested)
+        if "speech" not in entry.surfaces:
+            raise SpeechRefusal(
+                f"model: {entry.id} transcribes and does not speak; name one of this "
+                "account's speech models"
+            )
         return entry
 
     # -- speech ---------------------------------------------------------------
@@ -339,17 +463,115 @@ class ElevenLabsHttpEngine:
             time.perf_counter() - started,
         )
 
+    # -- transcription --------------------------------------------------------
+
+    async def transcribe(self, request: TranscribeRequest, audio: bytes) -> TranscribeResponse:
+        """ElevenLabs' `/v1/speech-to-text`, answered in OpenAI's words (P3-1).
+
+        **Asked for no audio-event tags**: its default puts *(laughter)* in
+        the text, which no OpenAI transcript carries. **A `prompt` is
+        refused**: ElevenLabs has none and ignores an unknown field
+        (measured), so sending one would drop it silently. **`segment`
+        timestamps are refused**: it makes words, not segments.
+        """
+        started = time.perf_counter()
+        entry = self._resolve(request.model)
+        if request.prompt:
+            raise TranscriptionRefusal(
+                "prompt: ElevenLabs takes no prompt and would ignore one; remove it, "
+                "or choose a model that takes one"
+            )
+        granularities = request.timestampGranularities or []
+        if TimestampGranularity.segment in granularities:
+            raise TranscriptionRefusal(
+                "timestamp_granularities: ElevenLabs makes word timestamps, not segments; "
+                "ask for word"
+            )
+        words_asked = request.verbose and TimestampGranularity.word in granularities
+        fields: dict[str, str] = {
+            "model_id": entry.id,
+            "tag_audio_events": "false",
+            "timestamps_granularity": "word" if words_asked else "none",
+        }
+        if request.language:
+            fields["language_code"] = request.language
+        if request.temperature is not None:
+            fields["temperature"] = str(request.temperature)
+        upload = (
+            request.audio.filename,
+            audio,
+            request.audio.mediaType or "application/octet-stream",
+        )
+        try:
+            response = await self._client().post(
+                "/v1/speech-to-text",
+                headers=self._headers(),
+                data=fields,
+                files={"file": upload},
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"ElevenLabs could not be reached: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise BackendTimeout(
+                f"ElevenLabs did not transcribe within {self._timeout_seconds:g}s "
+                f"({type(e).__name__}). Raise requestTimeoutSeconds on this driver.",
+                limit_seconds=self._timeout_seconds,
+            ) from e
+        except httpx.HTTPError as e:
+            raise CliError(f"ElevenLabs transcription failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"ElevenLabs returned {response.status_code} for a transcription: "
+                f"{upstream_words(response)}",
+                upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+            )
+        try:
+            body = response.json()
+            text = body["text"]
+            if not isinstance(text, str):
+                raise TypeError("text is not a string")
+        except (ValueError, KeyError, TypeError) as e:
+            raise CliError(f"ElevenLabs' transcription answer was not usable: {e}") from e
+        seconds = body.get("audio_duration_secs")
+        seconds = (
+            float(seconds)
+            if isinstance(seconds, int | float) and not isinstance(seconds, bool)
+            else None
+        )
+        language = body.get("language_code")
+        words = None
+        if words_asked:
+            # OpenAI's words are `{word, start, end}`; ElevenLabs' carry the
+            # spaces between them and audio events as entries of their own.
+            words = [
+                {"word": w["text"], "start": w.get("start"), "end": w.get("end")}
+                for w in body.get("words") or []
+                if isinstance(w, dict)
+                and w.get("type") == "word"
+                and isinstance(w.get("text"), str)
+            ]
+        return TranscribeResponse(
+            text=text,
+            language=language if isinstance(language, str) and language else None,
+            duration=seconds if request.verbose else None,
+            words=words,
+            usage=TranscriptionUsage(seconds=seconds) if seconds is not None else None,
+            modelId=entry.id,
+            latencyMs=int((time.perf_counter() - started) * 1000),
+        )
+
     # -- what this engine does not do --------------------------------------------
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
-        raise CliError("ElevenLabs serves speech only; send chat to a chat model")
+        raise CliError("ElevenLabs serves speech and transcription; send chat to a chat model")
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
-        raise CliError("ElevenLabs serves speech only; send chat to a chat model")
+        raise CliError("ElevenLabs serves speech and transcription; send chat to a chat model")
         yield  # pragma: no cover - makes this an async generator
 
     async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
-        raise CliError("ElevenLabs serves speech only; it does not embed")
+        raise CliError("ElevenLabs serves speech and transcription; it does not embed")
 
     async def context_window(self) -> int | None:
         return None

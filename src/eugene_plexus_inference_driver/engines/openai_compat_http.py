@@ -544,7 +544,11 @@ def classify_openai_model(model_id: str) -> list[str]:
         return ["moderation"]
     if lowered.startswith("tts-") or "-tts" in lowered:
         return ["speech"]
-    if lowered.startswith("whisper-") or "transcribe" in lowered:
+    # Only whisper translates: OpenAI answers `/v1/audio/translations` 404 for
+    # `gpt-4o-mini-transcribe` and `gpt-4o-transcribe` (measured 2026-09-28).
+    if lowered.startswith("whisper-"):
+        return ["transcription", "translation"]
+    if "transcribe" in lowered:
         return ["transcription"]
     # `chatgpt-image-latest` is an image model too (OpenAI's edit models;
     # on the account Troy gave, measured 2026-09-28) and filed as nothing.
@@ -1828,6 +1832,10 @@ class OpenAiCompatibleHttpEngine:
         **`response_format` is sent only for `verbose`**: `json` is every
         backend's default, and `llama-server` refuses every other value, so
         leaving it out is the one request all three answer the same way.
+
+        **`translate` asks `/v1/audio/translations` instead** (P3-4), the
+        same form without `language` or timestamps, which the route has
+        already refused with it.
         """
         started = time.perf_counter()
         target = self.resolve_model(request.model)
@@ -1842,6 +1850,7 @@ class OpenAiCompatibleHttpEngine:
             fields["temperature"] = str(request.temperature)
         if request.timestampGranularities:
             fields["timestamp_granularities[]"] = [g.value for g in request.timestampGranularities]
+        what = "translation" if request.translate else "transcription"
         upload = (
             request.audio.filename,
             audio,
@@ -1850,7 +1859,7 @@ class OpenAiCompatibleHttpEngine:
         client = self._client()
         try:
             response = await client.post(
-                "/v1/audio/transcriptions",
+                f"/v1/audio/{what}s",
                 headers={
                     **self._headers(),
                     **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
@@ -1861,12 +1870,12 @@ class OpenAiCompatibleHttpEngine:
         except httpx.ConnectTimeout as e:
             raise CliError(f"openai_compat_http could not connect: {e!r}") from e
         except httpx.TimeoutException as e:
-            raise _timed_out(e, self._timeout_seconds, "the transcription") from e
+            raise _timed_out(e, self._timeout_seconds, f"the {what}") from e
         except httpx.HTTPError as e:
-            raise CliError(f"openai_compat_http transcription failed: {e!r}") from e
+            raise CliError(f"openai_compat_http {what} failed: {e!r}") from e
         if response.status_code >= 400:
             raise CliError(
-                f"openai_compat_http returned {response.status_code} for a transcription: "
+                f"openai_compat_http returned {response.status_code} for a {what}: "
                 f"{_redact(response.text[:500])}",
                 upstream_status=response.status_code,
                 retry_after_seconds=retry_after(response.headers.get("Retry-After")),
@@ -1879,7 +1888,7 @@ class OpenAiCompatibleHttpEngine:
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
         except (ValueError, AttributeError) as e:
-            raise CliError(f"openai_compat_http transcription answer was not usable: {e}") from e
+            raise CliError(f"openai_compat_http {what} answer was not usable: {e}") from e
 
     def _image_target(self, request: ImageRequest, mask: bytes | None) -> _Target:
         """The model an image request is for, refused before any upload
