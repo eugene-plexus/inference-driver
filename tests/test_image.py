@@ -554,3 +554,22 @@ def test_the_sniffer_reads_every_format_a_backend_answers_in() -> None:
     assert sniff(b"GIF89a" + bytes(8)) == "image/gif"
     assert sniff(b'<?xml version="1.0"?><svg xmlns="x"/>') == "image/svg+xml"
     assert sniff(b"%PDF-1.7") is None
+
+
+@respx.mock
+def test_an_unreadable_images_listing_leaves_the_account_serving(tmp_path: Path) -> None:
+    """The images listing is supplementary: without it the account's chat
+    models stay routable (a first boot would otherwise serve nothing), and an
+    image-only model keeps `image` with no listed settings."""
+    respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(404, text="Not Found")
+    )
+    app = create_app(settings=Settings(config_file=_config(tmp_path, provider="openrouter")))
+    with TestClient(app) as client:
+        info = _ready(client)
+    models = {m["id"]: m for m in info["models"]}
+    assert models["mistralai/mistral-nemo"]["surfaces"] == ["chat"]
+    assert models[FLUX]["surfaces"] == ["image"]
+    assert "image" not in models[FLUX]["capabilities"]
+    assert info["catalogue"].get("error") is None

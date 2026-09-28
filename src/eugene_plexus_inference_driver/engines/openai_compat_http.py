@@ -963,11 +963,24 @@ class OpenAiCompatibleHttpEngine:
             # public 458 that output text; this is the 625 this key can
             # call (measured 2026-09-27).
             models = from_openrouter(await read("/v1/models/user?output_modalities=all"))
-            # P4: the image settings live only on the images listing. A
-            # failed read of it fails the whole refresh, so the last good
-            # list stays in force rather than every image model losing its
-            # door for an hour (R2.1).
-            models = with_openrouter_images(models, await read("/v1/images/models"))
+            # P4: the image settings live only on the images listing, and it
+            # is supplementary: a failed read of it must not unroute the
+            # account's chat models, which on a first boot, with no last good
+            # list, would leave it serving nothing (the P2 gate's fixture
+            # has no images listing, and went dark). Without it, an
+            # image-only model keeps `image` from its output modalities, with
+            # no capabilities: the backend checks its settings, and a stream
+            # or a mask, which must be confirmed, is routed nowhere.
+            try:
+                images = await read("/v1/images/models")
+            except (CatalogueError, httpx.HTTPError) as e:
+                log.warning(
+                    "OpenRouter's image model list could not be read (%s); image models are "
+                    "served without their listed settings until the next refresh",
+                    e,
+                )
+            else:
+                models = with_openrouter_images(models, images)
             return [self._with_fixed_temperature(m) for m in models]
         if source == "ollama":
             body = await read("/api/tags")
