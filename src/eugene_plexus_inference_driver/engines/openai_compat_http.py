@@ -57,7 +57,7 @@ from .._generated.models import (
 )
 from .._http import client_for
 from ..failures import request_id, retry_after
-from ..images import content_wire, has_images
+from ..images import attachment_kinds, content_wire
 from ._catalogue import (
     _LIST_TIMEOUT,
     _SHOW_CONCURRENCY,
@@ -95,6 +95,27 @@ _IMAGE_ERROR_HINT = (
     "and available context; try a smaller image or shorter conversation. "
     "Upstream body omitted to protect attachment data."
 )
+_AUDIO_ERROR_HINT = (
+    "Audio request refused by the backend. Check that the model takes audio input and "
+    "the clip's format; try a shorter clip or conversation. "
+    "Upstream body omitted to protect attachment data."
+)
+_FILE_ERROR_HINT = (
+    "File request refused by the backend. Check that the model reads PDFs; try a smaller "
+    "file or shorter conversation. Upstream body omitted to protect attachment data."
+)
+
+
+def _attachment_hint(kinds: frozenset[str]) -> str | None:
+    """What to say instead of an upstream error body that may echo an attachment."""
+    if "image" in kinds:
+        return _IMAGE_ERROR_HINT
+    if "audio" in kinds:
+        return _AUDIO_ERROR_HINT
+    if "file" in kinds:
+        return _FILE_ERROR_HINT
+    return None
+
 
 # How long a discovered context window is trusted before the backend is
 # asked again. Generous because the number only moves when an engine is
@@ -1127,7 +1148,8 @@ class OpenAiCompatibleHttpEngine:
         started = time.perf_counter()
         target = self.resolve_model(request.model)
         payload = self._payload_for(request, target)
-        image_request = has_images(request.messages)
+        hint = _attachment_hint(attachment_kinds(request.messages))
+        attachment_request = hint is not None
 
         # DEBUG-level full-payload trace. The gateway's copy-trace
         # captures what we sent it; this captures what WE send upstream
@@ -1135,7 +1157,7 @@ class OpenAiCompatibleHttpEngine:
         # post-param-shaping). When operators flip to DEBUG to chase
         # "is the LLM actually seeing what I think it's seeing", this
         # is the load-bearing log line. Auth header omitted on purpose.
-        if log.isEnabledFor(logging.DEBUG) and not image_request:
+        if log.isEnabledFor(logging.DEBUG) and not attachment_request:
             log.debug(
                 "openai_compat_http → POST %s/v1/chat/completions\n%s",
                 self._base_url,
@@ -1166,7 +1188,7 @@ class OpenAiCompatibleHttpEngine:
             raise CliError(f"openai_compat_http request failed: {e!r}") from e
 
         if response.status_code >= 400:
-            if log.isEnabledFor(logging.DEBUG) and not image_request:
+            if log.isEnabledFor(logging.DEBUG) and not attachment_request:
                 log.debug(
                     "openai_compat_http ← HTTP %d (%dms) body:\n%s",
                     response.status_code,
@@ -1180,7 +1202,7 @@ class OpenAiCompatibleHttpEngine:
             # made an exact refusal look like a broken backend.
             raise CliError(
                 f"openai_compat_http returned {response.status_code}: "
-                f"{_redact(response.text[:500]) if not image_request else _IMAGE_ERROR_HINT}",
+                f"{_redact(response.text[:500]) if hint is None else hint}",
                 upstream_status=response.status_code,
                 retry_after_seconds=retry_after(response.headers.get("Retry-After")),
             )
@@ -1190,7 +1212,7 @@ class OpenAiCompatibleHttpEngine:
         except ValueError as e:
             raise CliError("openai_compat_http returned non-JSON") from e
 
-        if log.isEnabledFor(logging.DEBUG) and not image_request:
+        if log.isEnabledFor(logging.DEBUG) and not attachment_request:
             log.debug(
                 "openai_compat_http ← HTTP %d (%dms) body:\n%s",
                 response.status_code,
@@ -1275,7 +1297,7 @@ class OpenAiCompatibleHttpEngine:
         """
         target = self.resolve_model(request.model)
         payload = self._payload_for(request, target)
-        image_request = has_images(request.messages)
+        hint = _attachment_hint(attachment_kinds(request.messages))
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
         report = bool(request.reportProgress)
@@ -1328,9 +1350,7 @@ class OpenAiCompatibleHttpEngine:
                     # still be a status code -- see the same raise in
                     # `generate`.
                     detail = (
-                        _IMAGE_ERROR_HINT
-                        if image_request
-                        else _redact(body.decode("utf-8", "replace")[:500])
+                        hint if hint is not None else _redact(body.decode("utf-8", "replace")[:500])
                     )
                     raise CliError(
                         f"openai_compat_http returned {response.status_code}: {detail}",
@@ -1576,10 +1596,16 @@ class OpenAiCompatibleHttpEngine:
         endpoint. A backend that is down or rejects the request raises
         `CliError`, as `generate` would.
         """
-        if has_images(request.messages):
+        kinds = attachment_kinds(request.messages)
+        if "image" in kinds:
             raise TokenCountUnsupported(
                 "an image's token cost is decided by the projector when it encodes the "
                 "picture, and the chat template renders only a marker for it"
+            )
+        if kinds:
+            raise TokenCountUnsupported(
+                "an attachment's token cost is decided by the encoder that reads it, and "
+                "the chat template renders only a marker for it"
             )
         if _is_openai_endpoint(self._base_url):
             raise TokenCountUnsupported("OpenAI's own API cannot count a chat prompt here")
@@ -1675,6 +1701,15 @@ class OpenAiCompatibleHttpEngine:
 
     async def probe_image_input(self) -> bool:
         """Confirm the loaded llama.cpp model without caching across restarts."""
+        return await self._probe_modality("vision")
+
+    async def probe_audio_input(self) -> bool:
+        """`llama-server`'s `/props` `modalities.audio`, for a model whose
+        projector hears (Voxtral, Qwen2.5-Omni, Gemma 3n). Same checks as
+        the image probe, so an Ollama or a hosted API reports false."""
+        return await self._probe_modality("audio")
+
+    async def _probe_modality(self, modality: str) -> bool:
         try:
             async with asyncio.timeout(2.0):
                 client = self._client()
@@ -1685,7 +1720,7 @@ class OpenAiCompatibleHttpEngine:
                 if not isinstance(props, dict):
                     return False
                 modalities = props.get("modalities")
-                if not isinstance(modalities, dict) or modalities.get("vision") is not True:
+                if not isinstance(modalities, dict) or modalities.get(modality) is not True:
                     return False
                 response = await client.get("/v1/models", headers=self._headers(), timeout=2.0)
                 if response.status_code != 200:

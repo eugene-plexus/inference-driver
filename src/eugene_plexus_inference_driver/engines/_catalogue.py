@@ -190,6 +190,8 @@ def from_openrouter(body: Any) -> list[DriverModel]:
                     supportedSettings=settings,
                     streaming="chat" in surfaces,
                     imageInput="image" in inputs,
+                    audioInput="audio" in inputs,
+                    fileInput="file" in inputs,
                     toolCalling="tools" in params,
                     maxContextTokens=context if isinstance(context, int) and context > 0 else None,
                 ),
@@ -238,8 +240,10 @@ def _inherited(
         capabilities=Capabilities(
             supportedSettings=list(defaults.supported_settings) if "chat" in served else [],
             streaming=defaults.streaming and "chat" in served,
-            # Never assumed: images route only where a listing said so.
+            # Never assumed: attachments route only where a listing said so.
             imageInput=False,
+            audioInput=False,
+            fileInput=False,
             toolCalling=defaults.tool_calling and "chat" in served,
             maxContextTokens=None,
         ),

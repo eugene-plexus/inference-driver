@@ -123,8 +123,9 @@ async def _single_model(engine: Any) -> list[DriverModel]:
     # their timeouts or let an embedding probe use the generation deadline.
     # Keep known engine policy available; unconfirmed capabilities stay
     # conservative, and cancelling a probe does not cache a false answer.
-    image_input, context_window, embeddings = await asyncio.gather(
+    image_input, audio_input, context_window, embeddings = await asyncio.gather(
         _bounded_probe(_image_input(engine), False),
+        _bounded_probe(_modality_input(engine, "audio"), False),
         _bounded_probe(_context_window(engine), None),
         _bounded_probe(_embeddings(engine), None),
     )
@@ -148,6 +149,10 @@ async def _single_model(engine: Any) -> list[DriverModel]:
             capabilities=Capabilities(
                 supportedSettings=list(getattr(engine, "supported_settings", [])),
                 imageInput=image_input,
+                audioInput=audio_input,
+                # No local engine reads a PDF part today; an account says
+                # per model from its listing instead.
+                fileInput=False,
                 # Contracted since M0 and populated since M10, when there
                 # was finally something true to say: `streaming` means
                 # "emits genuinely incremental tokens", which is False for
@@ -211,7 +216,11 @@ async def _embeddings(engine: Any) -> bool | None:
 
 
 async def _image_input(engine: Any) -> bool:
-    probe = getattr(engine, "probe_image_input", None)
+    return await _modality_input(engine, "image")
+
+
+async def _modality_input(engine: Any, kind: str) -> bool:
+    probe = getattr(engine, f"probe_{kind}_input", None)
     if probe is None:
         return False
     try:

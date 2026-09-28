@@ -33,7 +33,7 @@ from ..engines.base import (
 )
 from ..engines.systemone_http import validate_questions
 from ..failures import disposition, request_id
-from ..images import ImageRefusal, has_images, validate_messages
+from ..images import ImageRefusal, attachment_kinds, validate_messages
 from ..locality import enforce
 
 if TYPE_CHECKING:
@@ -559,23 +559,41 @@ async def _validate_content(
     except ImageRefusal as exc:
         raise HTTPException(
             status_code=400,
-            detail={"title": "Invalid image input", "status": 400, "detail": str(exc)},
+            detail={"title": "Invalid attachment", "status": 400, "detail": str(exc)},
         ) from None
-    if not has_images(body.messages):
-        return
-    if entry is not None:
-        # An account's model: its catalogue entry is the confirmation.
-        confirmed = entry.capabilities is not None and entry.capabilities.imageInput is True
-    else:
-        probe = getattr(engine, "probe_image_input", None)
-        confirmed = probe is not None and bool(await probe())
-    if not confirmed:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "title": "Image input not supported",
-                "status": 400,
-                "detail": "This backend has no confirmed vision model loaded. Select a vision "
-                "model with its projector loaded; capabilities.imageInput must be true.",
-            },
-        )
+    for kind in sorted(attachment_kinds(body.messages)):
+        flag, title, detail = _UNCONFIRMED[kind]
+        if entry is not None:
+            # An account's model: its catalogue entry is the confirmation.
+            confirmed = entry.capabilities is not None and getattr(entry.capabilities, flag) is True
+        else:
+            probe = getattr(engine, f"probe_{kind}_input", None)
+            confirmed = probe is not None and bool(await probe())
+        if not confirmed:
+            raise HTTPException(
+                status_code=400, detail={"title": title, "status": 400, "detail": detail}
+            )
+
+
+#: Per attachment kind: the capability that confirms it, and the refusal
+#: when nothing does. A model that cannot take the input is never sent it.
+_UNCONFIRMED = {
+    "image": (
+        "imageInput",
+        "Image input not supported",
+        "This backend has no confirmed vision model loaded. Select a vision model with its "
+        "projector loaded; capabilities.imageInput must be true.",
+    ),
+    "audio": (
+        "audioInput",
+        "Audio input not supported",
+        "This backend has no model confirmed to take audio. Select a model that hears audio; "
+        "capabilities.audioInput must be true.",
+    ),
+    "file": (
+        "fileInput",
+        "File input not supported",
+        "This backend has no model confirmed to read files. Select a model that reads PDFs; "
+        "capabilities.fileInput must be true.",
+    ),
+}
