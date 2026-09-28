@@ -52,6 +52,8 @@ from .._generated.models import (
     GenerateRequest,
     GenerateResponse,
     Role,
+    SpeakRequest,
+    SpeechFormat,
     Stage,
     StreamProgress,
     ToolCall,
@@ -62,6 +64,13 @@ from .._http import client_for
 from ..audio_out import AudioAssembly
 from ..failures import request_id, retry_after
 from ..images import attachment_kinds, content_wire
+from ..speech import (
+    ALL_FORMATS,
+    OPENROUTER_FORMATS,
+    SpeechRefusal,
+    refuse_format,
+    streaming_wav_header,
+)
 from ._catalogue import (
     _LIST_TIMEOUT,
     _SHOW_CONCURRENCY,
@@ -1685,6 +1694,80 @@ class OpenAiCompatibleHttpEngine:
                 latencyMs=int((time.perf_counter() - started) * 1000),
             ),
         )
+
+    def speech_formats(self, target: _Target) -> tuple[SpeechFormat, ...]:
+        """The formats this model can be given in (P3a): the listing's, else
+        OpenRouter's measured two plus a WAV made from pcm, else all six --
+        OpenAI's own API, or a local server that will refuse what it lacks."""
+        caps = target.entry.capabilities if target.entry is not None else None
+        if caps is not None and caps.speechFormats:
+            return tuple(caps.speechFormats)
+        if self._catalogue_source == "openrouter":
+            return OPENROUTER_FORMATS
+        return ALL_FORMATS
+
+    async def speak(self, request: SpeakRequest) -> AsyncGenerator[bytes, None]:
+        """`POST /v1/audio/speech` upstream, streamed back as it arrives (P3a).
+
+        **`wav` is made here from `pcm` on OpenRouter**, whose speech route
+        takes `mp3` and `pcm` only (measured), with a streaming WAV header
+        written before the first sample. Every other format is asked of the
+        backend as it is, and **the format is always sent**: OpenRouter's
+        default is `pcm` where OpenAI's is `mp3` (measured).
+        """
+        target = self.resolve_model(request.model)
+        if target.entry is not None and "speech" not in (target.entry.surfaces or []):
+            raise SpeechRefusal(
+                f"{target.id!r} does not speak; choose a model with the speech surface"
+            )
+        formats = self.speech_formats(target)
+        asked = request.format or SpeechFormat.mp3
+        refuse_format(asked, formats)
+        made_here = asked is SpeechFormat.wav and self._catalogue_source == "openrouter"
+        payload: dict[str, Any] = {
+            "model": target.upstream,
+            "input": request.input,
+            "voice": request.voice,
+            "response_format": (SpeechFormat.pcm if made_here else asked).value,
+        }
+        if request.speed is not None:
+            payload["speed"] = request.speed
+        if request.instructions:
+            payload["instructions"] = request.instructions
+        client = self._client()
+        try:
+            async with client.stream(
+                "POST",
+                "/v1/audio/speech",
+                headers={
+                    **self._headers(),
+                    "Accept": "application/octet-stream",
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                json=payload,
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise CliError(
+                        f"openai_compat_http returned {response.status_code} for speech: "
+                        f"{_redact(body.decode('utf-8', 'replace')[:500])}",
+                        upstream_status=response.status_code,
+                        retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+                    )
+                header_sent = not made_here
+                async for chunk in response.aiter_raw():
+                    if not chunk:
+                        continue
+                    if not header_sent:
+                        header_sent = True
+                        yield streaming_wav_header()
+                    yield chunk
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the speech request") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http speech failed: {e!r}") from e
 
     async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
         """`POST /v1/embeddings` upstream, in the shape OpenAI defined.

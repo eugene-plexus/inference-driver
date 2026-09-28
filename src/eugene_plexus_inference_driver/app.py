@@ -23,6 +23,7 @@ from .routes import config as config_routes
 from .routes import generate as generate_routes
 from .routes import health as health_routes
 from .routes import info as info_routes
+from .routes import speak as speak_routes
 from .runtime_lookup import resolve_runtime_url
 from .settings import Settings, load_settings
 
@@ -286,6 +287,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     authorized = [Depends(require_authorized)]
     app.include_router(info_routes.router, dependencies=authorized)
     app.include_router(generate_routes.router, dependencies=authorized)
+    app.include_router(speak_routes.router, dependencies=authorized)
 
     # Operator-only surfaces: config edits and the restart trigger ride
     # on the UI's session token. Service tokens are rejected so a

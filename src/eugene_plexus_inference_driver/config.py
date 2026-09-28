@@ -37,6 +37,7 @@ from ._generated.models import (
 from .engines.base import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
+from .engines.elevenlabs_http import ElevenLabsHttpEngine
 from .engines.openai_compat_http import OpenAiCompatibleHttpEngine
 from .engines.systemone_http import SystemOneHttpEngine
 from .providers import PROVIDERS, collect_extra_field_specs, providers_using
@@ -234,6 +235,29 @@ def _common_fields() -> list[ConfigField]:
     ]
 
 
+def _add_field(out: list[ConfigField], field: ConfigField) -> None:
+    """Add `field`, or widen the one already there with its key.
+
+    Two engine classes can read the same key -- ElevenLabs' `apiKey` and the
+    OpenAI-compatible engine's (P3a) -- and a key is one field in the
+    schema, so the second one's providers are added to the first one's
+    `showWhen` rather than appended as a duplicate the UI would render twice.
+    The second's description replaces the first's, because it is written to
+    cover both.
+    """
+    for index, existing in enumerate(out):
+        if existing.key != field.key:
+            continue
+        if existing.showWhen is not None and field.showWhen is not None:
+            merged = [*existing.showWhen.equals, *field.showWhen.equals]
+            widened = existing.showWhen.model_copy(update={"equals": list(dict.fromkeys(merged))})
+            out[index] = existing.model_copy(
+                update={"showWhen": widened, "description": field.description}
+            )
+        return
+    out.append(field)
+
+
 def _build_fields() -> list[ConfigField]:
     """Compose the full FIELDS list from the registry. Order:
     provider -> per-engine fields (API key, CLI paths) -> per-provider
@@ -249,6 +273,7 @@ def _build_fields() -> list[ConfigField]:
         CodexCliEngine,
         OpenAiCompatibleHttpEngine,
         SystemOneHttpEngine,
+        ElevenLabsHttpEngine,
     ):
         if engine_cls in seen:
             continue
@@ -256,7 +281,8 @@ def _build_fields() -> list[ConfigField]:
         applicable = providers_using(engine_cls)
         if not applicable:
             continue
-        out.extend(engine_cls.field_specs(applicable_providers=applicable))
+        for field in engine_cls.field_specs(applicable_providers=applicable):
+            _add_field(out, field)
     out.extend(collect_extra_field_specs())
     out.append(_modelid_field())
     out.append(_upstream_modelid_field())

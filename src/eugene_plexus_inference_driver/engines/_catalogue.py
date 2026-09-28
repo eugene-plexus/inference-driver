@@ -47,6 +47,7 @@ import httpx
 
 from .._generated.models import Capabilities, DriverCatalogue, DriverModel
 from .._private_files import write_private_text
+from ..speech import ALL_FORMATS, OPENROUTER_FORMATS
 
 log = logging.getLogger(__name__)
 
@@ -204,6 +205,9 @@ def from_openrouter(body: Any) -> list[DriverModel]:
                     # parameter list: no audio-output model on OpenRouter
                     # lists `modalities` or `audio` there (P2b, measured).
                     audioOutput="audio" in output,
+                    # P3a: OpenRouter's speech route makes mp3 and pcm, and
+                    # the driver makes WAV from pcm (measured 2026-09-28).
+                    speechFormats=list(OPENROUTER_FORMATS) if "speech" in surfaces else None,
                     toolCalling="tools" in params,
                     maxContextTokens=context if isinstance(context, int) and context > 0 else None,
                 ),
@@ -316,6 +320,10 @@ def from_openai_list(
             continue
         surfaces = classify(entry["id"]) if classify is not None else None
         model = _inherited(entry["id"], defaults, surfaces=surfaces)
+        if "speech" in model.surfaces and model.capabilities is not None:
+            # Only OpenAI's own list sorts a model into speech, and its API
+            # makes all six formats (P3a).
+            model.capabilities.speechFormats = list(ALL_FORMATS)
         window = entry.get("max_model_len")
         if isinstance(window, int) and window > 0 and model.capabilities is not None:
             model.capabilities.maxContextTokens = window

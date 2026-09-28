@@ -20,6 +20,7 @@ from typing import Any
 from ._generated.models import BackendKind, ConfigField
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
+from .engines.elevenlabs_http import ElevenLabsHttpEngine
 from .engines.openai_compat_http import (
     OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
@@ -248,6 +249,15 @@ PROVIDERS: dict[str, Provider] = {
             "catalogue_source": "openai",
         },
         extra_field_specs=_custom_backend_fields(),
+    ),
+    "elevenlabs": Provider(
+        key="elevenlabs",
+        label="ElevenLabs (speech)",
+        engine_class=ElevenLabsHttpEngine,
+        engine_kwargs={
+            "default_base_url": "https://api.elevenlabs.io",
+            "auth_required": True,
+        },
     ),
     "typesafe": Provider(
         key="typesafe",
