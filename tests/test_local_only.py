@@ -30,7 +30,7 @@ class CountingEngine:
         yield Chunk(text="local")
         yield Chunk(done=True, result=result)
 
-    async def embed(self, inputs):
+    async def embed(self, inputs, *, model=None):
         self.calls.append(inputs)
         return EmbedResponse(embeddings=[[1.0]])
 

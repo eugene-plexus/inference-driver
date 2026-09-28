@@ -137,6 +137,7 @@ PROVIDERS: dict[str, Provider] = {
             "default_base_url": "https://api.openai.com",
             "fixed_temperature_pattern": OPENAI_FIXED_TEMPERATURE_PATTERN,
             "backend_kind": BackendKind.openai_api,
+            "catalogue_source": "openai",
         },
     ),
     "xai": Provider(
@@ -147,6 +148,7 @@ PROVIDERS: dict[str, Provider] = {
             "default_base_url": "https://api.x.ai",
             "fixed_temperature_pattern": _XAI_FIXED_TEMPERATURE_PATTERN,
             "backend_kind": BackendKind.openai_compat_http,
+            "catalogue_source": "openai",
         },
     ),
     "openrouter": Provider(
@@ -162,6 +164,14 @@ PROVIDERS: dict[str, Provider] = {
             # the upstream message clearly.
             "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
+            # An account reads OpenRouter's own catalogue, which says per
+            # model what it takes and accepts (P1-3) -- so the chat-name
+            # heuristic has nothing to add, and applied to the model
+            # dropdown it hid every `openai/`, `anthropic/` and `google/`
+            # model, since OpenRouter's ids lead with the vendor.
+            "filter_models": False,
+            "catalogue_source": "openrouter",
+            "require_parameters": True,
         },
     ),
     "minimax": Provider(
@@ -172,6 +182,7 @@ PROVIDERS: dict[str, Provider] = {
             "default_base_url": "https://api.minimax.io",
             "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
+            "catalogue_source": "openai",
         },
     ),
     "ollama_local": Provider(
@@ -192,6 +203,8 @@ PROVIDERS: dict[str, Provider] = {
             # `huihui_ai/dolphin3-abliterated:...` don't match it and
             # would be invisibly hidden from the dropdown.
             "filter_models": False,
+            # `/api/show` names each pulled model's capabilities.
+            "catalogue_source": "ollama",
         },
     ),
     "lmstudio_local": Provider(
@@ -204,6 +217,7 @@ PROVIDERS: dict[str, Provider] = {
             "backend_kind": BackendKind.openai_compat_http,
             "auth_required": False,
             "filter_models": False,
+            "catalogue_source": "lmstudio",
         },
     ),
     "openai_compat_custom": Provider(
@@ -229,6 +243,9 @@ PROVIDERS: dict[str, Provider] = {
             # model's own filename and generally will not match a
             # chat-model prefix heuristic. The operator chose the URL.
             "filter_models": False,
+            # The OpenAI `/v1/models` shape: a `llama-server` in router
+            # mode, a vLLM, any server that lists what it holds.
+            "catalogue_source": "openai",
         },
         extra_field_specs=_custom_backend_fields(),
     ),

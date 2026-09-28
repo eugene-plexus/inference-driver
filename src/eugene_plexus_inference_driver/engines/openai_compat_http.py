@@ -29,7 +29,9 @@ import logging
 import os
 import re
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -39,6 +41,7 @@ from .._generated.models import (
     ConfigField,
     ConfigFieldShowWhen,
     ConfigValueType,
+    DriverModel,
     EmbedResponse,
     FinishReason,
     Function1,
@@ -55,14 +58,30 @@ from .._generated.models import (
 from .._http import client_for
 from ..failures import request_id, retry_after
 from ..images import content_wire, has_images
+from ._catalogue import (
+    _LIST_TIMEOUT,
+    _SHOW_CONCURRENCY,
+    _SHOW_TIMEOUT,
+    Catalogue,
+    CatalogueError,
+    EngineDefaults,
+    from_lmstudio,
+    from_openai_list,
+    from_openrouter,
+    ollama_entry,
+    upstream_words,
+)
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
 from .base import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_STREAM_STALL_SECONDS,
     Chunk,
+    ModelNotServed,
+    ModelRequired,
     TokenCountUnsupported,
     refuse_unsupported_settings,
+    resolve_single_model,
 )
 
 # A count is two small HTTP calls handled beside the slots, never a
@@ -256,6 +275,25 @@ _LOCAL_ENGINE_SETTINGS = frozenset({"topK", "minP"})
 # reasoning models refuse the penalties as they refuse the sampler itself.
 _FIXED_SAMPLER_SETTINGS = frozenset({"temperature", "topP", "frequencyPenalty", "presencePenalty"})
 
+# Every request setting this engine can put on the wire at all, in the
+# order `supported_settings` reports them.
+_ENGINE_SETTINGS: tuple[str, ...] = (
+    "maxTokens",
+    "temperature",
+    "topP",
+    "seed",
+    "stop",
+    "tools",
+    "toolChoice",
+    "responseFormat",
+    "topK",
+    "minP",
+    "frequencyPenalty",
+    "presencePenalty",
+    "parallelToolCalls",
+)
+_ALL_ENGINE_SETTINGS = frozenset(_ENGINE_SETTINGS)
+
 
 def _reasoning_of(obj: dict[str, Any]) -> str | None:
     """A message's or delta's separately-reported reasoning, if any.
@@ -380,6 +418,44 @@ def _stalled(stall_seconds: float, emitted_chars: int) -> BackendTimeout:
     )
 
 
+def classify_openai_model(model_id: str) -> list[str]:
+    """Sort an id from OpenAI's own `/v1/models` into the surfaces it answers.
+
+    `api.openai.com` lists every model on the account with nothing per model
+    (call P1-3), so an account over it can only go by the id -- the same
+    heuristic the model dropdown has used since M0, turned from a filter
+    into a sorter so a speech or image model is kept, under the surface its
+    door will serve (P1-4), instead of dropped. An id it cannot place
+    serves nothing rather than being guessed into chat.
+    """
+    lowered = model_id.lower()
+    if "embedding" in lowered or lowered.startswith(("text-similarity-", "text-search-")):
+        return ["embeddings"]
+    if "moderation" in lowered:
+        return ["moderation"]
+    if lowered.startswith("tts-") or "-tts" in lowered:
+        return ["speech"]
+    if lowered.startswith("whisper-") or "transcribe" in lowered:
+        return ["transcription"]
+    if lowered.startswith(("dall-e-", "gpt-image-")):
+        return ["image"]
+    if lowered.startswith("sora"):
+        return ["video"]
+    return ["chat"] if _is_plausible_chat_model(model_id) else []
+
+
+@dataclass(frozen=True)
+class _Target:
+    """The model one request is for: what callers see, what the backend is
+    asked for, and the one per-model fact the payload shaping reads."""
+
+    id: str
+    upstream: str
+    temperature_fixed: bool
+    #: The account's catalogue entry; None for a single-model driver.
+    entry: DriverModel | None = None
+
+
 class OpenAiCompatibleHttpEngine:
     """OpenAI-compatible HTTP engine. Provider-agnostic."""
 
@@ -388,6 +464,11 @@ class OpenAiCompatibleHttpEngine:
     #: is not a runtime — so `app.build_engine_with` consults this before
     #: resolving `runtimeName` at all.
     follows_runtimes = True
+
+    #: With no `modelId`, this engine is a provider ACCOUNT (P1) serving
+    #: every model its backend lists. `app.build_engine_with` hands such an
+    #: engine the provider key and where to keep its model list.
+    serves_accounts = True
 
     #: Upstream SSE delivers real per-token deltas, so `stream()`
     #: yields text as the model produces it.
@@ -404,7 +485,7 @@ class OpenAiCompatibleHttpEngine:
         *,
         api_key: str | None = None,
         base_url: str = "https://api.openai.com",
-        model_id: str = "gpt-4o",
+        model_id: str | None = "gpt-4o",
         upstream_model_id: str | None = None,
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
@@ -414,6 +495,11 @@ class OpenAiCompatibleHttpEngine:
         auth_required: bool = True,
         filter_models: bool = True,
         runtime: str | None = None,
+        catalogue_source: str = "openai",
+        require_parameters: bool = False,
+        get: Callable[[str], Any] | None = None,
+        catalogue_path: Path | None = None,
+        provider: str | None = None,
     ) -> None:
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
         if auth_required and not resolved_key:
@@ -423,6 +509,9 @@ class OpenAiCompatibleHttpEngine:
             )
         self._api_key = resolved_key
         self._base_url = base_url.rstrip("/")
+        #: None makes this driver a provider ACCOUNT (P1): it serves every
+        #: model its backend lists, and each request names one. A single
+        #: model is the degenerate case and behaves exactly as before.
         self._model_id = model_id
         #: What the backend is actually asked for. Resolved ONCE, here,
         #: and used at exactly the wire boundary (`_payload_for`, the
@@ -432,15 +521,15 @@ class OpenAiCompatibleHttpEngine:
         #: reports `_model_id`, the public identity the gateway routes
         #: on. Defaulting to the public id keeps every install that
         #: predates the split byte-identical on the wire.
-        self._upstream_model_id = upstream_model_id or model_id
+        self._upstream_model_id = upstream_model_id or model_id or ""
         self._timeout_seconds = timeout_seconds
         self._stall_seconds = stall_seconds
         self._fixed_temperature_pattern = fixed_temperature_pattern
-        self._warned_dropped: set[str] = set()
+        self._warned_dropped: set[tuple[str, str]] = set()
         # Matched against the upstream id — the pattern describes what
         # the BACKEND rejects, and the backend only ever sees that name.
-        self._temperature_is_fixed = fixed_temperature_pattern is not None and bool(
-            fixed_temperature_pattern.match(self._upstream_model_id)
+        self._temperature_is_fixed = model_id is not None and self._fixes_temperature(
+            self._upstream_model_id
         )
         if self._temperature_is_fixed:
             log.warning(
@@ -452,6 +541,24 @@ class OpenAiCompatibleHttpEngine:
         self.backend_kind = backend_kind
         self._thinking_mode = thinking_mode or "auto"
         self._filter_models = filter_models
+        #: OpenRouter only: ask it to route to a provider that honours every
+        #: setting sent. Its per-model `supported_parameters` is a union
+        #: over providers (measured: gpt-oss-20b has 12 endpoints, one takes
+        #: tools but not response_format, another the reverse), so without
+        #: this a setting the caller asked for can be dropped by whichever
+        #: provider it picks -- exactly what A2 forbids.
+        self._require_parameters = require_parameters
+        self._catalogue_source = catalogue_source
+        #: The account's model list, or None for a single-model driver.
+        self.catalogue: Catalogue | None = None
+        if model_id is None:
+            self.catalogue = Catalogue(
+                source=catalogue_source,
+                origin=f"{provider or catalogue_source}|{self._base_url}",
+                fetch=self._fetch_catalogue,
+                get=get or (lambda _key: None),
+                path=catalogue_path,
+            )
         #: The supervised runtime this engine follows, when `base_url` was
         #: resolved from one. Reported on `/v1/info` so the gateway and
         #: the UI can show which engine process is behind this driver.
@@ -563,6 +670,53 @@ class OpenAiCompatibleHttpEngine:
                 requiresRestart=True,
                 showWhen=show_when,
             ),
+            ConfigField(
+                key="catalogueInclude",
+                label="Models to use",
+                description=(
+                    "When Model is left empty this driver uses every model "
+                    "the provider lists. Keep only the ones matching these "
+                    "patterns: `*` matches anything, `/` included, so "
+                    "`anthropic/*` keeps one vendor's models on OpenRouter "
+                    "and `qwen3*` every Qwen 3 in Ollama. The default `*` "
+                    "keeps everything. Takes effect without a restart."
+                ),
+                category="adapter",
+                valueType=ConfigValueType.string_list,
+                default=["*"],
+                requiresRestart=False,
+                showWhen=show_when,
+            ),
+            ConfigField(
+                key="catalogueExclude",
+                label="Models to leave out",
+                description=(
+                    "Patterns for models to leave out even when they match "
+                    "Models to use, for example `*:free` or `*-preview`. "
+                    "Takes effect without a restart."
+                ),
+                category="adapter",
+                valueType=ConfigValueType.string_list,
+                default=[],
+                requiresRestart=False,
+                showWhen=show_when,
+            ),
+            ConfigField(
+                key="catalogueRefreshMinutes",
+                label="Model list refresh",
+                description=(
+                    "How often, in minutes, this driver reads the "
+                    "provider's model list again when Model is left empty. "
+                    "A failed read keeps the list it already has."
+                ),
+                category="adapter",
+                valueType=ConfigValueType.integer,
+                default=60,
+                minimum=1,
+                maximum=1440,
+                requiresRestart=False,
+                showWhen=show_when,
+            ),
         ]
 
     @classmethod
@@ -577,6 +731,10 @@ class OpenAiCompatibleHttpEngine:
         filter_models: bool = True,
         runtime_url: str | None = None,
         runtime_name: str | None = None,
+        catalogue_source: str = "openai",
+        require_parameters: bool = False,
+        catalogue_path: Path | None = None,
+        provider: str | None = None,
     ) -> OpenAiCompatibleHttpEngine:
         # Precedence: a resolved runtime URL (the caller turned
         # `runtimeName` into one via the agent), then the operator's
@@ -599,7 +757,11 @@ class OpenAiCompatibleHttpEngine:
         return cls(
             api_key=str(get("apiKey") or "") or None,
             base_url=base_url,
-            model_id=str(get("modelId") or "gpt-4o"),
+            # **Empty is an account, not "gpt-4o"** (P1-2). The old default
+            # sent a model nobody chose to whatever the key belonged to;
+            # an empty model now means "serve every model this backend
+            # lists", which is what leaving it empty on an aggregator meant.
+            model_id=str(get("modelId") or "").strip() or None,
             upstream_model_id=str(get("upstreamModelId") or "") or None,
             timeout_seconds=float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS),
             stall_seconds=(
@@ -613,28 +775,167 @@ class OpenAiCompatibleHttpEngine:
             auth_required=auth_required,
             filter_models=filter_models,
             runtime=runtime_name if runtime_url else None,
+            catalogue_source=catalogue_source,
+            require_parameters=require_parameters,
+            get=get,
+            catalogue_path=catalogue_path,
+            provider=provider,
         )
+
+    # -- which model a request is for (P1) ---------------------------------
+
+    @property
+    def model_id(self) -> str | None:
+        """The one model a single-model driver serves; None for an account."""
+        return self._model_id
+
+    def _fixes_temperature(self, upstream: str) -> bool:
+        pattern = self._fixed_temperature_pattern
+        return pattern is not None and bool(pattern.match(upstream))
+
+    def resolve_model(self, requested: str | None) -> _Target:
+        """The model a request is for, or `ModelNotServed` / `ModelRequired`.
+
+        Called before any backend work, by the routes (for the 404) and by
+        every engine method (for the wire), so the two cannot disagree.
+        """
+        if self.catalogue is None:
+            resolve_single_model(self._model_id, requested)
+            return _Target(
+                id=self._model_id or "",
+                upstream=self._upstream_model_id,
+                temperature_fixed=self._temperature_is_fixed,
+            )
+        if not requested:
+            raise ModelRequired(
+                "This driver is a provider account serving "
+                f"{len(self.catalogue.exposed())} models; a request must name one "
+                "in `model`."
+            )
+        entry = self.catalogue.find(requested)
+        if entry is None:
+            raise ModelNotServed(requested, served=len(self.catalogue.exposed()))
+        upstream = entry.upstreamId or entry.id
+        return _Target(
+            id=entry.id,
+            upstream=upstream,
+            temperature_fixed=self._fixes_temperature(upstream),
+            entry=entry,
+        )
+
+    def engine_defaults(self, upstream: str = "") -> EngineDefaults:
+        """What a model inherits where its provider's listing says nothing."""
+        return EngineDefaults(
+            supported_settings=self._supported_for(
+                _Target(
+                    id=upstream,
+                    upstream=upstream,
+                    temperature_fixed=self._fixes_temperature(upstream),
+                )
+            ),
+            tool_calling=self.supports_tool_calling,
+            streaming=self.supports_streaming,
+        )
+
+    async def _fetch_catalogue(self) -> list[DriverModel]:
+        """Read this account's list from the provider's own listing."""
+        client = self._client()
+        headers = self._headers()
+        source = self._catalogue_source
+
+        async def read(path: str) -> Any:
+            response = await client.get(path, headers=headers, timeout=_LIST_TIMEOUT)
+            if response.status_code >= 400:
+                raise CatalogueError(
+                    f"{source} refused the model list ({response.status_code}): "
+                    f"{upstream_words(response)}"
+                )
+            try:
+                return response.json()
+            except ValueError as e:
+                raise CatalogueError(f"{source}'s model list was not JSON") from e
+
+        if source == "openrouter":
+            # The ACCOUNT's list, every modality. `/v1/models` is the
+            # public 458 that output text; this is the 625 this key can
+            # call (measured 2026-09-27).
+            models = from_openrouter(await read("/v1/models/user?output_modalities=all"))
+            return [self._with_fixed_temperature(m) for m in models]
+        if source == "ollama":
+            body = await read("/api/tags")
+            listed = body.get("models") if isinstance(body, dict) else None
+            names = [
+                m.get("name") or m.get("model")
+                for m in (listed if isinstance(listed, list) else [])
+                if isinstance(m, dict)
+            ]
+            gate = asyncio.Semaphore(_SHOW_CONCURRENCY)
+
+            async def show(name: str) -> dict[str, Any] | None:
+                async with gate:
+                    try:
+                        answer = await client.post(
+                            "/api/show",
+                            headers=headers,
+                            json={"model": name},
+                            timeout=_SHOW_TIMEOUT,
+                        )
+                        if answer.status_code >= 400:
+                            return None
+                        shown = answer.json()
+                        return shown if isinstance(shown, dict) else None
+                    except (httpx.HTTPError, ValueError):
+                        return None
+
+            valid = [n for n in names if isinstance(n, str) and n]
+            shows = await asyncio.gather(*(show(n) for n in valid))
+            return [
+                ollama_entry(name, shown, self.engine_defaults(name))
+                for name, shown in zip(valid, shows, strict=True)
+            ]
+        if source == "lmstudio":
+            try:
+                return from_lmstudio(await read("/api/v0/models"), self.engine_defaults())
+            except CatalogueError:
+                # An LM Studio without the v0 REST API still speaks OpenAI's.
+                pass
+        body = await read("/v1/models")
+        classify = classify_openai_model if self._filter_models else None
+        return [
+            self._with_fixed_temperature(m)
+            for m in from_openai_list(body, self.engine_defaults(), classify=classify)
+        ]
+
+    def _with_fixed_temperature(self, model: DriverModel) -> DriverModel:
+        """Drop the sampler settings from a model whose provider rejects them."""
+        if model.capabilities is None or not self._fixes_temperature(model.upstreamId or model.id):
+            return model
+        caps = model.capabilities
+        caps.supportedSettings = [
+            s for s in (caps.supportedSettings or []) if s not in _FIXED_SAMPLER_SETTINGS
+        ]
+        return model
 
     @property
     def supported_settings(self) -> list[str]:
-        fields = [
-            "maxTokens",
-            "temperature",
-            "topP",
-            "seed",
-            "stop",
-            "tools",
-            "toolChoice",
-            "responseFormat",
-            "topK",
-            "minP",
-            "frequencyPenalty",
-            "presencePenalty",
-            "parallelToolCalls",
-        ]
-        return [field for field in fields if field not in self._unsupported_settings()]
+        return self._supported_for(
+            _Target(
+                id=self._model_id or "",
+                upstream=self._upstream_model_id,
+                temperature_fixed=self._temperature_is_fixed,
+            )
+        )
 
-    def _unsupported_settings(self) -> frozenset[str]:
+    def _supported_for(self, target: _Target) -> list[str]:
+        """The settings this engine can carry for one model.
+
+        For an account over OpenRouter it is what that model's listing
+        names, intersected with what this engine can send at all.
+        """
+        unsupported = self._unsupported_settings(target)
+        return [field for field in _ENGINE_SETTINGS if field not in unsupported]
+
+    def _unsupported_settings(self, target: _Target) -> frozenset[str]:
         """What this backend cannot carry, whoever asks.
 
         One answer read by both `supported_settings` (so the gateway
@@ -643,13 +944,19 @@ class OpenAiCompatibleHttpEngine:
         separate lists would be two chances to disagree.
         """
         unsupported: set[str] = set()
-        if self._temperature_is_fixed:
+        if target.temperature_fixed:
             unsupported |= _FIXED_SAMPLER_SETTINGS
         if _is_openai_endpoint(self._base_url):
             unsupported |= _LOCAL_ENGINE_SETTINGS
+        caps = target.entry.capabilities if target.entry is not None else None
+        if self._catalogue_source == "openrouter" and caps is not None:
+            # The listing is the authority for what this model accepts; a
+            # setting it does not name is one OpenRouter would drop.
+            listed = set(caps.supportedSettings or [])
+            unsupported |= _ALL_ENGINE_SETTINGS - listed
         return frozenset(unsupported)
 
-    def _payload_for(self, request: GenerateRequest) -> dict[str, Any]:
+    def _payload_for(self, request: GenerateRequest, target: _Target) -> dict[str, Any]:
         """The chat-completions body for this request.
 
         Shared by `generate` and `stream` so the two cannot drift on
@@ -657,7 +964,7 @@ class OpenAiCompatibleHttpEngine:
         the only symptom would be a streamed answer differing from a
         non-streamed one for the same request.
         """
-        unsupported = self._unsupported_settings()
+        unsupported = self._unsupported_settings(target)
         if unsupported:
             refuse_unsupported_settings(request, unsupported=set(unsupported))
         # Apply the operator's thinkingMode by mutating the system
@@ -666,14 +973,14 @@ class OpenAiCompatibleHttpEngine:
         # inline `<think>` blocks leaking into chat responses.
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         payload: dict[str, Any] = {
-            "model": self._upstream_model_id,
+            "model": target.upstream,
             "messages": _to_openai_messages(
                 messages, send_reasoning=not _is_openai_endpoint(self._base_url)
             ),
         }
         if request.maxTokens is not None:
             payload[_max_tokens_field_for(self._base_url)] = request.maxTokens
-        if request.temperature is not None and not self._temperature_is_fixed:
+        if request.temperature is not None and not target.temperature_fixed:
             payload["temperature"] = float(request.temperature)
         # **Carried since 2026-09-19.** `GenerateRequest` had no field
         # for either until then, so `gateway.yaml`'s promise that both
@@ -690,10 +997,10 @@ class OpenAiCompatibleHttpEngine:
         # seed is NOT dropped with them: those models accept it, and
         # widening the drop to every sampling parameter because two
         # travel together would be the over-correction.
-        if request.topP is not None and not self._temperature_is_fixed:
+        if request.topP is not None and not target.temperature_fixed:
             payload["top_p"] = float(request.topP)
         elif request.topP is not None:
-            self._warn_dropped("top_p")
+            self._warn_dropped("top_p", target)
         # `is not None` and not truthiness: **`seed=0` is a real seed**
         # and a falsy one, and dropping it would answer a request for a
         # reproducible result with a different answer every time --
@@ -723,7 +1030,7 @@ class OpenAiCompatibleHttpEngine:
             if value is None:
                 continue
             if field in unsupported:
-                self._warn_dropped(key)
+                self._warn_dropped(key, target)
                 continue
             payload[key] = value
         # Tools ride through untouched. We do not validate the JSON
@@ -746,9 +1053,11 @@ class OpenAiCompatibleHttpEngine:
             payload["response_format"] = request.responseFormat.model_dump(
                 mode="json", by_alias=True, exclude_none=True
             )
+        if self._require_parameters and request.callerSettings:
+            payload["provider"] = {"require_parameters": True}
         return payload
 
-    def _public_model_id(self, reported: object) -> str:
+    def _public_model_id(self, reported: object, target: _Target) -> str:
         """The model identity a caller sees on a response.
 
         When this engine translates (`upstreamModelId` set and
@@ -763,11 +1072,18 @@ class OpenAiCompatibleHttpEngine:
         what was configured is telling the truth about what answered,
         and hiding that would un-diagnose a misconfigured endpoint.
         """
-        if self._upstream_model_id != self._model_id:
-            return self._model_id
-        return str(reported or self._model_id)
+        if target.entry is not None:
+            # **An account always answers with the id that was asked for.**
+            # OpenRouter answers an alias under its target's id
+            # (`~z-ai/glm-flash-latest` came back as `z-ai/glm-5.3-flash`,
+            # measured), and echoing that would name a model the gateway
+            # does not route and the caller did not ask for.
+            return target.id
+        if target.upstream != target.id:
+            return target.id
+        return str(reported or target.id)
 
-    def _warn_dropped(self, field: str) -> None:
+    def _warn_dropped(self, field: str, target: _Target) -> None:
         """Say it once per field per engine, not once per request.
 
         The contract promises a parameter we cannot carry is "dropped
@@ -775,14 +1091,14 @@ class OpenAiCompatibleHttpEngine:
         per token-generating call on a busy backend, which is how a
         real warning becomes something an operator filters out.
         """
-        if field in self._warned_dropped:
+        if (target.id, field) in self._warned_dropped:
             return
-        self._warned_dropped.add(field)
+        self._warned_dropped.add((target.id, field))
         log.warning(
             "model %r does not accept `%s`; the driver is omitting it on every "
             "request and letting the model use its own default. This is said "
             "once per parameter for the life of this engine.",
-            self._model_id,
+            target.id,
             field,
         )
 
@@ -809,7 +1125,8 @@ class OpenAiCompatibleHttpEngine:
         # 15.6 ms grid -- 20 distinct values in 300 ms -- which is coarser
         # than the thing being measured.
         started = time.perf_counter()
-        payload = self._payload_for(request)
+        target = self.resolve_model(request.model)
+        payload = self._payload_for(request, target)
         image_request = has_images(request.messages)
 
         # DEBUG-level full-payload trace. The gateway's copy-trace
@@ -926,7 +1243,7 @@ class OpenAiCompatibleHttpEngine:
             usage=_usage_from_envelope(body.get("usage") or {}),
             requestId=request.requestId,
             backend=self.backend_kind,
-            modelId=self._public_model_id(body.get("model")),
+            modelId=self._public_model_id(body.get("model"), target),
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
@@ -956,7 +1273,8 @@ class OpenAiCompatibleHttpEngine:
         consumer abandons the generator -- which is what a client
         disconnect looks like from here.
         """
-        payload = self._payload_for(request)
+        target = self.resolve_model(request.model)
+        payload = self._payload_for(request, target)
         image_request = has_images(request.messages)
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
@@ -990,7 +1308,7 @@ class OpenAiCompatibleHttpEngine:
         # of two calls, which is why the index is the key and not the
         # arrival order.
         call_parts: dict[int, dict[str, str]] = {}
-        served_model = self._model_id
+        served_model = target.id
 
         client = self._client()
         try:
@@ -1098,7 +1416,7 @@ class OpenAiCompatibleHttpEngine:
                                 yield Chunk(progress=progress)
                     else:
                         saw_first_data = True
-                    served_model = self._public_model_id(event.get("model") or served_model)
+                    served_model = self._public_model_id(event.get("model") or served_model, target)
                     if event.get("usage"):
                         usage_payload = event["usage"]
                     for choice in event.get("choices") or []:
@@ -1190,7 +1508,7 @@ class OpenAiCompatibleHttpEngine:
             ),
         )
 
-    async def embed(self, inputs: list[str]) -> EmbedResponse:
+    async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
         """`POST /v1/embeddings` upstream, in the shape OpenAI defined.
 
         **Always asks for floats.** The base64 encoding the OpenAI SDKs
@@ -1199,7 +1517,8 @@ class OpenAiCompatibleHttpEngine:
         backend implements `encoding_format` -- and several do not.
         """
         started = time.perf_counter()
-        payload: dict[str, Any] = {"model": self._upstream_model_id, "input": inputs}
+        target = self.resolve_model(model)
+        payload: dict[str, Any] = {"model": target.upstream, "input": inputs}
 
         client = self._client()
         try:
@@ -1235,7 +1554,7 @@ class OpenAiCompatibleHttpEngine:
         vectors = _vectors_from_envelope(body, expected=len(inputs))
         return EmbedResponse(
             embeddings=vectors,
-            modelId=self._public_model_id(body.get("model")),
+            modelId=self._public_model_id(body.get("model"), target),
             backend=self.backend_kind,
             usage=_usage_from_envelope(body.get("usage") or {}),
             latencyMs=int((time.perf_counter() - started) * 1000),
@@ -1264,7 +1583,7 @@ class OpenAiCompatibleHttpEngine:
             )
         if _is_openai_endpoint(self._base_url):
             raise TokenCountUnsupported("OpenAI's own API cannot count a chat prompt here")
-        payload = self._payload_for(request)
+        payload = self._payload_for(request, self.resolve_model(request.model))
         client = self._client()
         try:
             rendered = await client.post(

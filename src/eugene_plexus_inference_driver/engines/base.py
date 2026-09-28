@@ -85,6 +85,44 @@ class TokenCountUnsupported(Exception):
     """
 
 
+class ModelNotServed(Exception):
+    """The request named a model this driver does not serve (404).
+
+    Raised before any backend call, so nothing was computed and the gateway
+    may try another backend at once -- the model most likely left an
+    account's catalogue between the gateway's last read and this request.
+    """
+
+    def __init__(self, requested: str, *, served: int) -> None:
+        self.requested = requested
+        self.served = served
+        super().__init__(
+            f"This driver does not serve {requested!r} "
+            f"({served} model{'s' if served != 1 else ''} served here). "
+            "GET /v1/info lists them."
+        )
+
+
+class ModelRequired(Exception):
+    """An account driver asked for no model at all (400): it has no one
+    model to assume."""
+
+
+def resolve_single_model(model_id: str | None, requested: str | None) -> str | None:
+    """The single-model rule, shared by every engine that serves one model.
+
+    A request that names no model gets the configured one -- a caller from
+    before P1. A request that names the configured model gets it. Anything
+    else was meant for another driver and is refused, never served by
+    whatever this driver happens to hold: answering a request for model A
+    with model B is the silent substitution the whole `models[]` change
+    exists to rule out.
+    """
+    if requested is None or requested == model_id:
+        return model_id
+    raise ModelNotServed(requested, served=1 if model_id else 0)
+
+
 class StreamChunk(Protocol):
     """One event in the SSE stream emitted by `BackendEngine.stream`."""
 

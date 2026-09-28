@@ -229,11 +229,13 @@ def test_info_reports_the_embeddings_capability(client: TestClient) -> None:
     `streaming` (M10) and `maxContextTokens` (step 7)."""
     client.app.state.adapter = _Backend(capable=True)  # type: ignore[attr-defined]
 
-    assert client.get("/v1/info").json()["capabilities"]["embeddings"] is True
+    (model,) = client.get("/v1/info").json()["models"]
+    assert model["surfaces"] == ["embeddings"]
 
 
 class _Backend:
     backend_kind = BackendKind.openai_compat_http
+    model_id = "the-model"
     supports_streaming = True
     supports_tool_calling = True
     runtime = None
@@ -248,7 +250,7 @@ class _Backend:
     async def context_window(self) -> int | None:
         return None
 
-    async def embed(self, inputs: list[str]) -> EmbedResponse:
+    async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
         return EmbedResponse(
             embeddings=[[0.1, 0.2] for _ in inputs],
             modelId="fake-embed",

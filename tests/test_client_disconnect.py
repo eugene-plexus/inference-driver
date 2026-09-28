@@ -61,7 +61,7 @@ class _HangingAdapter:
         await self._hang()
         raise AssertionError("unreachable")
 
-    async def embed(self, texts: list[str]) -> Any:
+    async def embed(self, texts: list[str], *, model: str | None = None) -> Any:
         await self._hang()
         raise AssertionError("unreachable")
 

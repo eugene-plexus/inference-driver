@@ -128,6 +128,32 @@ async def test_config(
                 sampleOutput=f"noul={answer.noul}",
             )
 
+        # A provider account's test is its model list: reading it proves
+        # the address and the key, and says how many models it would
+        # serve. It does not generate -- there is no one model the
+        # operator chose, and asking an arbitrary one of six hundred to
+        # answer would test that model, not this configuration.
+        catalogue = getattr(engine, "catalogue", None)
+        if catalogue is not None:
+            listed = await catalogue.refresh()
+            summary = catalogue.summary()
+            if not listed:
+                return ConfigTestResult(
+                    ok=False,
+                    component="inference-driver",
+                    latencyMs=int((time.perf_counter() - start) * 1000),
+                    error=f"could not read the model list: {summary.error}",
+                )
+            return ConfigTestResult(
+                ok=True,
+                component="inference-driver",
+                latencyMs=int((time.perf_counter() - start) * 1000),
+                summary=(
+                    f"{summary.source} lists {summary.total} models; "
+                    f"{summary.exposed} kept by this driver's patterns."
+                ),
+            )
+
         test_request = GenerateRequest(
             messages=[Message(role=Role.user, content="Reply with exactly: PING")],
         )

@@ -14,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from .._generated.models import (
     DecisionRequest,
     DecisionResponse,
+    DriverModel,
     EmbedRequest,
     EmbedResponse,
     GenerateRequest,
@@ -24,7 +25,12 @@ from .._generated.models import (
 )
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
-from ..engines.base import TokenCountUnsupported
+from ..engines.base import (
+    ModelNotServed,
+    ModelRequired,
+    TokenCountUnsupported,
+    resolve_single_model,
+)
 from ..engines.systemone_http import validate_questions
 from ..failures import disposition, request_id
 from ..images import ImageRefusal, has_images, validate_messages
@@ -43,10 +49,11 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
-    _refuse_non_chat(engine)
+    entry = _resolve_model(engine, body.model)
+    _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
-    _refuse_unsupported_tools(engine, body)
-    await _validate_content(engine, body)
+    _refuse_unsupported_tools(engine, body, entry)
+    await _validate_content(engine, body, entry)
     try:
         return await serve_while_connected(request, engine.generate(body), what="a generation")
     except ClientGone as e:
@@ -84,10 +91,11 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
-    _refuse_non_chat(engine)
+    entry = _resolve_model(engine, body.model)
+    _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
-    _refuse_unsupported_tools(engine, body)
-    await _validate_content(engine, body)
+    _refuse_unsupported_tools(engine, body, entry)
+    await _validate_content(engine, body, entry)
 
     stream = engine.stream(body)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
@@ -146,9 +154,10 @@ async def count_prompt_tokens(request: Request, body: GenerateRequest) -> TokenC
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
-    _refuse_non_chat(engine)
+    entry = _resolve_model(engine, body.model)
+    _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
-    _refuse_unsupported_tools(engine, body)
+    _refuse_unsupported_tools(engine, body, entry)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
     counter = getattr(engine, "count_prompt_tokens", None)
     if counter is None:
@@ -192,13 +201,20 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    entry = _resolve_model(engine, body.model)
     enforce(engine, body.localOnly)
 
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
-    probe = getattr(engine, "probe_embeddings", None)
-    capable = (
-        await probe() if probe is not None else bool(getattr(engine, "supports_embeddings", False))
-    )
+    if entry is not None:
+        # An account's model says what it is on its own catalogue entry.
+        capable = "embeddings" in entry.surfaces
+    else:
+        probe = getattr(engine, "probe_embeddings", None)
+        capable = (
+            await probe()
+            if probe is not None
+            else bool(getattr(engine, "supports_embeddings", False))
+        )
     if not capable:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -209,7 +225,7 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
                 detail=(
                     f"This driver's backend ({kind_label}) does not serve embeddings, so the "
                     "request was refused rather than answered with something that is not one. "
-                    "GET /v1/info reports capabilities.embeddings; the gateway reports the same "
+                    "GET /v1/info reports each model's surfaces; the gateway reports the same "
                     "per model as x_eugene_plexus.surfaces on GET /v1/models. A local engine "
                     "must be started in embedding mode -- it is a property of the running "
                     "backend, not of the model."
@@ -221,7 +237,9 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
     token = request_id.set(str(body.requestId) if body.requestId else None)
     try:
         return await serve_while_connected(
-            request, engine.embed(list(body.input)), what="an embedding"
+            request,
+            cast(Any, engine).embed(list(body.input), model=body.model),
+            what="an embedding",
         )
     except ClientGone as e:
         raise _client_gone() from e
@@ -249,8 +267,9 @@ async def decide(request: Request, body: DecisionRequest) -> DecisionResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
+    entry = _resolve_model(engine, body.model)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
-    if not getattr(engine, "decision_kinds", None):
+    if entry is not None or not getattr(engine, "decision_kinds", None):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=Problem(
@@ -299,9 +318,67 @@ async def decide(request: Request, body: DecisionRequest) -> DecisionResponse:
         request_id.reset(token)
 
 
-def _refuse_non_chat(engine: BackendEngine) -> None:
-    """A decision backend refuses chat with the door's name, not a
-    protocol error from inside a backend that never spoke chat."""
+def _resolve_model(engine: BackendEngine, requested: str | None) -> DriverModel | None:
+    """Which model this request is for, refused before any backend work.
+
+    Returns the account's catalogue entry, whose surfaces and capabilities
+    the gates below read; None for a single-model driver, whose gates read
+    the engine as they always have. A model this driver does not serve is
+    **404** and never answered by whatever it happens to hold -- answering
+    a request for model A with model B is the substitution `models[]`
+    exists to rule out.
+    """
+    try:
+        resolver = getattr(engine, "resolve_model", None)
+        if resolver is not None:
+            return getattr(resolver(requested), "entry", None)
+        resolve_single_model(getattr(engine, "_model_id", None), requested)
+        return None
+    except ModelNotServed as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#model-not-served",
+                title="Model not served by this driver",
+                status=404,
+                detail=str(e) + " No backend was called.",
+                component="inference-driver",
+                retryDisposition=RetryDisposition.safe,
+            ).model_dump(exclude_none=True),
+        ) from None
+    except ModelRequired as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#model-required",
+                title="This driver needs to be told which model",
+                status=400,
+                detail=str(e),
+                component="inference-driver",
+            ).model_dump(exclude_none=True),
+        ) from None
+
+
+def _refuse_non_chat(engine: BackendEngine, entry: DriverModel | None = None) -> None:
+    """A model that does not chat refuses chat with a sentence, not a
+    protocol error from inside a backend that never spoke it."""
+    if entry is not None:
+        if "chat" in entry.surfaces:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#chat-unsupported",
+                title="This model does not answer chat",
+                status=400,
+                detail=(
+                    f"{entry.id!r} answers "
+                    f"{', '.join(entry.surfaces) or 'nothing Eugene serves yet'}, not chat. "
+                    "GET /v1/info lists what each model answers."
+                ),
+                component="inference-driver",
+            ).model_dump(exclude_none=True),
+        )
     if getattr(engine, "chat_capable", True):
         return
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
@@ -346,7 +423,9 @@ def _frame(chunk: Any) -> str:
     return f"event: token\ndata: {json.dumps({'text': getattr(chunk, 'text', '')})}\n\n"
 
 
-def _refuse_unsupported_tools(engine: BackendEngine, body: GenerateRequest) -> None:
+def _refuse_unsupported_tools(
+    engine: BackendEngine, body: GenerateRequest, entry: DriverModel | None = None
+) -> None:
     """400 when the caller sent tools and this backend cannot carry them.
 
     **Never silently strip.** A harness that receives a plain answer
@@ -361,7 +440,10 @@ def _refuse_unsupported_tools(engine: BackendEngine, body: GenerateRequest) -> N
     """
     if not body.tools:
         return
-    if getattr(engine, "supports_tool_calling", False):
+    if entry is not None:
+        if entry.capabilities is not None and entry.capabilities.toolCalling:
+            return
+    elif getattr(engine, "supports_tool_calling", False):
         return
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
     raise HTTPException(
@@ -469,7 +551,9 @@ def _backend_error(e: Exception, kind_label: str) -> HTTPException:
     )
 
 
-async def _validate_content(engine: Any, body: GenerateRequest) -> None:
+async def _validate_content(
+    engine: Any, body: GenerateRequest, entry: DriverModel | None = None
+) -> None:
     try:
         await run_in_threadpool(validate_messages, body.messages)
     except ImageRefusal as exc:
@@ -479,8 +563,13 @@ async def _validate_content(engine: Any, body: GenerateRequest) -> None:
         ) from None
     if not has_images(body.messages):
         return
-    probe = getattr(engine, "probe_image_input", None)
-    if probe is None or not await probe():
+    if entry is not None:
+        # An account's model: its catalogue entry is the confirmation.
+        confirmed = entry.capabilities is not None and entry.capabilities.imageInput is True
+    else:
+        probe = getattr(engine, "probe_image_input", None)
+        confirmed = probe is not None and bool(await probe())
+    if not confirmed:
         raise HTTPException(
             status_code=400,
             detail={

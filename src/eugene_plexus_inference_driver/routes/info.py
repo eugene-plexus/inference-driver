@@ -15,6 +15,7 @@ from .._generated.models import (
     Capabilities,
     DecisionCapability,
     DriverInfo,
+    DriverModel,
     Problem,
 )
 from ..config import ConfigStore
@@ -25,8 +26,8 @@ router = APIRouter(tags=["meta"])
 log = logging.getLogger(__name__)
 
 
-@router.get("/v1/info", response_model=DriverInfo)
-async def info(request: Request) -> DriverInfo:
+@router.get("/v1/info", response_model=DriverInfo, response_model_exclude_none=True)
+async def info(request: Request, models: bool = True) -> DriverInfo:
     store: ConfigStore = request.app.state.config_store
     provider_key = str(store.get("provider") or "") or None
 
@@ -43,55 +44,22 @@ async def info(request: Request) -> DriverInfo:
 
     engine = request.app.state.adapter
     if engine is not None:
-        backend = engine.backend_kind
-        # The gateway reconfirms locality/settings within four seconds before
-        # waking a stopped runtime. Optional backend probes must not serialize
-        # their timeouts or let an embedding probe use the generation deadline.
-        # Keep known engine policy available; unconfirmed capabilities stay
-        # conservative, and cancelling a probe does not cache a false answer.
-        image_input, context_window, embeddings = await asyncio.gather(
-            _bounded_probe(_image_input(engine), False),
-            _bounded_probe(_context_window(engine), None),
-            _bounded_probe(_embeddings(engine), None),
-        )
+        catalogue = getattr(engine, "catalogue", None)
+        if not models:
+            served = None
+        elif catalogue is not None:
+            # A provider account: its catalogue, filtered by its patterns.
+            # No per-model probes -- the listing is the answer (P1-3).
+            served = catalogue.exposed()
+        else:
+            served = await _single_model(engine)
         return DriverInfo(
             locality=engine_locality(engine),
             localOnlyEnforced=True,
-            # Contracted since M0 and populated since M10, when there was
-            # finally something true to say: `streaming` means "emits
-            # genuinely incremental tokens", which is False for a backend
-            # that streams one whole message (codex) even though its
-            # endpoint works. A flag that said True for everything would
-            # tell a UI nothing.
-            capabilities=Capabilities(
-                supportedSettings=list(getattr(engine, "supported_settings", [])),
-                imageInput=image_input,
-                streaming=bool(getattr(engine, "supports_streaming", False)),
-                toolCalling=bool(getattr(engine, "supports_tool_calling", False)),
-                # Contracted at M0, populated by nothing until step 7 --
-                # `streaming`'s own story, one field over, and with the
-                # same consequence: every backend the install does not
-                # supervise advertised no context window at all, so the
-                # gateway published `context_length: null` for the most
-                # ordinary local setup there is. Probed from the backend
-                # and cached by the engine; None stays None rather than
-                # becoming a guess.
-                maxContextTokens=context_window,
-                # The third capability flag this project contracted and
-                # left unpopulated -- `streaming` was the first (M10),
-                # `maxContextTokens` the second (step 7). Determined by
-                # asking the backend, because nothing exposes it: see
-                # `probe_embeddings`.
-                embeddings=embeddings,
-                # Absent means chat-capable — every pre-decision backend —
-                # so only a decision engine changes anything by saying no.
-                chatCapable=bool(getattr(engine, "chat_capable", True)),
-                decision=_decision_capability(engine),
-            ),
-            backend=backend,
+            backend=engine.backend_kind,
             provider=provider_key,
-            modelId=store.get("modelId") or None,
-            upstreamModelId=store.get("upstreamModelId") or None,
+            models=served,
+            catalogue=catalogue.summary() if catalogue is not None else None,
             # Off the live engine: only set when the URL was genuinely
             # resolved from a runtime, so a stale name on a CLI provider
             # does not claim a runtime it is not fronting.
@@ -127,13 +95,69 @@ async def info(request: Request) -> DriverInfo:
         localOnlyEnforced=True,
         backend=backend,
         provider=provider_key,
-        modelId=store.get("modelId") or None,
-        upstreamModelId=store.get("upstreamModelId") or None,
+        # Degraded: nothing is served, and an empty list says so -- which is
+        # not an absent one, which would read as a driver from before P1.
+        models=[] if models else None,
         # Degraded: the configured intent, so a driver that failed to
         # resolve its runtime still says which one it was meant to front.
         runtime=runtime,
         version=__version__,
     )
+
+
+async def _single_model(engine: Any) -> list[DriverModel]:
+    """A single-model driver's one entry, probed as `/v1/info` always was.
+
+    Empty when no model is configured: a subscription CLI left on its
+    default, or a decision engine with none chosen, serves nothing
+    routable -- as a driver with no `modelId` did before P1.
+    """
+    model_id = getattr(engine, "model_id", None) or getattr(engine, "_model_id", None)
+    if not model_id:
+        return []
+    # The gateway reconfirms locality/settings within four seconds before
+    # waking a stopped runtime. Optional backend probes must not serialize
+    # their timeouts or let an embedding probe use the generation deadline.
+    # Keep known engine policy available; unconfirmed capabilities stay
+    # conservative, and cancelling a probe does not cache a false answer.
+    image_input, context_window, embeddings = await asyncio.gather(
+        _bounded_probe(_image_input(engine), False),
+        _bounded_probe(_context_window(engine), None),
+        _bounded_probe(_embeddings(engine), None),
+    )
+    decision = _decision_capability(engine)
+    # `surfaces` replaces `capabilities.embeddings` and `chatCapable`, with
+    # the gateway's old reading of them kept exactly: a backend that embeds
+    # is an embeddings backend, a decision engine answers decisions alone,
+    # and everything else -- every driver that predates both -- is chat.
+    if decision is not None or not getattr(engine, "chat_capable", True):
+        surfaces = ["decisions"]
+    elif embeddings is True:
+        surfaces = ["embeddings"]
+    else:
+        surfaces = ["chat"]
+    upstream = getattr(engine, "_upstream_model_id", None)
+    return [
+        DriverModel(
+            id=model_id,
+            upstreamId=upstream if upstream and upstream != model_id else None,
+            surfaces=surfaces,
+            capabilities=Capabilities(
+                supportedSettings=list(getattr(engine, "supported_settings", [])),
+                imageInput=image_input,
+                # Contracted since M0 and populated since M10, when there
+                # was finally something true to say: `streaming` means
+                # "emits genuinely incremental tokens", which is False for
+                # a backend that streams one whole message (codex).
+                streaming=bool(getattr(engine, "supports_streaming", False)),
+                toolCalling=bool(getattr(engine, "supports_tool_calling", False)),
+                # Probed from the backend and cached by the engine; None
+                # stays None rather than becoming a guess (step 7).
+                maxContextTokens=context_window,
+                decision=decision,
+            ),
+        )
+    ]
 
 
 async def _bounded_probe(probe: Awaitable[Any], fallback: Any) -> Any:

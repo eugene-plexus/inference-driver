@@ -120,7 +120,7 @@ async def test_the_template_is_given_exactly_what_a_generation_would_send(
     await engine.count_prompt_tokens(request)
 
     sent = _body(template)
-    expected = engine._payload_for(request)
+    expected = engine._payload_for(request, engine.resolve_model(request.model))
     assert sent["messages"] == expected["messages"]
     assert sent["tools"] == expected["tools"]
 

@@ -298,7 +298,10 @@ def test_config_test_resolves_a_pending_runtime_name(tmp_path: Path) -> None:
     )
 
     config = tmp_path / "config.yaml"
-    _write_config(config, provider="openai_compat_custom", runtimeName="qwen3-8b")
+    # A model named, so the test generates; an account would list instead.
+    _write_config(
+        config, provider="openai_compat_custom", runtimeName="qwen3-8b", modelId="Qwen3-8B"
+    )
     app = create_app(settings=Settings(config_file=config, agent_url=AGENT))
     with TestClient(app) as client:
         good = client.post("/v1/config/test").json()

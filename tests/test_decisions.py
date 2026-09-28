@@ -313,10 +313,11 @@ def test_a_decision_driver_refuses_chat_naming_the_door(tmp_path, monkeypatch) -
 def test_info_advertises_the_decision_capability(tmp_path, monkeypatch) -> None:
     with _decision_app_client(tmp_path, monkeypatch) as client:
         info = client.get("/v1/info").json()
-    assert info["capabilities"]["chatCapable"] is False
-    assert info["capabilities"]["decision"]["kinds"] == ["noul", "choice", "score"]
-    assert info["capabilities"]["decision"]["maxConcurrent"] == 1
-    assert info["modelId"] == "decisions"
+    (model,) = info["models"]
+    assert model["surfaces"] == ["decisions"]
+    assert model["capabilities"]["decision"]["kinds"] == ["noul", "choice", "score"]
+    assert model["capabilities"]["decision"]["maxConcurrent"] == 1
+    assert model["id"] == "decisions"
 
 
 @respx.mock

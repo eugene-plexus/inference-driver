@@ -92,8 +92,12 @@ def _modelid_field() -> ConfigField:
             "Which specific model to ask the backend for (e.g. "
             '"gpt-4o", "claude-opus-4-7", "grok-2", '
             '"llama3.1:70b"). The list below is discovered from the '
-            "selected provider; pick the empty entry to fall back to "
-            "the engine's built-in default."
+            "selected provider. **Leave it empty to use every model** an "
+            "API provider or local server lists (OpenRouter, OpenAI, "
+            "Ollama, LM Studio, a custom URL): this driver then serves "
+            "them all, each published as <this driver's name>/<model>. "
+            "For the Claude and ChatGPT subscriptions, empty falls back "
+            "to the CLI's own default model."
         ),
         category="adapter",
         valueType=ConfigValueType.string,
@@ -385,6 +389,18 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         allowed = field.enumValues or []
         if value not in allowed:
             return f"must be one of {allowed}"
+        return None
+
+    if vt == ConfigValueType.string_list:
+        if not isinstance(value, list):
+            return f"expected a list of strings, got {type(value).__name__}"
+        for i, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                return f"entry {i} must be a non-empty string"
+            if len(item) > 256:
+                return f"entry {i} is longer than 256 characters"
+        if len(value) > 100:
+            return "at most 100 entries"
         return None
 
     return f"unsupported valueType: {vt}"

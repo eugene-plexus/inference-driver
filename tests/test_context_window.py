@@ -273,7 +273,7 @@ def test_info_reports_the_window_the_backend_admitted_to(client: TestClient) -> 
 
     body = client.get("/v1/info").json()
 
-    assert body["capabilities"]["maxContextTokens"] == 8192
+    assert body["models"][0]["capabilities"]["maxContextTokens"] == 8192
 
 
 def test_a_failing_probe_does_not_take_v1_info_down(client: TestClient) -> None:
@@ -285,7 +285,7 @@ def test_a_failing_probe_does_not_take_v1_info_down(client: TestClient) -> None:
     response = client.get("/v1/info")
 
     assert response.status_code == 200
-    assert response.json()["capabilities"]["maxContextTokens"] is None
+    assert response.json()["models"][0]["capabilities"].get("maxContextTokens") is None
 
 
 class _Refusing:
@@ -301,6 +301,7 @@ class _Refusing:
 
 class _WithWindow:
     backend_kind = BackendKind.openai_compat_http
+    model_id = "the-model"
     supports_streaming = True
     supports_tool_calling = True
     runtime = None

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Request
@@ -46,6 +49,7 @@ def build_engine_with(
     get: Callable[[str], Any],
     *,
     resolve_runtime: RuntimeResolver | None = None,
+    catalogue_path: Path | None = None,
 ) -> BackendEngine:
     """Construct an engine from a key->value getter.
 
@@ -67,6 +71,12 @@ def build_engine_with(
     provider = get_provider(provider_key)
 
     kwargs: dict[str, Any] = dict(provider.engine_kwargs)
+    if getattr(provider.engine_class, "serves_accounts", False):
+        # A provider account keeps its last good model list beside this
+        # driver's config (`catalogue_path`); a throwaway engine built by
+        # `/v1/config/test` passes none, so a test never writes one.
+        kwargs["provider"] = provider_key
+        kwargs["catalogue_path"] = catalogue_path
     runtime_name = str(get("runtimeName") or "").strip()
     if runtime_name:
         if getattr(provider.engine_class, "follows_runtimes", False):
@@ -103,10 +113,21 @@ def build_engine_with(
 
 
 def build_engine(
-    store: ConfigStore, *, resolve_runtime: RuntimeResolver | None = None
+    store: ConfigStore,
+    *,
+    resolve_runtime: RuntimeResolver | None = None,
+    catalogue_path: Path | None = None,
 ) -> BackendEngine:
     """Construct the configured engine from the runtime config store."""
-    return build_engine_with(store.get, resolve_runtime=resolve_runtime)
+    return build_engine_with(
+        store.get, resolve_runtime=resolve_runtime, catalogue_path=catalogue_path
+    )
+
+
+def catalogue_path_for(config_file: Path) -> Path:
+    """Where an account's last good model list is kept: beside its config,
+    named after it (`openrouter.yaml` -> `openrouter.catalogue.json`)."""
+    return config_file.with_name(f"{config_file.stem}.catalogue.json")
 
 
 @asynccontextmanager
@@ -158,7 +179,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.adapter_error = "running in safe mode"
     else:
         try:
-            engine = build_engine(store, resolve_runtime=runtime_resolver_for(app))
+            engine = build_engine(
+                store,
+                resolve_runtime=runtime_resolver_for(app),
+                catalogue_path=catalogue_path_for(settings.config_file),
+            )
             app.state.adapter = engine  # historical name; routes still read `app.state.adapter`
             app.state.adapter_error = None
             log.info("engine ready: backend=%s", engine.backend_kind.value)
@@ -170,6 +195,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "mode — fix config via /v1/config and restart",
                 e,
             )
+
+    # A provider account reads its model list now and then on its interval.
+    # In the background: a slow or down upstream must not hold the driver's
+    # startup, and the last good list (read from disk) serves meanwhile.
+    app.state.catalogue_task = None
+    catalogue = getattr(app.state.adapter, "catalogue", None)
+    if catalogue is not None:
+        app.state.catalogue_task = asyncio.create_task(catalogue.run(), name="catalogue")
 
     # Discover the engine's available models for the modelId dropdown
     # in the UI. Best-effort: an unreachable backend leaves the list
@@ -195,6 +228,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        task = app.state.catalogue_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         # The engine owns one HTTP client for the life of the process
         # (see `OpenAiCompatibleHttpEngine._client`). Release its
         # connection pool on the way out rather than leaving sockets to

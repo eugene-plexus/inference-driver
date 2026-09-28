@@ -290,5 +290,6 @@ def test_info_advertises_public_and_upstream(tmp_path, monkeypatch) -> None:
     with TestClient(create_app()) as client:
         info = client.get("/v1/info").json()
 
-    assert info["modelId"] == "public-alias"
-    assert info["upstreamModelId"] == "default_model"
+    (model,) = info["models"]
+    assert model["id"] == "public-alias"
+    assert model["upstreamId"] == "default_model"

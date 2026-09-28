@@ -122,7 +122,9 @@ def test_thinking_directive_preserves_image():
     adapter = engine()
     adapter._thinking_mode = "off"
     body = request()
-    payload = adapter._payload_for(GenerateRequest.model_validate(body))
+    payload = adapter._payload_for(
+        GenerateRequest.model_validate(body), adapter.resolve_model(None)
+    )
     assert payload["messages"][-1] == body["messages"][0]
 
 

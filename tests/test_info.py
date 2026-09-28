@@ -40,6 +40,7 @@ def test_optional_probes_cannot_block_local_policy_confirmation(
         backend_kind="openai_compat_http",
         routing_locality="local",
         runtime="cold-model",
+        model_id="cold-model-alias",
         supported_settings=["maxTokens"],
         supports_streaming=True,
         supports_tool_calling=True,
@@ -56,19 +57,22 @@ def test_optional_probes_cannot_block_local_policy_confirmation(
     body = response.json()
     assert body["locality"] == "local" and body["localOnlyEnforced"] is True
     assert body["runtime"] == "cold-model"
-    assert body["capabilities"]["toolCalling"] is True
-    assert body["capabilities"]["supportedSettings"] == ["maxTokens"]
+    (model,) = body["models"]
+    assert model["id"] == "cold-model-alias"
+    assert model["capabilities"]["toolCalling"] is True
+    assert model["capabilities"]["supportedSettings"] == ["maxTokens"]
     if delay < 3:
-        assert body["capabilities"]["imageInput"] is True
-        assert body["capabilities"]["maxContextTokens"] == 16384
-        assert body["capabilities"]["embeddings"] is True
+        assert model["capabilities"]["imageInput"] is True
+        assert model["capabilities"]["maxContextTokens"] == 16384
+        assert model["surfaces"] == ["embeddings"]
     else:
-        assert body["capabilities"]["imageInput"] is False
-        assert body["capabilities"]["maxContextTokens"] is None
-        assert body["capabilities"]["embeddings"] is None
+        assert model["capabilities"]["imageInput"] is False
+        assert model["capabilities"].get("maxContextTokens") is None
+        # An unanswered embeddings probe is not a yes: the model is chat.
+        assert model["surfaces"] == ["chat"]
         assert sorted(cancelled) == ["context", "embeddings", "image"]
         delay = 0
-        recovered = client.get("/v1/info").json()["capabilities"]
-        assert recovered["imageInput"] is True
-        assert recovered["maxContextTokens"] == 16384
-        assert recovered["embeddings"] is True
+        (recovered,) = client.get("/v1/info").json()["models"]
+        assert recovered["capabilities"]["imageInput"] is True
+        assert recovered["capabilities"]["maxContextTokens"] == 16384
+        assert recovered["surfaces"] == ["embeddings"]
