@@ -540,7 +540,9 @@ def classify_openai_model(model_id: str) -> list[str]:
         return ["speech"]
     if lowered.startswith("whisper-") or "transcribe" in lowered:
         return ["transcription"]
-    if lowered.startswith(("dall-e-", "gpt-image-")):
+    # `chatgpt-image-latest` is an image model too (OpenAI's edit models;
+    # on the account Troy gave, measured 2026-09-28) and filed as nothing.
+    if lowered.startswith(("dall-e-", "gpt-image-", "chatgpt-image-")):
         return ["image"]
     if lowered.startswith("sora"):
         return ["video"]

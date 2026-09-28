@@ -575,6 +575,7 @@ def test_openais_own_list_is_sorted_by_surface_not_filtered() -> None:
     assert classify_openai_model("tts-1-hd") == ["speech"]
     assert classify_openai_model("whisper-1") == ["transcription"]
     assert classify_openai_model("gpt-image-1") == ["image"]
+    assert classify_openai_model("chatgpt-image-latest") == ["image"]
     assert classify_openai_model("omni-moderation-latest") == ["moderation"]
     assert classify_openai_model("babbage-002") == []
 
