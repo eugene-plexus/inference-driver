@@ -140,6 +140,11 @@ async def _single_model(engine: Any) -> list[DriverModel]:
         surfaces = ["embeddings"]
     else:
         surfaces = ["chat"]
+        # P3b: `llama-server`'s `/v1/audio/transcriptions` answers only
+        # with a projector that hears, which is what `/props` reports as
+        # audio (measured), so the same probe says it transcribes.
+        if audio_input is True and getattr(engine, "transcribe", None) is not None:
+            surfaces.append("transcription")
     upstream = getattr(engine, "_upstream_model_id", None)
     return [
         DriverModel(

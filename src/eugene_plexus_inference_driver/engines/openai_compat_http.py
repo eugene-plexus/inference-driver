@@ -58,6 +58,8 @@ from .._generated.models import (
     StreamProgress,
     ToolCall,
     ToolCallDelta,
+    TranscribeRequest,
+    TranscribeResponse,
     Usage,
 )
 from .._http import client_for
@@ -71,6 +73,7 @@ from ..speech import (
     refuse_format,
     streaming_wav_header,
 )
+from ..transcription import response_from
 from ._catalogue import (
     _LIST_TIMEOUT,
     _SHOW_CONCURRENCY,
@@ -1768,6 +1771,66 @@ class OpenAiCompatibleHttpEngine:
             raise _timed_out(e, self._timeout_seconds, "the speech request") from e
         except httpx.HTTPError as e:
             raise CliError(f"openai_compat_http speech failed: {e!r}") from e
+
+    async def transcribe(self, request: TranscribeRequest, audio: bytes) -> TranscribeResponse:
+        """`POST /v1/audio/transcriptions` upstream, in OpenAI's multipart
+        form, which OpenRouter and `llama-server` both take (measured).
+
+        **`response_format` is sent only for `verbose`**: `json` is every
+        backend's default, and `llama-server` refuses every other value, so
+        leaving it out is the one request all three answer the same way.
+        """
+        started = time.perf_counter()
+        target = self.resolve_model(request.model)
+        fields: dict[str, Any] = {"model": target.upstream}
+        if request.verbose:
+            fields["response_format"] = "verbose_json"
+        if request.language:
+            fields["language"] = request.language
+        if request.prompt:
+            fields["prompt"] = request.prompt
+        if request.temperature is not None:
+            fields["temperature"] = str(request.temperature)
+        if request.timestampGranularities:
+            fields["timestamp_granularities[]"] = [g.value for g in request.timestampGranularities]
+        upload = (
+            request.audio.filename,
+            audio,
+            request.audio.mediaType or "application/octet-stream",
+        )
+        client = self._client()
+        try:
+            response = await client.post(
+                "/v1/audio/transcriptions",
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                data=fields,
+                files={"file": upload},
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the transcription") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http transcription failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for a transcription: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+            )
+        try:
+            body = response.json()
+            return response_from(
+                body,
+                model_id=body.get("model") if isinstance(body.get("model"), str) else target.id,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        except (ValueError, AttributeError) as e:
+            raise CliError(f"openai_compat_http transcription answer was not usable: {e}") from e
 
     async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
         """`POST /v1/embeddings` upstream, in the shape OpenAI defined.

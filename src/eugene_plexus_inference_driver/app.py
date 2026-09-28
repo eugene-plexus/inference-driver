@@ -24,6 +24,7 @@ from .routes import generate as generate_routes
 from .routes import health as health_routes
 from .routes import info as info_routes
 from .routes import speak as speak_routes
+from .routes import transcribe as transcribe_routes
 from .runtime_lookup import resolve_runtime_url
 from .settings import Settings, load_settings
 
@@ -288,6 +289,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(info_routes.router, dependencies=authorized)
     app.include_router(generate_routes.router, dependencies=authorized)
     app.include_router(speak_routes.router, dependencies=authorized)
+    app.include_router(transcribe_routes.router, dependencies=authorized)
 
     # Operator-only surfaces: config edits and the restart trigger ride
     # on the UI's session token. Service tokens are rejected so a
@@ -305,6 +307,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         InferenceBodyLimit,
         paths={"/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide", "/v1/speak"},
+        # P3b: 25 MiB of audio is 33.4 MiB of base64, plus the fields.
+        limits={"/v1/transcribe": 36 * 1024 * 1024},
         driver=True,
     )
     return app
