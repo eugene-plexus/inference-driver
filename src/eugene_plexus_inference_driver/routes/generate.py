@@ -32,7 +32,7 @@ from ..engines.base import (
     resolve_single_model,
 )
 from ..engines.systemone_http import validate_questions
-from ..failures import disposition, request_id
+from ..failures import credential_refused, disposition, request_id
 from ..images import ImageRefusal, attachment_kinds, validate_messages
 from ..locality import enforce
 
@@ -521,6 +521,32 @@ def _not_configured(adapter_error: str | None) -> HTTPException:
 
 
 def _backend_error(e: Exception, kind_label: str) -> HTTPException:
+    refused = credential_refused(e)
+    if refused is not None:
+        # The backend refused OUR key, not the caller's request. A 400 here
+        # told the caller to fix a request that was fine (measured live
+        # against OpenRouter). 502, because the fault is upstream of the
+        # caller; `terminal`, because the 4xx non-cascade rule is older
+        # than this and changing what we SAY must not change what we DO.
+        what = "the account behind its API key has no credit" if refused == 402 else "its API key"
+        step = "Add credit to that account, or set" if refused == 402 else "Set"
+        wait = getattr(e, "retry_after_seconds", None)
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            headers={"Retry-After": str(int(wait + 0.999))} if wait is not None else None,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#backend-credential-refused",
+                title="Backend refused this driver's credential",
+                status=502,
+                detail=(
+                    f"The backend refused this driver's credential ({what}; HTTP {refused}): {e} "
+                    f"Nothing is wrong with the request. {step} a working API key on this driver."
+                ),
+                component=f"inference-driver:{kind_label}",
+                retryDisposition=RetryDisposition.terminal,
+                retryAfterSeconds=wait,
+            ).model_dump(exclude_none=True),
+        )
     outcome = disposition(e)
     code = 504 if isinstance(e, BackendTimeout) else 400 if outcome == "terminal" else 502
     delay = getattr(e, "retry_after_seconds", None)
