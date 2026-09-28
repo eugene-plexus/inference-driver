@@ -109,6 +109,9 @@ def test_the_listing_says_a_model_speaks_in_which_voices_and_formats() -> None:
 
 def _openrouter(tmp_path: Path, upstream: httpx.Response):
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     route = respx.post(f"{OPENROUTER}/v1/audio/speech").mock(return_value=upstream)
     return TestClient(
         create_app(settings=Settings(config_file=_config(tmp_path, provider="openrouter")))

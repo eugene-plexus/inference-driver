@@ -120,6 +120,9 @@ def test_a_listing_confirms_audio_and_files_per_model() -> None:
 @respx.mock
 def test_the_part_reaches_the_backend_exactly_as_sent(account: Path, part: dict) -> None:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion())
     )
@@ -137,6 +140,9 @@ def test_a_model_whose_listing_does_not_take_it_is_never_sent_it(
     account: Path, part: dict, word: str
 ) -> None:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion())
     )
@@ -153,6 +159,9 @@ def test_bare_base64_is_carried_as_the_data_url_openrouter_requires(account: Pat
     """Measured 2026-09-28: OpenRouter answers bare base64 with *Invalid
     content*, while OpenAI's schema calls the field base64."""
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(200, json=_completion())
     )
@@ -189,6 +198,9 @@ def test_a_bad_attachment_is_refused_before_any_network(
     account: Path, part: dict, said: str
 ) -> None:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     upstream = respx.post(f"{OPENROUTER}/v1/chat/completions")
     with TestClient(create_app(settings=Settings(config_file=account))) as client:
         _ready(client)
@@ -246,6 +258,9 @@ def test_a_cli_backend_refuses_audio_rather_than_flattening_it(app, stream) -> N
 @respx.mock
 def test_a_backend_echo_of_the_audio_is_not_exposed(account: Path) -> None:
     respx.get(f"{OPENROUTER}/v1/models/user").mock(return_value=httpx.Response(200, json=LISTING))
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     body = ask(audio_part(), model="google/gemini-2.5-flash-lite")
     respx.post(f"{OPENROUTER}/v1/chat/completions").mock(
         return_value=httpx.Response(400, json=body)

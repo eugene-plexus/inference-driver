@@ -47,6 +47,7 @@ import httpx
 
 from .._generated.models import Capabilities, DriverCatalogue, DriverModel
 from .._private_files import write_private_text
+from ..images_out import openai_caps, openrouter_caps
 from ..speech import ALL_FORMATS, OPENROUTER_FORMATS
 
 log = logging.getLogger(__name__)
@@ -216,6 +217,39 @@ def from_openrouter(body: Any) -> list[DriverModel]:
     return models
 
 
+def with_openrouter_images(models: list[DriverModel], body: Any) -> list[DriverModel]:
+    """OpenRouter's `GET /images/models` laid over its account listing (P4).
+
+    **Authoritative for the `image` surface**: a model this listing names
+    serves `/v1/image` with the settings it lists, Gemini's image+text chat
+    models included (they answer the images route too, measured); a model
+    it does not name does not, whatever its output modalities say
+    (`openrouter/auto` has image output and no images entry). The main
+    listing's `supported_parameters` for an image model is chat-style and
+    says nothing about images, so this second read is the only source.
+    """
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        raise CatalogueError("OpenRouter's image model list had no `data` array")
+    listed = {
+        entry["id"]: entry
+        for entry in data
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
+    for model in models:
+        entry = listed.get(model.id)
+        surfaces = [s for s in model.surfaces if s != "image"]
+        if entry is not None:
+            surfaces.append("image")
+            if model.capabilities is None:
+                model.capabilities = Capabilities()
+            model.capabilities.image = openrouter_caps(entry)
+        elif model.capabilities is not None:
+            model.capabilities.image = None
+        model.surfaces = surfaces
+    return models
+
+
 def ollama_entry(name: str, show: dict[str, Any] | None, defaults: EngineDefaults) -> DriverModel:
     """One pulled model. `capabilities` is on `/api/show` from Ollama 0.6;
     an older Ollama, or a failed show, inherits the driver's own answer."""
@@ -324,6 +358,10 @@ def from_openai_list(
             # Only OpenAI's own list sorts a model into speech, and its API
             # makes all six formats (P3a).
             model.capabilities.speechFormats = list(ALL_FORMATS)
+        if "image" in model.surfaces and model.capabilities is not None:
+            # Only OpenAI's own list sorts a model into image, and its API
+            # checks its own image fields (P4).
+            model.capabilities.image = openai_caps(entry["id"])
         window = entry.get("max_model_len")
         if isinstance(window, int) and window > 0 and model.capabilities is not None:
             model.capabilities.maxContextTokens = window

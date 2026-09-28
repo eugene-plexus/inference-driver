@@ -30,7 +30,12 @@ def test_a_chunked_body_past_the_limit_is_refused(
     assert "16 MiB" in response.text
 
 
-@pytest.mark.parametrize("path", BOUNDED)
+#: Paths with a larger limit of their own (P3b's audio, P4's images): bounded
+#: all the same, which is what a missing row would lose.
+OWN_LIMIT = ["/v1/transcribe", "/v1/image", "/v1/image/stream"]
+
+
+@pytest.mark.parametrize("path", BOUNDED + OWN_LIMIT)
 def test_a_declared_length_past_the_limit_is_refused_unread(client: TestClient, path: str) -> None:
     response = client.post(path, content=b"{}", headers={"content-length": "9" * 5000})
     assert response.status_code == 413, response.text

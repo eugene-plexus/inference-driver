@@ -140,6 +140,9 @@ def _serve(config: Path, upstream: httpx.Response, base: str = OPENROUTER):
         respx.get(f"{OPENROUTER}/v1/models/user").mock(
             return_value=httpx.Response(200, json=LISTING)
         )
+        respx.get(f"{OPENROUTER}/v1/images/models").mock(
+            return_value=httpx.Response(200, json={"data": []})
+        )
     else:
         respx.get(f"{base}/v1/models").mock(
             return_value=httpx.Response(

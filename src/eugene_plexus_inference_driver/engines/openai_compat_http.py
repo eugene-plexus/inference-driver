@@ -51,6 +51,9 @@ from .._generated.models import (
     FunctionCall,
     GenerateRequest,
     GenerateResponse,
+    ImagePartial,
+    ImageRequest,
+    ImageResponse,
     Role,
     SpeakRequest,
     SpeechFormat,
@@ -66,6 +69,14 @@ from .._http import client_for
 from ..audio_out import AudioAssembly
 from ..failures import request_id, retry_after
 from ..images import attachment_kinds, content_wire
+from ..images_out import ImageRefusal as ImageOutRefusal
+from ..images_out import (
+    completed_from,
+    event_kind,
+    format_name,
+    partial_from,
+)
+from ..images_out import response_from as images_response_from
 from ..speech import (
     ALL_FORMATS,
     OPENROUTER_FORMATS,
@@ -86,6 +97,7 @@ from ._catalogue import (
     from_openrouter,
     ollama_entry,
     upstream_words,
+    with_openrouter_images,
 )
 from ._subprocess import BackendTimeout, CliError
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
@@ -951,6 +963,11 @@ class OpenAiCompatibleHttpEngine:
             # public 458 that output text; this is the 625 this key can
             # call (measured 2026-09-27).
             models = from_openrouter(await read("/v1/models/user?output_modalities=all"))
+            # P4: the image settings live only on the images listing. A
+            # failed read of it fails the whole refresh, so the last good
+            # list stays in force rather than every image model losing its
+            # door for an hour (R2.1).
+            models = with_openrouter_images(models, await read("/v1/images/models"))
             return [self._with_fixed_temperature(m) for m in models]
         if source == "ollama":
             body = await read("/api/tags")
@@ -1831,6 +1848,229 @@ class OpenAiCompatibleHttpEngine:
             )
         except (ValueError, AttributeError) as e:
             raise CliError(f"openai_compat_http transcription answer was not usable: {e}") from e
+
+    def _image_target(self, request: ImageRequest, mask: bytes | None) -> _Target:
+        """The model an image request is for, refused before any upload
+        leaves: one without the `image` surface, and a `mask` for a backend
+        that would ignore it (OpenRouter does, measured) -- a silently
+        ignored mask is an edit of the whole picture."""
+        target = self.resolve_model(request.model)
+        if target.entry is not None and "image" not in (target.entry.surfaces or []):
+            raise ImageOutRefusal(
+                f"{target.id!r} does not make images; choose a model with the image surface"
+            )
+        caps = (
+            target.entry.capabilities.image if target.entry and target.entry.capabilities else None
+        )
+        if mask is not None and caps is not None and not caps.mask:
+            raise ImageOutRefusal(
+                f"mask: {target.id!r} does not honour a mask (only OpenAI's own API does), so "
+                "the edit would change the whole image. Send it without mask, or to an OpenAI "
+                "account's image model."
+            )
+        return target
+
+    def _image_request(
+        self,
+        target: _Target,
+        request: ImageRequest,
+        uploads: list[bytes],
+        mask: bytes | None,
+        *,
+        stream: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """The upstream path and `httpx` arguments for one image request.
+
+        **OpenRouter has no edit route** (404, measured): an edit is a
+        generation with `input_references`, which must be objects -- the
+        plain strings its guide shows are a 400 (measured). **OpenAI** takes
+        an edit on `/v1/images/edits` in the multipart form its SDK sends,
+        and answers `dall-e-*` with a URL unless asked for `b64_json`; its
+        GPT image models always answer base64 and take no
+        `response_format`.
+        """
+        settings: list[tuple[str, Any]] = [
+            ("n", request.n),
+            ("size", request.size),
+            ("quality", request.quality),
+            ("background", request.background),
+            ("output_format", request.outputFormat),
+            ("output_compression", request.outputCompression),
+            ("moderation", request.moderation),
+            ("style", request.style),
+            ("user", request.user),
+            ("input_fidelity", request.inputFidelity),
+        ]
+        if stream:
+            settings.append(("stream", True))
+            settings.append(("partial_images", request.partialImages))
+        chosen = {key: value for key, value in settings if value is not None}
+        dall_e = target.upstream.lower().startswith("dall-e-")
+        if self._catalogue_source == "openrouter" or not request.references:
+            payload: dict[str, Any] = {"model": target.upstream, "prompt": request.prompt, **chosen}
+            if request.references:
+                payload["input_references"] = [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{ref.mediaType};base64,{ref.data}"},
+                    }
+                    for ref in request.references
+                ]
+            if dall_e:
+                payload["response_format"] = "b64_json"
+            return "/v1/images/generations", {"json": payload}
+        fields: dict[str, Any] = {"model": target.upstream, "prompt": request.prompt}
+        for key, value in chosen.items():
+            fields[key] = "true" if value is True else str(value)
+        if dall_e:
+            fields["response_format"] = "b64_json"
+        name = "image" if len(uploads) == 1 else "image[]"
+        files: list[tuple[str, tuple[str, bytes, str]]] = []
+        for index, (ref, raw) in enumerate(zip(request.references, uploads, strict=True)):
+            ext = format_name(ref.mediaType)
+            files.append((name, (f"image{index}.{ext}", raw, ref.mediaType)))
+        if mask is not None and request.mask is not None:
+            files.append(
+                (
+                    "mask",
+                    (f"mask.{format_name(request.mask.mediaType)}", mask, request.mask.mediaType),
+                )
+            )
+        return "/v1/images/edits", {"data": fields, "files": files}
+
+    async def image(
+        self, request: ImageRequest, uploads: list[bytes], mask: bytes | None
+    ) -> ImageResponse:
+        """Images made or edited, answered as base64 with the media type
+        their bytes carry (P4). `uploads` are `request.references` decoded,
+        in order; the route has checked each is an image."""
+        started = time.perf_counter()
+        target = self._image_target(request, mask)
+        path, sending = self._image_request(target, request, uploads, mask, stream=False)
+        client = self._client()
+        try:
+            response = await client.post(
+                path,
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                **sending,
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the image request") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http image request failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for an image request: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+            )
+        try:
+            return images_response_from(
+                response.json(),
+                model_id=target.id,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        except (ValueError, AttributeError) as e:
+            raise CliError(f"openai_compat_http image answer was not usable: {e}") from e
+
+    async def image_stream(
+        self, request: ImageRequest, uploads: list[bytes], mask: bytes | None
+    ) -> AsyncGenerator[ImagePartial | ImageResponse, None]:
+        """Partial renders as they arrive, then the final `ImageResponse`.
+
+        Reads both backends' streams: OpenAI's `event:`-named frames and
+        OpenRouter's bare `data:` frames with `: ` keepalives between them
+        (measured). **A backend that answers plain JSON although asked to
+        stream** -- OpenRouter does, for a model that cannot -- is refused:
+        the model's listing said it streams, and a stream with its partials
+        missing is not what was asked for (P4-3).
+        """
+        started = time.perf_counter()
+        target = self._image_target(request, mask)
+        caps = (
+            target.entry.capabilities.image if target.entry and target.entry.capabilities else None
+        )
+        if caps is not None and not caps.streaming:
+            raise ImageOutRefusal(f"stream: {target.id!r} does not stream partial images")
+        path, sending = self._image_request(target, request, uploads, mask, stream=True)
+        client = self._client()
+        completed: list[dict[str, Any]] = []
+        partials = 0
+        try:
+            async with client.stream(
+                "POST",
+                path,
+                headers={
+                    **self._headers(),
+                    "Accept": "text/event-stream",
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                **sending,
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise CliError(
+                        f"openai_compat_http returned {response.status_code} for an image "
+                        f"stream: {_redact(body.decode('utf-8', 'replace')[:500])}",
+                        upstream_status=response.status_code,
+                        retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+                    )
+                if "text/event-stream" not in response.headers.get("content-type", ""):
+                    await response.aread()
+                    raise ImageOutRefusal(
+                        f"stream: {target.id!r} answered one JSON document although asked to "
+                        "stream, so it gives no partial images. Ask without stream."
+                    )
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                    except ValueError as e:
+                        raise CliError(
+                            f"openai_compat_http image stream sent a bad frame: {e}"
+                        ) from e
+                    if isinstance(event, dict) and (
+                        event.get("type") == "error" or "error" in event
+                    ):
+                        raise CliError(
+                            "openai_compat_http image stream failed: "
+                            f"{_redact(json.dumps(event.get('error', event))[:500])}"
+                        )
+                    kind = event_kind(event)
+                    try:
+                        if kind == "partial":
+                            yield partial_from(event, partials)
+                            partials += 1
+                        elif kind == "completed":
+                            completed.append(event)
+                    except ValueError as e:
+                        raise CliError(
+                            f"openai_compat_http image stream frame was not usable: {e}"
+                        ) from e
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the image stream") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http image stream failed: {e!r}") from e
+        try:
+            yield completed_from(
+                completed,
+                model_id=target.id,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        except ValueError as e:
+            raise CliError(f"openai_compat_http image stream ended badly: {e}") from e
 
     async def embed(self, inputs: list[str], *, model: str | None = None) -> EmbedResponse:
         """`POST /v1/embeddings` upstream, in the shape OpenAI defined.
