@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_inference_driver import body_limit
 
-BOUNDED = ["/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide"]
+BOUNDED = ["/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide", "/v1/speak"]
 
 
 @pytest.mark.parametrize("path", BOUNDED)

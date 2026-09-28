@@ -304,7 +304,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # memory exhaustion. A new body-taking inference route belongs here.
     app.add_middleware(
         InferenceBodyLimit,
-        paths={"/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide"},
+        paths={"/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide", "/v1/speak"},
         driver=True,
     )
     return app
