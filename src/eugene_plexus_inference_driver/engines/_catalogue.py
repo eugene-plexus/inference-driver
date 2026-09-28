@@ -192,6 +192,10 @@ def from_openrouter(body: Any) -> list[DriverModel]:
                     imageInput="image" in inputs,
                     audioInput="audio" in inputs,
                     fileInput="file" in inputs,
+                    # From what the model gives back, not from its
+                    # parameter list: no audio-output model on OpenRouter
+                    # lists `modalities` or `audio` there (P2b, measured).
+                    audioOutput="audio" in output,
                     toolCalling="tools" in params,
                     maxContextTokens=context if isinstance(context, int) and context > 0 else None,
                 ),
@@ -244,6 +248,7 @@ def _inherited(
             imageInput=False,
             audioInput=False,
             fileInput=False,
+            audioOutput=False,
             toolCalling=defaults.tool_calling and "chat" in served,
             maxContextTokens=None,
         ),

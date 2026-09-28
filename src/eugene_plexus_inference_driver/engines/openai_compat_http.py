@@ -56,6 +56,7 @@ from .._generated.models import (
     Usage,
 )
 from .._http import client_for
+from ..audio_out import AudioAssembly
 from ..failures import request_id, retry_after
 from ..images import attachment_kinds, content_wire
 from ._catalogue import (
@@ -1076,6 +1077,15 @@ class OpenAiCompatibleHttpEngine:
             )
         if self._require_parameters and request.callerSettings:
             payload["provider"] = {"require_parameters": True}
+        if request.audioOutput is not None:
+            # **Always `pcm16`, whatever was asked** (P2b): every
+            # audio-output model behind an account answers audio only on
+            # a stream and only as `pcm16` (measured 2026-09-28), and
+            # Lyria sends MP3 whatever it is asked. The caller's format
+            # decides what `generate` makes of the stream, not what is
+            # asked of the backend.
+            payload["modalities"] = ["text", "audio"]
+            payload["audio"] = {"voice": request.audioOutput.voice, "format": "pcm16"}
         return payload
 
     def _public_model_id(self, reported: object, target: _Target) -> str:
@@ -1145,6 +1155,8 @@ class OpenAiCompatibleHttpEngine:
         # installers provision, `monotonic()` is `GetTickCount64` with a
         # 15.6 ms grid -- 20 distinct values in 300 ms -- which is coarser
         # than the thing being measured.
+        if request.audioOutput is not None:
+            return await self._assembled(request)
         started = time.perf_counter()
         target = self.resolve_model(request.model)
         payload = self._payload_for(request, target)
@@ -1269,7 +1281,24 @@ class OpenAiCompatibleHttpEngine:
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
-    async def stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
+    async def _assembled(self, request: GenerateRequest) -> GenerateResponse:
+        """A non-streamed answer with audio: the stream, assembled (P2b).
+
+        The backend answers audio only on a stream (OpenRouter refuses
+        anything else before any provider sees it, measured), so the batch
+        path is the stream path with the fragments kept.
+        """
+        result: GenerateResponse | None = None
+        async for chunk in self.stream(request, assemble_audio=True):
+            if chunk.done:
+                result = chunk.result
+        if result is None:
+            raise CliError("openai_compat_http stream ended without a result")
+        return result
+
+    async def stream(
+        self, request: GenerateRequest, *, assemble_audio: bool = False
+    ) -> AsyncGenerator[Chunk, None]:
         """Token-by-token, over upstream's own SSE.
 
         The wire shape is OpenAI's: `data:` lines carrying a chunk whose
@@ -1331,6 +1360,10 @@ class OpenAiCompatibleHttpEngine:
         # arrival order.
         call_parts: dict[int, dict[str, str]] = {}
         served_model = target.id
+        # A spoken answer's fragments (P2b). Kept whole only for
+        # `generate`, which returns one clip; a streamed caller has been
+        # sent them already, so the terminal frame does not repeat them.
+        audio = AudioAssembly(keep=assemble_audio) if request.audioOutput is not None else None
 
         client = self._client()
         try:
@@ -1462,6 +1495,13 @@ class OpenAiCompatibleHttpEngine:
                         # dispatching. We also accumulate a copy so
                         # the terminal `done` carries whole calls,
                         # for the non-streaming half of the contract.
+                        if audio is not None and delta.get("audio") is not None:
+                            try:
+                                fragment = audio.feed(delta["audio"])
+                            except ValueError as e:
+                                raise CliError(f"openai_compat_http: {e}") from e
+                            if fragment is not None:
+                                yield Chunk(audio=fragment)
                         raw_calls = delta.get("tool_calls")
                         if raw_calls:
                             fragments = _tool_call_deltas_from_wire(raw_calls)
@@ -1508,12 +1548,20 @@ class OpenAiCompatibleHttpEngine:
 
         content = "".join(emitted)
         tool_calls = _finish_tool_calls(call_parts)
+        spoken = audio is not None and audio.heard
+        clip = (
+            audio.result(request.audioOutput.format)
+            if assemble_audio and audio is not None and request.audioOutput is not None
+            else None
+        )
         yield Chunk(
             done=True,
             result=GenerateResponse(
-                # None rather than "" when the turn was only tool calls,
-                # so the streamed and non-streamed shapes agree.
-                content=content if (content or not tool_calls) else None,
+                # None rather than "" when the turn was only tool calls or
+                # only speech, so the streamed and non-streamed shapes
+                # agree -- and a spoken answer's text is its transcript.
+                content=content if (content or not (tool_calls or spoken)) else None,
+                audio=clip,
                 reasoning="".join(reasoned) or None,
                 toolCalls=tool_calls or None,
                 finishReason=FinishReason.stop_sequence

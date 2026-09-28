@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .._generated.models import (
+    AudioDelta,
     BackendKind,
     ConfigField,
     EmbedResponse,
@@ -165,6 +166,10 @@ class Chunk:
     fragments, never two of them -- upstream sends them in separate
     deltas and combining them here would invent a shape no backend
     produces."""
+    audio: AudioDelta | None = None
+    """A fragment of a spoken answer (P2b), from a backend asked for
+    audio: `pcm16` samples as they are generated, or Lyria's whole MP3 in
+    one. Output like text, so it is a commit point one layer up."""
     progress: StreamProgress | None = None
     """What the backend is doing while it produces no output -- reading
     the prompt, holding the request, running one of its own tools. NOT

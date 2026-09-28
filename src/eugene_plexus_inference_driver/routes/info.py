@@ -153,6 +153,8 @@ async def _single_model(engine: Any) -> list[DriverModel]:
                 # No local engine reads a PDF part today; an account says
                 # per model from its listing instead.
                 fileInput=False,
+                # Nor speaks (P2b).
+                audioOutput=False,
                 # Contracted since M0 and populated since M10, when there
                 # was finally something true to say: `streaming` means
                 # "emits genuinely incremental tokens", which is False for

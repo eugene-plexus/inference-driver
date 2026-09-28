@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from .._generated.models import (
+    AudioOutputFormat,
     DecisionRequest,
     DecisionResponse,
     DriverModel,
@@ -23,6 +24,7 @@ from .._generated.models import (
     RetryDisposition,
     TokenCount,
 )
+from ..audio_out import BATCH_FORMATS, STREAM_FORMATS
 from ..disconnect import ClientGone, serve_while_connected
 from ..engines._subprocess import BackendTimeout, CliError
 from ..engines.base import (
@@ -53,6 +55,7 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body, entry)
+    _refuse_audio_output(engine, body, entry, formats=BATCH_FORMATS)
     await _validate_content(engine, body, entry)
     try:
         return await serve_while_connected(request, engine.generate(body), what="a generation")
@@ -95,6 +98,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body, entry)
+    _refuse_audio_output(engine, body, entry, formats=STREAM_FORMATS)
     await _validate_content(engine, body, entry)
 
     stream = engine.stream(body)
@@ -417,10 +421,70 @@ def _frame(chunk: Any) -> str:
     if calls:
         fragments = [c.model_dump(exclude_none=True, mode="json") for c in calls]
         return f"event: token\ndata: {json.dumps({'toolCalls': fragments})}\n\n"
+    audio = getattr(chunk, "audio", None)
+    if audio is not None:
+        fragment = audio.model_dump(exclude_none=True, mode="json")
+        return f"event: token\ndata: {json.dumps({'audio': fragment})}\n\n"
     reasoning = getattr(chunk, "reasoning", "")
     if reasoning:
         return f"event: token\ndata: {json.dumps({'reasoning': reasoning})}\n\n"
     return f"event: token\ndata: {json.dumps({'text': getattr(chunk, 'text', '')})}\n\n"
+
+
+def _refuse_audio_output(
+    engine: BackendEngine,
+    body: GenerateRequest,
+    entry: DriverModel | None,
+    *,
+    formats: frozenset[AudioOutputFormat],
+) -> None:
+    """400 when the caller asked for a spoken answer this driver cannot give.
+
+    Two ways (P2b): the model does not confirm audio output -- its
+    listing's `output_modalities` did not say `audio`, which is every
+    local engine and CLI -- or the format is one the backend's `pcm16`
+    stream cannot become without a transcoder (P2-1). Both before
+    anything is forwarded: a text model asked to speak would answer in
+    text, and a caller who asked for MP3 would be handed PCM.
+    """
+    asked = body.audioOutput
+    if asked is None:
+        return
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    confirmed = (
+        entry is not None
+        and entry.capabilities is not None
+        and entry.capabilities.audioOutput is True
+    )
+    if not confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#audio-output-unsupported",
+                title="Audio output not supported",
+                status=400,
+                detail=(
+                    "This model is not confirmed to answer with audio. Select a model that "
+                    "speaks; capabilities.audioOutput must be true."
+                ),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
+    if asked.format not in formats:
+        served = " or ".join(sorted(f.value for f in formats))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#audio-format-unsupported",
+                title="Audio format not supported",
+                status=400,
+                detail=(
+                    f"audioOutput.format {asked.format.value!r} cannot be served here: the "
+                    f"backend streams pcm16 only, so this route can answer in {served}."
+                ),
+                component=f"inference-driver:{kind_label}",
+            ).model_dump(exclude_none=True),
+        )
 
 
 def _refuse_unsupported_tools(
