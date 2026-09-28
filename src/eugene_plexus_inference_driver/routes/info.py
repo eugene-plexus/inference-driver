@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 
 @router.get("/v1/info", response_model=DriverInfo, response_model_exclude_none=True)
-async def info(request: Request, models: bool = True) -> DriverInfo:
+async def info(request: Request, models: bool = True, model: str | None = None) -> DriverInfo:
     store: ConfigStore = request.app.state.config_store
     provider_key = str(store.get("provider") or "") or None
 
@@ -53,6 +53,9 @@ async def info(request: Request, models: bool = True) -> DriverInfo:
             served = catalogue.exposed()
         else:
             served = await _single_model(engine)
+        if served is not None and model is not None:
+            # One candidate's entry, for the gateway's per-request re-check.
+            served = [m for m in served if m.id == model]
         return DriverInfo(
             locality=engine_locality(engine),
             localOnlyEnforced=True,

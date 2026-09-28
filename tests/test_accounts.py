@@ -546,3 +546,17 @@ def test_openais_own_list_is_sorted_by_surface_not_filtered() -> None:
 def test_one_malformed_row_does_not_cost_the_rest() -> None:
     models = from_openrouter({"data": [{"id": None}, "junk", {"id": "a/b"}]})
     assert [m.id for m in models] == ["a/b"]
+
+
+@respx.mock
+def test_info_for_one_model_answers_that_entry_alone(openrouter_config: Path) -> None:
+    respx.get(f"{OPENROUTER}/v1/models/user").mock(
+        return_value=httpx.Response(200, json=OPENROUTER_LIST)
+    )
+    with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
+        _wait_for_catalogue(client)
+        one = client.get("/v1/info", params={"model": "mistralai/mistral-nemo"}).json()
+        none = client.get("/v1/info", params={"model": "not/listed"}).json()
+    assert [m["id"] for m in one["models"]] == ["mistralai/mistral-nemo"]
+    assert none["models"] == []
+    assert one["catalogue"]["exposed"] == 5
