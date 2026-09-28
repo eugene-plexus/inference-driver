@@ -87,6 +87,14 @@ _OPENROUTER_SETTINGS: tuple[tuple[str, str], ...] = (
     ("frequency_penalty", "frequencyPenalty"),
     ("presence_penalty", "presencePenalty"),
     ("parallel_tool_calls", "parallelToolCalls"),
+    # P2c (2026-09-28). `top_logprobs` rides with `logprobs`, which every
+    # model listing one lists both (149 each, measured).
+    ("logprobs", "logprobs"),
+    ("logit_bias", "logitBias"),
+    ("reasoning_effort", "reasoningEffort"),
+    ("verbosity", "verbosity"),
+    ("prediction", "prediction"),
+    ("web_search_options", "webSearchOptions"),
 )
 
 

@@ -29,6 +29,8 @@ from typing import Any, Protocol
 from .._generated.models import (
     AudioDelta,
     BackendKind,
+    ChatAnnotation,
+    ChatLogprobs,
     ConfigField,
     EmbedResponse,
     GenerateRequest,
@@ -166,6 +168,12 @@ class Chunk:
     fragments, never two of them -- upstream sends them in separate
     deltas and combining them here would invent a shape no backend
     produces."""
+    logprobs: ChatLogprobs | None = None
+    """The log probabilities of this frame's tokens (P2c), riding with its
+    `text` -- which may be empty, when a thinking filter withheld the text
+    or the frame carried none."""
+    annotations: list[ChatAnnotation] | None = None
+    """Citations a provider's web search produced (P2c), its own frame."""
     audio: AudioDelta | None = None
     """A fragment of a spoken answer (P2b), from a backend asked for
     audio: `pcm16` samples as they are generated, or Lyria's whole MP3 in
@@ -332,6 +340,9 @@ def refuse_unsupported_settings(request: GenerateRequest, *, unsupported: set[st
         "frequencyPenalty": "frequency_penalty",
         "presencePenalty": "presence_penalty",
         "parallelToolCalls": "parallel_tool_calls",
+        "logitBias": "logit_bias",
+        "reasoningEffort": "reasoning_effort",
+        "webSearchOptions": "web_search_options",
     }
     for field in request.callerSettings or []:
         if field in unsupported:
@@ -384,6 +395,13 @@ def warn_dropped_sampling(
             "frequencyPenalty",
             "presencePenalty",
             "parallelToolCalls",
+            # P2c (2026-09-28): the same answer, for the same reason.
+            "logprobs",
+            "logitBias",
+            "reasoningEffort",
+            "verbosity",
+            "prediction",
+            "webSearchOptions",
         },
     )
     for field, value in (("topP", request.topP), ("seed", request.seed)):

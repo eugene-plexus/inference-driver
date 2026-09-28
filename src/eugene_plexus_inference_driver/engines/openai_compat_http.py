@@ -38,6 +38,9 @@ import httpx
 
 from .._generated.models import (
     BackendKind,
+    ChatAnnotation,
+    ChatLogprobs,
+    ChatTokenLogprob,
     ConfigField,
     ConfigFieldShowWhen,
     ConfigValueType,
@@ -293,6 +296,27 @@ def _is_openai_endpoint(base_url: str) -> bool:
 # backend instead of trying it and failing.
 _LOCAL_ENGINE_SETTINGS = frozenset({"topK", "minP"})
 
+# P2c (2026-09-28): settings only a hosted API is known to take -- OpenAI's
+# own, or an OpenRouter model whose listing names them (186 list
+# `reasoning_effort`, 149 `logprobs`, 141 `logit_bias`, measured). A local
+# engine or a provider whose list says nothing per model is not claimed
+# for any of them, so a request that sets one is routed where it will be
+# honoured rather than sent where it may be dropped.
+_HOSTED_SETTINGS = frozenset(
+    {"logprobs", "logitBias", "reasoningEffort", "verbosity", "prediction", "webSearchOptions"}
+)
+
+# Hints: they change where or how cheaply an answer is made, never what it
+# says. Carried to OpenAI's own API, the only backend known to take them
+# (no OpenRouter model lists any, measured), and dropped elsewhere with a
+# warning once, rather than refused.
+_HINTS: tuple[tuple[str, str], ...] = (
+    ("promptCacheKey", "prompt_cache_key"),
+    ("promptCacheRetention", "prompt_cache_retention"),
+    ("serviceTier", "service_tier"),
+    ("safetyIdentifier", "safety_identifier"),
+)
+
 # Settings a fixed-sampler model rejects along with `temperature`: OpenAI's
 # reasoning models refuse the penalties as they refuse the sampler itself.
 _FIXED_SAMPLER_SETTINGS = frozenset({"temperature", "topP", "frequencyPenalty", "presencePenalty"})
@@ -313,8 +337,41 @@ _ENGINE_SETTINGS: tuple[str, ...] = (
     "frequencyPenalty",
     "presencePenalty",
     "parallelToolCalls",
+    "logprobs",
+    "logitBias",
+    "reasoningEffort",
+    "verbosity",
+    "prediction",
+    "webSearchOptions",
 )
 _ALL_ENGINE_SETTINGS = frozenset(_ENGINE_SETTINGS)
+
+
+def _logprobs_of(raw: Any) -> ChatLogprobs | None:
+    """A choice's `logprobs`, OpenAI's shape (measured through OpenRouter,
+    2026-09-28), or None when there is none or it is malformed. A bad
+    `logprobs` is not worth failing an answer over."""
+    if not isinstance(raw, dict) or not raw.get("content"):
+        return None
+    try:
+        return ChatLogprobs.model_validate(raw)
+    except ValueError:
+        log.debug("openai_compat_http: logprobs in an unexpected shape (omitted)")
+        return None
+
+
+def _annotations_of(raw: Any) -> list[ChatAnnotation]:
+    """The `url_citation` annotations on a message or delta. OpenRouter's
+    `file` annotations are its own cache of a parsed PDF, not a citation,
+    and no OpenAI client reads them, so they are not carried."""
+    out: list[ChatAnnotation] = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and item.get("type") == "url_citation":
+            try:
+                out.append(ChatAnnotation.model_validate(item))
+            except ValueError:
+                log.debug("openai_compat_http: a citation in an unexpected shape (omitted)")
+    return out
 
 
 def _reasoning_of(obj: dict[str, Any]) -> str | None:
@@ -971,7 +1028,10 @@ class OpenAiCompatibleHttpEngine:
         if _is_openai_endpoint(self._base_url):
             unsupported |= _LOCAL_ENGINE_SETTINGS
         caps = target.entry.capabilities if target.entry is not None else None
-        if self._catalogue_source == "openrouter" and caps is not None:
+        listed_by_provider = self._catalogue_source == "openrouter" and caps is not None
+        if not _is_openai_endpoint(self._base_url) and not listed_by_provider:
+            unsupported |= _HOSTED_SETTINGS
+        if listed_by_provider and caps is not None:
             # The listing is the authority for what this model accepts; a
             # setting it does not name is one OpenRouter would drop.
             listed = set(caps.supportedSettings or [])
@@ -1077,6 +1137,30 @@ class OpenAiCompatibleHttpEngine:
             )
         if self._require_parameters and request.callerSettings:
             payload["provider"] = {"require_parameters": True}
+        if request.logprobs is not None:
+            payload["logprobs"] = request.logprobs
+            if request.topLogprobs is not None:
+                payload["top_logprobs"] = request.topLogprobs
+        if request.logitBias is not None:
+            payload["logit_bias"] = dict(request.logitBias)
+        if request.reasoningEffort is not None:
+            payload["reasoning_effort"] = request.reasoningEffort.value
+        if request.verbosity is not None:
+            payload["verbosity"] = request.verbosity.value
+        if request.prediction is not None:
+            payload["prediction"] = request.prediction.model_dump(mode="json", exclude_none=True)
+        if request.webSearchOptions is not None:
+            payload["web_search_options"] = request.webSearchOptions.model_dump(
+                mode="json", exclude_none=True
+            )
+        for ours, theirs in _HINTS:
+            value = getattr(request, ours)
+            if value is None:
+                continue
+            if _is_openai_endpoint(self._base_url):
+                payload[theirs] = getattr(value, "value", value)
+            else:
+                self._warn_dropped(theirs, target)
         if request.audioOutput is not None:
             # **Always `pcm16`, whatever was asked** (P2b): every
             # audio-output model behind an account answers audio only on
@@ -1261,8 +1345,14 @@ class OpenAiCompatibleHttpEngine:
             content = strip_thinking_blocks(content)
 
         stop_sequence = _stop_sequence(first, request)
+        message = first.get("message")
+        citations = _annotations_of(
+            message.get("annotations") if isinstance(message, dict) else None
+        )
         return GenerateResponse(
             content=content,
+            logprobs=_logprobs_of(first.get("logprobs")),
+            annotations=citations or None,
             # `off` withholds it on this path exactly as the stream
             # withholds its frames: the operator said not to show
             # reasoning, and a separate field is still showing it.
@@ -1364,6 +1454,10 @@ class OpenAiCompatibleHttpEngine:
         # `generate`, which returns one clip; a streamed caller has been
         # sent them already, so the terminal frame does not repeat them.
         audio = AudioAssembly(keep=assemble_audio) if request.audioOutput is not None else None
+        # P2c: every token's log probability, for the terminal `done`, and
+        # every citation the provider's search produced.
+        token_logprobs: list[ChatTokenLogprob] = []
+        citations: list[ChatAnnotation] = []
 
         client = self._client()
         try:
@@ -1478,6 +1572,16 @@ class OpenAiCompatibleHttpEngine:
                             saw_terminator = True
                             stop_sequence = _stop_sequence(choice, request)
                         delta = choice.get("delta") or {}
+                        # Logprobs ride on the choice beside `delta`, not
+                        # in it (measured through OpenRouter), on the
+                        # frames that carry tokens.
+                        frame_logprobs = _logprobs_of(choice.get("logprobs"))
+                        if frame_logprobs is not None:
+                            token_logprobs.extend(frame_logprobs.content or [])
+                        cited = _annotations_of(delta.get("annotations"))
+                        if cited:
+                            citations.extend(cited)
+                            yield Chunk(annotations=cited)
                         # Reasoning rides its own frames, ahead of the
                         # answer. Before 2026-09-23 this loop looked at
                         # `content` alone, and a model that thought until
@@ -1510,11 +1614,15 @@ class OpenAiCompatibleHttpEngine:
                                 yield Chunk(toolCalls=fragments)
                         text = (delta.get("content")) or ""
                         if not text:
+                            if frame_logprobs is not None:
+                                yield Chunk(logprobs=frame_logprobs)
                             continue
                         visible = filtered.feed(text) if filtered is not None else text
                         if visible:
                             emitted.append(visible)
-                            yield Chunk(text=visible)
+                            yield Chunk(text=visible, logprobs=frame_logprobs)
+                        elif frame_logprobs is not None:
+                            yield Chunk(logprobs=frame_logprobs)
         except httpx.ConnectTimeout as e:
             raise CliError(f"openai_compat_http could not connect: {e!r}") from e
         except httpx.TimeoutException as e:
@@ -1562,6 +1670,8 @@ class OpenAiCompatibleHttpEngine:
                 # agree -- and a spoken answer's text is its transcript.
                 content=content if (content or not (tool_calls or spoken)) else None,
                 audio=clip,
+                logprobs=ChatLogprobs(content=token_logprobs) if token_logprobs else None,
+                annotations=citations or None,
                 reasoning="".join(reasoned) or None,
                 toolCalls=tool_calls or None,
                 finishReason=FinishReason.stop_sequence

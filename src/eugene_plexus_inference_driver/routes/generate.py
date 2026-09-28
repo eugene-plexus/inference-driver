@@ -425,10 +425,18 @@ def _frame(chunk: Any) -> str:
     if audio is not None:
         fragment = audio.model_dump(exclude_none=True, mode="json")
         return f"event: token\ndata: {json.dumps({'audio': fragment})}\n\n"
+    annotations = getattr(chunk, "annotations", None)
+    if annotations:
+        cited = [a.model_dump(exclude_none=True, mode="json") for a in annotations]
+        return f"event: token\ndata: {json.dumps({'annotations': cited})}\n\n"
     reasoning = getattr(chunk, "reasoning", "")
     if reasoning:
         return f"event: token\ndata: {json.dumps({'reasoning': reasoning})}\n\n"
-    return f"event: token\ndata: {json.dumps({'text': getattr(chunk, 'text', '')})}\n\n"
+    token: dict[str, Any] = {"text": getattr(chunk, "text", "")}
+    logprobs = getattr(chunk, "logprobs", None)
+    if logprobs is not None:
+        token["logprobs"] = logprobs.model_dump(exclude_none=True, mode="json")
+    return f"event: token\ndata: {json.dumps(token)}\n\n"
 
 
 def _refuse_audio_output(
