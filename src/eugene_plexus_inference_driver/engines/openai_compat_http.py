@@ -83,6 +83,21 @@ from ..images_out import (
     partial_from,
 )
 from ..images_out import response_from as images_response_from
+from ..raw_completion import (
+    CARRIED,
+    OLLAMA_CARRIED,
+    CompletionRefusal,
+    infill_answer,
+    infill_payload,
+    ollama_answer,
+    ollama_payload,
+    openai_answer,
+    openai_payload,
+    refuse_uncarried,
+    sse_json,
+)
+from ..raw_completion import finish as raw_finish
+from ..raw_completion import usage as raw_usage
 from ..speech import (
     ALL_FORMATS,
     OPENROUTER_FORMATS,
@@ -667,6 +682,8 @@ class OpenAiCompatibleHttpEngine:
         #: provider it picks -- exactly what A2 forbids.
         self._require_parameters = require_parameters
         self._catalogue_source = catalogue_source
+        #: `(continues raw text, fills in the middle)`, once definite (P6).
+        self._completion_caps: tuple[bool, bool] | None = None
         #: The account's model list, or None for a single-model driver.
         self.catalogue: Catalogue | None = None
         if model_id is None:
@@ -1309,6 +1326,8 @@ class OpenAiCompatibleHttpEngine:
         # than the thing being measured.
         if request.audioOutput is not None:
             return await self._assembled(request)
+        if request.completion is not None:
+            return await self._complete(request)
         started = time.perf_counter()
         target = self.resolve_model(request.model)
         payload = self._payload_for(request, target)
@@ -1482,6 +1501,10 @@ class OpenAiCompatibleHttpEngine:
         consumer abandons the generator -- which is what a client
         disconnect looks like from here.
         """
+        if request.completion is not None:
+            async for chunk in self._complete_stream(request):
+                yield chunk
+            return
         target = self.resolve_model(request.model)
         payload = self._payload_for(request, target)
         hint = _attachment_hint(attachment_kinds(request.messages))
@@ -1892,6 +1915,227 @@ class OpenAiCompatibleHttpEngine:
             )
         except (ValueError, AttributeError) as e:
             raise CliError(f"openai_compat_http {what} answer was not usable: {e}") from e
+
+    # -- raw completion (P6) -----------------------------------------------------
+
+    async def probe_completion(self) -> tuple[bool, bool]:
+        """`(continues raw text, fills in the middle)` for a single-model
+        driver (P6-4: local engines first). An account says per model from
+        its listing instead.
+
+        `llama-server` answers `/props`, and fills the middle when its
+        `/infill` does (a model without fill-in-the-middle tokens is a 501
+        there). vLLM answers `/version` and fills nothing, since it refuses
+        a suffix for every model but DeepSeek V4. Anything else is not
+        offered: an unknown server's `/v1/completions` may apply a chat
+        template, as Ollama's does. A hosted endpoint is not offered either.
+
+        Cached once definite; a transport failure is not definite.
+        """
+        if self._completion_caps is not None:
+            return self._completion_caps
+        if getattr(self, "routing_locality", None) != "local":
+            return (False, False)
+        client = self._client()
+        try:
+            props = await client.get("/props", headers=self._headers(), timeout=2.0)
+            if props.status_code == 200 and isinstance(props.json(), dict):
+                infill = await client.post(
+                    "/infill",
+                    headers=self._headers(),
+                    json={"input_prefix": "", "input_suffix": "", "n_predict": 0},
+                    timeout=5.0,
+                )
+                self._completion_caps = (True, infill.status_code == 200)
+                return self._completion_caps
+            version = await client.get("/version", headers=self._headers(), timeout=2.0)
+            body = version.json() if version.status_code == 200 else None
+            if isinstance(body, dict) and isinstance(body.get("version"), str):
+                self._completion_caps = (True, False)
+                return self._completion_caps
+        except (httpx.HTTPError, ValueError):
+            return (False, False)
+        self._completion_caps = (False, False)
+        return self._completion_caps
+
+    async def _completion_route(
+        self, request: GenerateRequest, target: _Target, *, stream: bool
+    ) -> tuple[str, dict[str, Any], str]:
+        """Where and how this backend continues raw text: `(path, payload,
+        kind)`. Refused before anything is sent: a setting a raw completion
+        would drop, and a suffix for a model that does not fill the middle."""
+        completion = request.completion
+        assert completion is not None
+        if self._catalogue_source == "ollama":
+            refuse_uncarried(request, OLLAMA_CARRIED)
+            caps = target.entry.capabilities if target.entry is not None else None
+            if completion.suffix is not None and not (caps is not None and caps.fillInMiddle):
+                raise CompletionRefusal(
+                    f"suffix: {target.id!r} does not fill in the middle (Ollama lists no insert "
+                    "capability for it); send the prompt alone"
+                )
+            return (
+                "/api/generate",
+                ollama_payload(request, target.upstream, stream=stream),
+                "ollama",
+            )
+        refuse_uncarried(request, CARRIED)
+        if completion.suffix is not None:
+            _, fills = await self.probe_completion()
+            if not fills:
+                raise CompletionRefusal(
+                    f"suffix: {target.id!r} does not fill in the middle on this backend; send the "
+                    "prompt alone, or a model whose fill_in_middle is true"
+                )
+            return "/infill", infill_payload(request, stream=stream), "infill"
+        return "/v1/completions", openai_payload(request, target.upstream, stream=stream), "openai"
+
+    async def _complete(self, request: GenerateRequest) -> GenerateResponse:
+        """A raw completion, whole (P6)."""
+        started = time.perf_counter()
+        target = self.resolve_model(request.model)
+        path, payload, kind = await self._completion_route(request, target, stream=False)
+        try:
+            response = await self._client().post(
+                path,
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                json=payload,
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the completion") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http completion failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for a completion: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+            )
+        try:
+            body = response.json()
+            parse = {"ollama": ollama_answer, "infill": infill_answer}.get(kind, openai_answer)
+            text, reason, used = parse(body)
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+            raise CliError(f"openai_compat_http completion answer was not usable: {e}") from e
+        return GenerateResponse(
+            content=text,
+            finishReason=reason,
+            usage=used,
+            backend=self.backend_kind,
+            modelId=self._public_model_id(body.get("model"), target),
+            latencyMs=int((time.perf_counter() - started) * 1000),
+        )
+
+    async def _complete_stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
+        """A raw completion, as the backend makes it (P6): SSE from
+        `/v1/completions` and `/infill`, NDJSON from Ollama's `/api/generate`.
+
+        **A stream that stops is not a stream that finished** (M10): with no
+        `[DONE]`, finish reason, `stop: true` or `done: true`, the stream is
+        an error, never a short completion presented as whole.
+        """
+        started = time.perf_counter()
+        target = self.resolve_model(request.model)
+        path, payload, kind = await self._completion_route(request, target, stream=True)
+        parts: list[str] = []
+        reason = FinishReason.stop
+        used: Usage | None = None
+        ended = False
+        try:
+            async with self._client().stream(
+                "POST",
+                path,
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                json=payload,
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise CliError(
+                        f"openai_compat_http returned {response.status_code} for a completion: "
+                        f"{_redact(response.text[:500])}",
+                        upstream_status=response.status_code,
+                        retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+                    )
+                async for line in response.aiter_lines():
+                    piece = ""
+                    if kind == "ollama":
+                        try:
+                            frame = json.loads(line) if line.strip() else None
+                        except ValueError:
+                            frame = None
+                        if not isinstance(frame, dict):
+                            continue
+                        piece = frame.get("response") or ""
+                        if frame.get("done"):
+                            ended = True
+                            reason = raw_finish(frame.get("done_reason"))
+                            used = raw_usage(
+                                frame.get("prompt_eval_count"), frame.get("eval_count")
+                            )
+                    elif kind == "infill":
+                        frame = sse_json(line)
+                        if frame is None:
+                            continue
+                        piece = frame.get("content") or ""
+                        if frame.get("stop"):
+                            ended = True
+                            reason = raw_finish(frame.get("stop_type"))
+                            used = raw_usage(
+                                frame.get("tokens_evaluated"), frame.get("tokens_predicted")
+                            )
+                    else:
+                        if line.strip() == "data: [DONE]":
+                            ended = True
+                            continue
+                        frame = sse_json(line)
+                        if frame is None:
+                            continue
+                        counted = frame.get("usage")
+                        if isinstance(counted, dict):
+                            used = raw_usage(
+                                counted.get("prompt_tokens"), counted.get("completion_tokens")
+                            )
+                        choices = frame.get("choices") or []
+                        if choices and isinstance(choices[0], dict):
+                            piece = choices[0].get("text") or ""
+                            if choices[0].get("finish_reason"):
+                                ended = True
+                                reason = raw_finish(choices[0]["finish_reason"])
+                    if piece:
+                        parts.append(piece)
+                        yield Chunk(text=piece)
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the completion") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http completion stream failed: {e!r}") from e
+        if not ended:
+            raise CliError(
+                f"openai_compat_http completion stream from {path} ended before it said it was "
+                f"finished, after {sum(len(p) for p in parts)} characters: the backend stopped "
+                "sending without a terminator"
+            )
+        yield Chunk(
+            done=True,
+            result=GenerateResponse(
+                content="".join(parts),
+                finishReason=reason,
+                usage=used,
+                backend=self.backend_kind,
+                modelId=target.id,
+                latencyMs=int((time.perf_counter() - started) * 1000),
+            ),
+        )
 
     async def moderate(self, request: ModerateRequest) -> ModerateResponse:
         """`POST /v1/moderations` upstream (P6), in OpenAI's own shape: only

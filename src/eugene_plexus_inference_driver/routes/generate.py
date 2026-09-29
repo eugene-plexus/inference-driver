@@ -37,6 +37,7 @@ from ..engines.systemone_http import validate_questions
 from ..failures import credential_refused, disposition, request_id
 from ..images import ImageRefusal, attachment_kinds, validate_messages
 from ..locality import enforce
+from ..raw_completion import CompletionRefusal
 
 if TYPE_CHECKING:
     from ..engines.base import BackendEngine
@@ -52,7 +53,10 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
     entry = _resolve_model(engine, body.model)
-    _refuse_non_chat(engine, entry)
+    if body.completion is not None:
+        await _refuse_non_completion(engine, entry)
+    else:
+        _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body, entry)
     _refuse_audio_output(engine, body, entry, formats=BATCH_FORMATS)
@@ -61,6 +65,8 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
         return await serve_while_connected(request, engine.generate(body), what="a generation")
     except ClientGone as e:
         raise _client_gone() from e
+    except CompletionRefusal as e:
+        raise _completion_refused(e) from None
     except CliError as e:
         log.warning("backend invocation failed: %s", e)
         # `backend_kind` is BackendKind in production but tests may stub
@@ -95,7 +101,10 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
     entry = _resolve_model(engine, body.model)
-    _refuse_non_chat(engine, entry)
+    if body.completion is not None:
+        await _refuse_non_completion(engine, entry)
+    else:
+        _refuse_non_chat(engine, entry)
     enforce(engine, body.localOnly)
     _refuse_unsupported_tools(engine, body, entry)
     _refuse_audio_output(engine, body, entry, formats=STREAM_FORMATS)
@@ -118,6 +127,9 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     except ClientGone as e:
         await stream.aclose()
         raise _client_gone() from e
+    except CompletionRefusal as e:
+        await stream.aclose()
+        raise _completion_refused(e) from None
     except CliError as e:
         # Nothing has been sent, so this can still be a status code.
         log.warning("backend invocation failed before the stream opened: %s", e)
@@ -361,6 +373,48 @@ def _resolve_model(engine: BackendEngine, requested: str | None) -> DriverModel 
                 component="inference-driver",
             ).model_dump(exclude_none=True),
         ) from None
+
+
+async def _refuse_non_completion(engine: BackendEngine, entry: DriverModel | None) -> None:
+    """A raw completion (P6) goes only to a model that continues raw text:
+    an account's listing says per model; a single-model driver asks its
+    backend (`llama-server` or vLLM, P6-4). Refused before anything is sent,
+    so an engine that would apply a chat template never sees the prompt."""
+    if entry is not None:
+        completes = "completion" in entry.surfaces
+    else:
+        probe = getattr(engine, "probe_completion", None)
+        completes = probe is not None and (await probe())[0]
+    if completes:
+        return
+    kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#completion-unsupported",
+            title="This model does not continue raw text",
+            status=400,
+            detail=(
+                f"This driver's backend ({kind_label}) does not continue raw text with this "
+                "model, so nothing was sent. A local llama-server, vLLM or Ollama model does; "
+                "GET /v1/info lists what each model answers."
+            ),
+            component="inference-driver",
+        ).model_dump(exclude_none=True),
+    )
+
+
+def _completion_refused(e: CompletionRefusal) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#completion-refused",
+            title="Completion request refused",
+            status=400,
+            detail=f"{e}. Nothing was sent.",
+            component="inference-driver",
+        ).model_dump(exclude_none=True),
+    )
 
 
 def _refuse_non_chat(engine: BackendEngine, entry: DriverModel | None = None) -> None:

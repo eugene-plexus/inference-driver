@@ -305,6 +305,11 @@ def ollama_entry(name: str, show: dict[str, Any] | None, defaults: EngineDefault
             surfaces.append("chat")
         if "embedding" in names:
             surfaces.append("embeddings")
+        # P6: raw continuation through `/api/generate` with `raw` (its
+        # `/v1/completions` would apply the chat template), and
+        # fill-in-the-middle for a model with the `insert` capability.
+        if "completion" in names:
+            surfaces.append("completion")
         return DriverModel(
             id=name,
             surfaces=surfaces,
@@ -314,6 +319,7 @@ def ollama_entry(name: str, show: dict[str, Any] | None, defaults: EngineDefault
                 streaming=defaults.streaming and "chat" in surfaces,
                 imageInput="vision" in names,
                 toolCalling="tools" in names,
+                fillInMiddle="insert" in names,
                 # `/api/show` carries only the trained maximum, which
                 # overstates whatever Ollama resolved (step 7 measured
                 # 131072 auto-sized against a trained number above it).

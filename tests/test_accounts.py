@@ -509,7 +509,9 @@ def test_an_ollama_account_lists_every_pulled_model_with_its_capabilities(
         info = _wait_for_catalogue(client)
     by_id = {m["id"]: m for m in info["models"]}
     assert info["catalogue"]["source"] == "ollama"
-    assert by_id["qwen3-coder:30b"]["surfaces"] == ["chat"]
+    # P6: a model Ollama lists as `completion` also continues raw text
+    # (through /api/generate with `raw`).
+    assert by_id["qwen3-coder:30b"]["surfaces"] == ["chat", "completion"]
     assert by_id["qwen3-coder:30b"]["capabilities"]["toolCalling"] is True
     assert by_id["nomic-embed-text:latest"]["surfaces"] == ["embeddings"]
     assert by_id["gemma3:4b"]["capabilities"]["imageInput"] is True

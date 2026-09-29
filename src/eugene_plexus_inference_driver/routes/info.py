@@ -123,11 +123,12 @@ async def _single_model(engine: Any) -> list[DriverModel]:
     # their timeouts or let an embedding probe use the generation deadline.
     # Keep known engine policy available; unconfirmed capabilities stay
     # conservative, and cancelling a probe does not cache a false answer.
-    image_input, audio_input, context_window, embeddings = await asyncio.gather(
+    image_input, audio_input, context_window, embeddings, completion = await asyncio.gather(
         _bounded_probe(_image_input(engine), False),
         _bounded_probe(_modality_input(engine, "audio"), False),
         _bounded_probe(_context_window(engine), None),
         _bounded_probe(_embeddings(engine), None),
+        _bounded_probe(_completion(engine), (False, False)),
     )
     decision = _decision_capability(engine)
     # `surfaces` replaces `capabilities.embeddings` and `chatCapable`, with
@@ -145,6 +146,9 @@ async def _single_model(engine: Any) -> list[DriverModel]:
         # audio (measured), so the same probe says it transcribes.
         if audio_input is True and getattr(engine, "transcribe", None) is not None:
             surfaces.append("transcription")
+        # P6: a local `llama-server` or vLLM continues raw text.
+        if completion[0]:
+            surfaces.append("completion")
     upstream = getattr(engine, "_upstream_model_id", None)
     return [
         DriverModel(
@@ -155,6 +159,7 @@ async def _single_model(engine: Any) -> list[DriverModel]:
                 supportedSettings=list(getattr(engine, "supported_settings", [])),
                 imageInput=image_input,
                 audioInput=audio_input,
+                fillInMiddle=completion[1],
                 # No local engine reads a PDF part today; an account says
                 # per model from its listing instead.
                 fileInput=False,
@@ -201,6 +206,20 @@ async def _context_window(engine: Any) -> int | None:
         log.debug("context-window probe failed; reporting unknown", exc_info=True)
         return None
     return value if isinstance(value, int) and value > 0 else None
+
+
+async def _completion(engine: Any) -> tuple[bool, bool]:
+    """`(continues raw text, fills in the middle)` (P6), never an
+    exception, for the reason `_embeddings` gives."""
+    probe = getattr(engine, "probe_completion", None)
+    if probe is None:
+        return (False, False)
+    try:
+        completes, fills = await probe()
+        return (bool(completes), bool(fills))
+    except Exception:  # see _embeddings: /v1/info must not fail over a capability
+        log.debug("completion probe failed; reporting none", exc_info=True)
+        return (False, False)
 
 
 async def _embeddings(engine: Any) -> bool | None:
