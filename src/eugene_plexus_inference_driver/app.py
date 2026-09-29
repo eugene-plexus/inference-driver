@@ -24,6 +24,7 @@ from .routes import generate as generate_routes
 from .routes import health as health_routes
 from .routes import image as image_routes
 from .routes import info as info_routes
+from .routes import moderate as moderate_routes
 from .routes import speak as speak_routes
 from .routes import transcribe as transcribe_routes
 from .routes import video as video_routes
@@ -294,6 +295,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(transcribe_routes.router, dependencies=authorized)
     app.include_router(image_routes.router, dependencies=authorized)
     app.include_router(video_routes.router, dependencies=authorized)
+    app.include_router(moderate_routes.router, dependencies=authorized)
 
     # Operator-only surfaces: config edits and the restart trigger ride
     # on the UI's session token. Service tokens are rejected so a
@@ -310,7 +312,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # memory exhaustion. A new body-taking inference route belongs here.
     app.add_middleware(
         InferenceBodyLimit,
-        paths={"/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/decide", "/v1/speak"},
+        paths={
+            "/v1/generate",
+            "/v1/generate/stream",
+            "/v1/embed",
+            "/v1/decide",
+            "/v1/speak",
+            "/v1/moderate",
+        },
         # P3b: 25 MiB of audio is 33.4 MiB of base64, plus the fields.
         limits={
             "/v1/transcribe": 36 * 1024 * 1024,

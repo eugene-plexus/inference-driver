@@ -55,6 +55,9 @@ from .._generated.models import (
     ImagePartial,
     ImageRequest,
     ImageResponse,
+    ModerateRequest,
+    ModerateResponse,
+    ModerationPartType,
     Role,
     SpeakRequest,
     SpeechFormat,
@@ -1889,6 +1892,63 @@ class OpenAiCompatibleHttpEngine:
             )
         except (ValueError, AttributeError) as e:
             raise CliError(f"openai_compat_http {what} answer was not usable: {e}") from e
+
+    async def moderate(self, request: ModerateRequest) -> ModerateResponse:
+        """`POST /v1/moderations` upstream (P6), in OpenAI's own shape: only
+        OpenAI's API serves it (OpenRouter answers 404, measured).
+
+        `texts` go as a list, one result each; `parts` as one multimodal
+        input, one result. The results come back as the backend sent them.
+        """
+        started = time.perf_counter()
+        target = self.resolve_model(request.model)
+        wire: list[Any]
+        if request.parts:
+            wire = [
+                {"type": "image_url", "image_url": {"url": part.image}}
+                if part.type is ModerationPartType.image
+                else {"type": "text", "text": part.text or ""}
+                for part in request.parts
+            ]
+        else:
+            # Each text is generated as a `RootModel[str]` (its maxLength).
+            wire = [getattr(text, "root", text) for text in request.texts or []]
+        client = self._client()
+        try:
+            response = await client.post(
+                "/v1/moderations",
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                json={"model": target.upstream, "input": wire},
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the moderation") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http moderation failed: {e!r}") from e
+        if response.status_code >= 400:
+            raise CliError(
+                f"openai_compat_http returned {response.status_code} for a moderation: "
+                f"{_redact(response.text[:500])}",
+                upstream_status=response.status_code,
+                retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+            )
+        try:
+            body = response.json()
+            results = body["results"]
+            if not isinstance(results, list):
+                raise TypeError("results is not a list")
+        except (ValueError, KeyError, TypeError) as e:
+            raise CliError(f"openai_compat_http moderation answer was not usable: {e}") from e
+        return ModerateResponse(
+            id=body.get("id") if isinstance(body.get("id"), str) else None,
+            results=[r for r in results if isinstance(r, dict)],
+            modelId=self._public_model_id(body.get("model"), target),
+            latencyMs=int((time.perf_counter() - started) * 1000),
+        )
 
     def _image_target(self, request: ImageRequest, mask: bytes | None) -> _Target:
         """The model an image request is for, refused before any upload
