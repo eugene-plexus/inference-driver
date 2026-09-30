@@ -118,3 +118,11 @@ def test_nan_is_refused(tmp_path: Path) -> None:
         ConfigUpdateRequest.model_validate({"requestTimeoutSeconds": float("nan")})
     )
     assert result.applied == [] and "finite" in result.rejected[0].message
+
+
+def test_info_names_the_provider_running_not_the_one_saved(client: Any) -> None:
+    """`provider` is read at start: saved but not restarted, it is not what
+    answers, and `/v1/info` named it beside the running engine's backend."""
+    saved = client.patch("/v1/config", json={"provider": "openrouter"})
+    assert saved.json()["pendingRestart"] == ["provider"]
+    assert client.get("/v1/info").json()["provider"] == "claude_subscription"
