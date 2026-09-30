@@ -192,17 +192,23 @@ def test_schema_offers_runtime_name_for_the_custom_provider() -> None:
     # deliberately not a component.
     assert runtime_name.valueType == ConfigValueType.runtime_name
     assert runtime_name.showWhen is not None
-    # Widened for the System One BYO provider: both custom providers
-    # share the one field (two providers declaring `runtimeName` would
-    # be two fields with one key).
-    assert runtime_name.showWhen.equals == ["openai_compat_custom", "systemone_custom"]
+    # Shown wherever it is read (settings never lie, 2026-09-30): every
+    # engine that follows a runtime, not only the two custom providers --
+    # a stale one, invisible on the page, won over the provider's address.
+    assert "openai_compat_custom" in runtime_name.showWhen.equals
+    assert "systemone_custom" in runtime_name.showWhen.equals
+    assert "openai" in runtime_name.showWhen.equals
+    assert "claude_subscription" not in runtime_name.showWhen.equals
     assert runtime_name.requiresRestart is True
 
     # `baseUrl` is no longer the only way in, so it is no longer required.
     base_url = fields["baseUrl"]
     assert not base_url.required
     assert base_url.showWhen is not None
-    assert base_url.showWhen.equals == ["openai_compat_custom", "systemone_custom"]
+    assert {"openai_compat_custom", "systemone_custom", "openrouter", "typesafe"} <= set(
+        base_url.showWhen.equals
+    )
+    assert "chatgpt_subscription" not in base_url.showWhen.equals
 
     # And it is the custom provider's, not every HTTP provider's: a
     # cloud API is not a runtime we supervise.

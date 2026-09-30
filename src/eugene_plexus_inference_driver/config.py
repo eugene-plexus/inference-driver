@@ -18,6 +18,8 @@ load fine and auto-upgrade to envelopes on the next save.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from ._generated.models import (
     ConfigDocument,
     ConfigField,
     ConfigFieldError,
+    ConfigFieldShowWhen,
     ConfigSchema,
     ConfigUpdateRequest,
     ConfigUpdateResult,
@@ -287,7 +290,59 @@ def _build_fields() -> list[ConfigField]:
     out.append(_modelid_field())
     out.append(_upstream_modelid_field())
     out.extend(_common_fields())
-    return out
+    return [_shown_where_read(f) for f in out]
+
+
+def _providers(*engines: Any) -> list[str]:
+    return [p for engine in engines for p in providers_using(engine)]
+
+
+def _read_by() -> dict[str, list[str] | None]:
+    """Which providers read each key, from the engines that read it.
+
+    **A field is shown wherever it is read** (settings never lie,
+    2026-09-30). `baseUrl` and `runtimeName` were shown only for the two
+    custom providers while every OpenAI-compatible engine reads both -- so
+    a stale address, invisible on the page, sent an account's key to it --
+    and `apiKey` was hidden for TypeSafe, which refuses to run without one.
+    `None` means every provider. A key not listed keeps its own condition.
+    """
+    http = _providers(OpenAiCompatibleHttpEngine, ElevenLabsHttpEngine, SystemOneHttpEngine)
+    follows_runtimes = _providers(OpenAiCompatibleHttpEngine, SystemOneHttpEngine)
+    everything_but_speech = [p for p in PROVIDERS if p not in providers_using(ElevenLabsHttpEngine)]
+    thinks = _providers(ClaudeCodeCliEngine, CodexCliEngine, OpenAiCompatibleHttpEngine)
+    return {
+        "baseUrl": http,
+        "runtimeName": follows_runtimes,
+        "apiKey": http,
+        "catalogueRefreshMinutes": _providers(OpenAiCompatibleHttpEngine, ElevenLabsHttpEngine),
+        # ElevenLabs reads neither: it serves the voices its account lists.
+        "modelId": everything_but_speech,
+        "upstreamModelId": everything_but_speech,
+        "thinkingMode": thinks,
+        # Honoured only for a backend that could be either; every other
+        # provider is external (or, fronting a runtime here, local) whatever
+        # this says.
+        "backendLocality": [
+            "ollama_local",
+            "lmstudio_local",
+            "openai_compat_custom",
+            "systemone_custom",
+        ],
+    }
+
+
+def _shown_where_read(field: ConfigField) -> ConfigField:
+    readers = _read_by()
+    if field.key not in readers:
+        return field
+    providers = readers[field.key]
+    show = (
+        None
+        if providers is None
+        else ConfigFieldShowWhen(key="provider", equals=[p for p in PROVIDERS if p in providers])
+    )
+    return field.model_copy(update={"showWhen": show})
 
 
 # Schema for inference-driver's config surface. Built dynamically from
@@ -305,7 +360,75 @@ FIELDS: list[ConfigField] = _build_fields()
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 
-def as_schema(*, available_models: list[str] | None = None) -> ConfigSchema:
+#: Which environment variable each engine falls back to for its key.
+_KEY_ENV: dict[Any, str] = {
+    OpenAiCompatibleHttpEngine: "OPENAI_API_KEY",
+    ElevenLabsHttpEngine: "ELEVENLABS_API_KEY",
+}
+#: Handed to a companion driver by the agent that declared it, naming the
+#: keys that agent rewrites (settings never lie, 2026-09-30).
+MANAGED_KEYS_ENV = "EUGENE_PLEXUS_DRIVER_MANAGED_KEYS"
+MANAGED_BY = (
+    "Set by this machine's agent from the runtime this driver fronts, and rewritten at "
+    "its next start: change the runtime instead (the model's profile, or Backends)."
+)
+
+
+def managed_keys() -> frozenset[str]:
+    raw = os.environ.get(MANAGED_KEYS_ENV, "")
+    return frozenset(k.strip() for k in raw.split(",") if k.strip())
+
+
+def _unset_facts(key: str, values: dict[str, Any]) -> dict[str, Any]:
+    """What an unset `key` does for the provider this driver runs now."""
+    provider = PROVIDERS.get(str(values.get("provider") or ""))
+    if provider is None:
+        return {}
+    engine = provider.engine_class
+    if key == "baseUrl":
+        url = provider.engine_kwargs.get("default_base_url")
+        if url:
+            return {
+                "unsetMeans": f"Not set: uses {provider.label}'s own address, {url}.",
+                "unsetResolvesTo": url,
+            }
+        return {
+            "unsetMeans": "Not set: requests go to the runtime named above, and without one "
+            "this driver has nowhere to send them."
+        }
+    if key == "runtimeName":
+        return {"unsetMeans": "Not set: requests go to the address below, or the provider's own."}
+    if key == "apiKey":
+        env = _KEY_ENV.get(engine)
+        if env and os.environ.get(env):
+            # Presence only -- never the key (Troy, 2026-09-30).
+            return {"unsetMeans": f"Not set here: uses the {env} in this machine's environment."}
+        if provider.engine_kwargs.get("auth_required", True):
+            return {"unsetMeans": f"Not set: {provider.label} refuses requests without a key."}
+        return {"unsetMeans": "Not set: no key is sent."}
+    if key == "modelId":
+        if engine in (ClaudeCodeCliEngine, CodexCliEngine):
+            return {"unsetMeans": "Not set: the CLI's own default model."}
+        if engine is SystemOneHttpEngine:
+            return {"unsetMeans": "Not set: asks for kev-latest.", "unsetResolvesTo": "kev-latest"}
+        return {
+            "unsetMeans": "Not set: this driver serves every model the account lists, less "
+            "any the model filters leave out."
+        }
+    if key == "upstreamModelId":
+        return {"unsetMeans": "Not set: the same as the model id."}
+    if key == "decisionMaxConcurrent":
+        return {"unsetMeans": "Not set: no limit is advertised."}
+    return {}
+
+
+def as_schema(
+    *,
+    available_models: list[str] | None = None,
+    values: dict[str, Any] | None = None,
+    pending: dict[str, Any] | None = None,
+    managed: frozenset[str] = frozenset(),
+) -> ConfigSchema:
     """Return the driver's schema, surfacing discovered models as
     `suggestions` on the `modelId` field when the caller supplies them.
 
@@ -331,9 +454,21 @@ def as_schema(*, available_models: list[str] | None = None) -> ConfigSchema:
             else f
             for f in fields
         ]
+    live: list[ConfigField] = []
+    for field in fields:
+        update: dict[str, Any] = {}
+        if values is not None and values.get(field.key) in (None, ""):
+            update.update(_unset_facts(field.key, values))
+        if field.key in managed:
+            update["managedBy"] = MANAGED_BY
+        if pending and field.key in pending:
+            update["pendingRestart"] = True
+            if not field.sensitive:
+                update["inEffect"] = pending[field.key]
+        live.append(field.model_copy(update=update) if update else field)
     return ConfigSchema(
         component="inference-driver",
-        fields=fields,
+        fields=live,
         categories=CATEGORY_LABELS,
     )
 
@@ -346,6 +481,16 @@ def _with_model_suggestions(model_field: ConfigField, models: list[str]) -> Conf
         update={
             "suggestions": list(models),
         }
+    )
+
+
+def _is_unset(field: ConfigField, value: Any) -> bool:
+    """None, or an empty secret: an empty key is no key, and it used to
+    read `"<redacted>"` -- a key saved that never was."""
+    if value is None:
+        return True
+    return (
+        field.valueType == ConfigValueType.secret and isinstance(value, str) and not value.strip()
     )
 
 
@@ -398,6 +543,10 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
     if vt == ConfigValueType.number or vt == ConfigValueType.duration:
         if isinstance(value, bool) or not isinstance(value, int | float):
             return f"expected number, got {type(value).__name__}"
+        if not math.isfinite(value):
+            # JSON's `NaN` parses and compares false with everything, so it
+            # passed the range check.
+            return "must be a finite number"
         if field.minimum is not None and value < field.minimum:
             return f"must be >= {field.minimum}"
         if field.maximum is not None and value > field.maximum:
@@ -449,7 +598,9 @@ class ConfigStore:
         self._path = path
         self._lock = threading.Lock()
         self._values: dict[str, Any] = _defaults()
-        self._pending_restart: set[str] = set()
+        # What this process runs on for every `requiresRestart` field, as
+        # loaded; a field is pending while its saved value differs.
+        self._started: dict[str, Any] = dict(self._values)
         self._master_key = master_key
 
     def load(self) -> None:
@@ -461,13 +612,20 @@ class ConfigStore:
                     raise ValueError(f"config file {self._path} must be a YAML mapping at the root")
                 merged = _defaults()
                 for k, v in raw.items():
-                    if k not in _FIELDS_BY_KEY:
+                    field = _FIELDS_BY_KEY.get(k)
+                    if field is None:
                         continue
-                    merged[k] = self._decrypt_loaded(k, v)
+                    value = self._decrypt_loaded(k, v)
+                    # A null in the file is the default, as a PATCH of null
+                    # is; an empty secret is no secret.
+                    if _is_unset(field, value):
+                        value = field.default
+                    merged[k] = value
                 self._values = merged
             else:
                 self._values = _defaults()
                 self._write_locked()
+            self._started = dict(self._values)
 
     def _decrypt_loaded(self, key: str, value: Any) -> Any:
         """Resolve an on-disk value to its in-memory (plaintext) form.
@@ -524,26 +682,53 @@ class ConfigStore:
                     rejected.append(ConfigFieldError(key=key, message=err))
                     continue
 
+                if key in managed_keys():
+                    rejected.append(ConfigFieldError(key=key, message=MANAGED_BY))
+                    continue
+
+                if _is_unset(field, new_value):
+                    new_value = None
                 if new_value is None and field.default is not None:
                     self._values[key] = field.default
                 else:
                     self._values[key] = new_value
 
                 applied.append(key)
-                if field.requiresRestart:
-                    self._pending_restart.add(key)
+                # This PATCH's keys, while they differ from what the
+                # process runs on: the contract's subset of `applied`. It
+                # was every restart key saved since start.
+                if field.requiresRestart and self._values.get(key) != self._started.get(key):
                     pending_restart.append(key)
 
             if applied:
                 self._write_locked()
 
-            requires_restart = bool(self._pending_restart)
             return ConfigUpdateResult(
                 applied=applied,
                 rejected=rejected,
-                requiresRestart=requires_restart,
-                pendingRestart=sorted(self._pending_restart),
+                requiresRestart=bool(pending_restart),
+                pendingRestart=pending_restart,
             )
+
+    def pending_restart(self) -> dict[str, Any]:
+        """`requiresRestart` fields whose saved value is not the one this
+        process runs on, with the value it runs on."""
+        with self._lock:
+            return {
+                f.key: self._started.get(f.key)
+                for f in FIELDS
+                if f.requiresRestart and self._values.get(f.key) != self._started.get(f.key)
+            }
+
+    def started(self, key: str) -> Any:
+        """The value this process started with -- what a restart field is
+        in effect as."""
+        with self._lock:
+            return self._started.get(key)
+
+    def values(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._values)
 
     def get(self, key: str) -> Any:
         with self._lock:

@@ -29,7 +29,9 @@ log = logging.getLogger(__name__)
 @router.get("/v1/info", response_model=DriverInfo, response_model_exclude_none=True)
 async def info(request: Request, models: bool = True, model: str | None = None) -> DriverInfo:
     store: ConfigStore = request.app.state.config_store
-    provider_key = str(store.get("provider") or "") or None
+    # The provider the running engine was built for: `provider` is read at
+    # start, so a saved-but-not-restarted one is not what answers here.
+    provider_key = str(store.started("provider") or "") or None
 
     # The configured backend is determined by the engine the registry
     # picks for the configured provider — so prefer the live engine's

@@ -19,7 +19,7 @@ from .._generated.models import (
     Message,
     Role,
 )
-from ..config import ConfigStore, as_schema
+from ..config import ConfigStore, as_schema, managed_keys
 
 router = APIRouter(tags=["config"])
 
@@ -33,7 +33,13 @@ async def get_config(request: Request) -> ConfigDocument:
 @router.get("/v1/config/schema", response_model=ConfigSchema)
 async def get_config_schema(request: Request) -> ConfigSchema:
     available_models = getattr(request.app.state, "available_models", None) or []
-    return as_schema(available_models=available_models)
+    store: ConfigStore = request.app.state.config_store
+    return as_schema(
+        available_models=available_models,
+        values=store.values(),
+        pending=store.pending_restart(),
+        managed=managed_keys(),
+    )
 
 
 @router.patch("/v1/config", response_model=ConfigUpdateResult)
