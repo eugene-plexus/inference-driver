@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,11 +59,13 @@ from .._generated.models import (
     ModerateRequest,
     ModerateResponse,
     ModerationPartType,
+    NamedToolChoice,
     Role,
     SpeakRequest,
     SpeechFormat,
     Stage,
     StreamProgress,
+    Tool,
     ToolCall,
     ToolCallDelta,
     TranscribeRequest,
@@ -1123,13 +1126,16 @@ class OpenAiCompatibleHttpEngine:
             unsupported |= _ALL_ENGINE_SETTINGS - listed
         return frozenset(unsupported)
 
-    def _payload_for(self, request: GenerateRequest, target: _Target) -> dict[str, Any]:
+    def _payload_for(
+        self, request: GenerateRequest, target: _Target, forced: Tool | None = None
+    ) -> dict[str, Any]:
         """The chat-completions body for this request.
 
         Shared by `generate` and `stream` so the two cannot drift on
         param shaping -- which would be an especially quiet bug, since
         the only symptom would be a streamed answer differing from a
-        non-streamed one for the same request.
+        non-streamed one for the same request. `forced` is the tool a
+        named `tool_choice` forces on llama-server (`_forced_tool`).
         """
         unsupported = self._unsupported_settings(target)
         if unsupported:
@@ -1255,7 +1261,25 @@ class OpenAiCompatibleHttpEngine:
             # asked of the backend.
             payload["modalities"] = ["text", "audio"]
             payload["audio"] = {"voice": request.audioOutput.voice, "format": "pcm16"}
+        if forced is not None:
+            _force_by_schema(payload, forced)
         return payload
+
+    async def _forced_tool(self, request: GenerateRequest) -> Tool | None:
+        """The tool a named `tool_choice` forces, when the backend is llama-server.
+
+        Only there: OpenAI, vLLM and the rest honour a named choice
+        themselves, so they get the request untouched. A choice naming a
+        tool the request does not offer is also left alone, for the
+        backend to refuse in its own words.
+        """
+        choice = request.toolChoice
+        if not isinstance(choice, NamedToolChoice) or not request.tools:
+            return None
+        tool = next((t for t in request.tools if t.function.name == choice.function.name), None)
+        if tool is None or not await self._answers_as_llama_cpp():
+            return None
+        return tool
 
     def _public_model_id(self, reported: object, target: _Target) -> str:
         """The model identity a caller sees on a response.
@@ -1330,7 +1354,8 @@ class OpenAiCompatibleHttpEngine:
             return await self._complete(request)
         started = time.perf_counter()
         target = self.resolve_model(request.model)
-        payload = self._payload_for(request, target)
+        forced = await self._forced_tool(request)
+        payload = self._payload_for(request, target, forced)
         hint = _attachment_hint(attachment_kinds(request.messages))
         attachment_request = hint is not None
 
@@ -1412,6 +1437,11 @@ class OpenAiCompatibleHttpEngine:
         content = message.get("content")
         tool_calls = _tool_calls_from_wire(message.get("tool_calls"))
         reasoning = _reasoning_of(message)
+        if forced is not None and not tool_calls:
+            made = _forced_call(forced, content, first.get("finish_reason"))
+            if made is not None:
+                tool_calls, content = [made], None
+                first = {**first, "finish_reason": "tool_calls"}
         # **`content` is null on a tool-call-only turn**, and this used
         # to raise on exactly that response -- the concrete way a tool
         # call failed here before the contract carried one. **And on a
@@ -1506,7 +1536,11 @@ class OpenAiCompatibleHttpEngine:
                 yield chunk
             return
         target = self.resolve_model(request.model)
-        payload = self._payload_for(request, target)
+        forced = await self._forced_tool(request)
+        payload = self._payload_for(request, target, forced)
+        # A forced call's arguments arrive as text and are not the answer:
+        # held here and turned into the call at the end.
+        held: list[str] = []
         hint = _attachment_hint(attachment_kinds(request.messages))
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
@@ -1708,6 +1742,9 @@ class OpenAiCompatibleHttpEngine:
                             if frame_logprobs is not None:
                                 yield Chunk(logprobs=frame_logprobs)
                             continue
+                        if forced is not None:
+                            held.append(text)
+                            continue
                         visible = filtered.feed(text) if filtered is not None else text
                         if visible:
                             emitted.append(visible)
@@ -1744,6 +1781,33 @@ class OpenAiCompatibleHttpEngine:
             if tail:
                 emitted.append(tail)
                 yield Chunk(text=tail)
+
+        if forced is not None and held and not call_parts:
+            made = _forced_call(forced, "".join(held), finish_reason)
+            if made is not None:
+                yield Chunk(
+                    toolCalls=[
+                        ToolCallDelta(
+                            index=0,
+                            id=made.id,
+                            type="function",
+                            function=Function1(
+                                name=made.function.name, arguments=made.function.arguments
+                            ),
+                        )
+                    ]
+                )
+                call_parts[0] = {
+                    "id": made.id,
+                    "name": made.function.name,
+                    "arguments": made.function.arguments,
+                }
+                finish_reason = "tool_calls"
+            else:
+                # No call came of it (the budget ran out): the text goes
+                # back as it came, so the caller sees what the model said.
+                emitted.append("".join(held))
+                yield Chunk(text="".join(held))
 
         content = "".join(emitted)
         tool_calls = _finish_tool_calls(call_parts)
@@ -3092,6 +3156,80 @@ def _tool_call_deltas_from_wire(raw: Any) -> list[ToolCallDelta]:
     return out
 
 
+def _new_call_id() -> str:
+    """`call_` and 24 hex digits, the shape OpenAI's ids have.
+
+    For a call the backend sent without an id. This was `call_{index}`,
+    and Mistral Small 3.2's chat template refuses an id under 9
+    characters: llama-server answers the next turn with a 400 before
+    generating anything (A5, 2026-09-30).
+    """
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
+def _force_by_schema(payload: dict[str, Any], tool: Tool) -> None:
+    """Ask llama-server for one tool's arguments as structured output.
+
+    **Why (A5, 2026-09-30).** llama-server reads `tool_choice` as a string,
+    so a named choice falls back to `auto` with only a log warning, and 22
+    of 30 forced answers across ten models came back as prose. `"required"`
+    with only that tool was not enough: Qwen3.6-35B-A3B wrote prose and
+    degenerated to the token limit 3 times of 3. A JSON schema as the
+    response format is a grammar llama-server does enforce, and gave a
+    valid call there 3 of 3. So the tools leave the request, the named
+    tool's parameters become the schema, and one system line says which
+    function the JSON is for. The answer is turned back into the call by
+    `_forced_call`.
+    """
+    for key in ("tools", "tool_choice", "parallel_tool_calls"):
+        payload.pop(key, None)
+    function = tool.function
+    payload["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": function.name, "schema": function.parameters or {"type": "object"}},
+    }
+    about = f": {function.description}" if function.description else ""
+    line = (
+        f"Call the function `{function.name}` now{about}. "
+        "Reply with its arguments only, as a JSON object."
+    )
+    messages: list[dict[str, Any]] = payload["messages"]
+    if messages and messages[0].get("role") == "system":
+        first = dict(messages[0])
+        content = first.get("content")
+        if isinstance(content, list):
+            first["content"] = [*content, {"type": "text", "text": line}]
+        else:
+            first["content"] = f"{content}\n\n{line}" if content else line
+        messages[0] = first
+    else:
+        messages.insert(0, {"role": "system", "content": line})
+
+
+def _forced_call(tool: Tool, content: str | None, finish: str | None) -> ToolCall | None:
+    """The call a forced answer makes, or None when it made none.
+
+    None when the budget ran out (`length`): a cut-off object is not a
+    call, and saying `length` is the honest end of that case. None too
+    when the text is not a JSON object, which the grammar should not
+    allow; the text then goes back as it came. The arguments stay the
+    model's own text, as every other call's do.
+    """
+    if finish == "length" or not isinstance(content, str):
+        return None
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return ToolCall(
+        id=_new_call_id(),
+        type="function",
+        function=FunctionCall(name=tool.function.name, arguments=content.strip()),
+    )
+
+
 def _accumulate_tool_calls(parts: dict[int, dict[str, str]], raw: Any) -> None:
     """Fold one frame's fragments into the calls being assembled."""
     if not isinstance(raw, list):
@@ -3126,7 +3264,7 @@ def _finish_tool_calls(parts: dict[int, dict[str, str]]) -> list[ToolCall]:
             continue
         calls.append(
             ToolCall(
-                id=slot.get("id") or f"call_{key}",
+                id=slot.get("id") or _new_call_id(),
                 type="function",
                 function=FunctionCall(name=slot["name"], arguments=slot.get("arguments") or ""),
             )
@@ -3145,7 +3283,7 @@ def _tool_calls_from_wire(raw: Any) -> list[ToolCall]:
     if not isinstance(raw, list):
         return []
     calls: list[ToolCall] = []
-    for i, item in enumerate(raw):
+    for item in raw:
         if not isinstance(item, dict):
             continue
         fn = item.get("function") or {}
@@ -3155,7 +3293,7 @@ def _tool_calls_from_wire(raw: Any) -> list[ToolCall]:
         args = fn.get("arguments") if isinstance(fn, dict) else None
         calls.append(
             ToolCall(
-                id=str(item.get("id") or f"call_{i}"),
+                id=str(item.get("id") or _new_call_id()),
                 type="function",
                 function=FunctionCall(name=str(name), arguments=str(args or "")),
             )

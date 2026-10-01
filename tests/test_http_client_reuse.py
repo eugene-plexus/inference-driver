@@ -164,9 +164,9 @@ async def test_latency_brackets_the_whole_call_not_just_the_socket() -> None:
     engine = _engine()
     real_payload = engine._payload_for
 
-    def slow_payload(request: GenerateRequest, target: Any) -> dict[str, Any]:
+    def slow_payload(request: GenerateRequest, target: Any, forced: Any = None) -> dict[str, Any]:
         time.sleep(0.05)  # stands in for the client build this used to hide
-        return real_payload(request, target)
+        return real_payload(request, target, forced)
 
     engine._payload_for = slow_payload  # type: ignore[method-assign]
     response = await engine.generate(_request())
