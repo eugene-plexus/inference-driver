@@ -270,6 +270,22 @@ PROVIDERS: dict[str, Provider] = {
             "auth_required": True,
         },
     ),
+    "openrouter_systemone": Provider(
+        key="openrouter_systemone",
+        label="OpenRouter (hosted Jev)",
+        engine_class=SystemOneHttpEngine,
+        engine_kwargs={
+            # OpenRouter serves the same pinned protocol at
+            # `/api/v1/systemone`; the engine appends `/v1/systemone`.
+            # Jev's id there is `typesafe/jev-1.13` (`upstreamModelId`).
+            "default_base_url": "https://openrouter.ai/api",
+            "auth_required": True,
+            "backend_kind": BackendKind.systemone_http,
+            # Ask OpenRouter not to re-route a decision to another host
+            # behind our back. Honouring it is OpenRouter's responsibility.
+            "provider_preferences": {"allow_fallbacks": False},
+        },
+    ),
     "systemone_custom": Provider(
         key="systemone_custom",
         label="Custom System One URL (Kev, or another decision server)",

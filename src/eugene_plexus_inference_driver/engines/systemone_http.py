@@ -2,7 +2,8 @@
 
 Drives every backend that implements `POST /v1/systemone` — a
 supervised Kev runtime, another System One-compatible server the
-operator points us at, or TypeSafe's own hosted endpoint — the way
+operator points us at, TypeSafe's own hosted endpoint, or OpenRouter's
+(`https://openrouter.ai/api/v1/systemone`, same protocol) — the way
 `openai_compat_http` drives every chat-completions backend. The
 protocol is **pinned**: docs.typesafe.ai/api as read on 2026-09-22,
 cross-checked against `kev/serve.py` at commit `1c35199` and a live
@@ -159,6 +160,7 @@ class SystemOneHttpEngine:
         auth_required: bool = False,
         max_concurrent: int | None = None,
         runtime: str | None = None,
+        provider_preferences: dict[str, Any] | None = None,
     ) -> None:
         if auth_required and not api_key:
             raise CliError(
@@ -179,6 +181,13 @@ class SystemOneHttpEngine:
         #: handles exactly one (a lock, no cross-caller batching).
         self.decision_max_concurrent = max_concurrent
         self.runtime = runtime
+        #: A router's own routing knobs, sent as the request's `provider`
+        #: object. Only the `openrouter_systemone` registry entry sets it
+        #: (`allow_fallbacks: false`: do not hand this decision to another
+        #: host). Whether the router honours it is the router's to answer
+        #: for; Eugene asks, and sends nothing to a backend that never
+        #: defined the field.
+        self._provider_preferences = provider_preferences
         self._http_client: httpx.AsyncClient | None = None
 
     # --- construction -------------------------------------------------------
@@ -215,6 +224,7 @@ class SystemOneHttpEngine:
         auth_required: bool = False,
         runtime_url: str | None = None,
         runtime_name: str | None = None,
+        provider_preferences: dict[str, Any] | None = None,
     ) -> SystemOneHttpEngine:
         del backend_kind  # one protocol, one kind; kept for registry symmetry
         base_url = str(runtime_url or get("baseUrl") or default_base_url or "").strip()
@@ -234,6 +244,7 @@ class SystemOneHttpEngine:
             auth_required=auth_required,
             max_concurrent=int(raw_concurrent) if raw_concurrent else None,
             runtime=runtime_name if runtime_url else None,
+            provider_preferences=provider_preferences,
         )
 
     def _client(self) -> httpx.AsyncClient:
@@ -277,6 +288,8 @@ class SystemOneHttpEngine:
             "state": request.state,
             "questions": questions,
         }
+        if self._provider_preferences:
+            payload["provider"] = dict(self._provider_preferences)
         try:
             response = await self._client().post(
                 "/v1/systemone",

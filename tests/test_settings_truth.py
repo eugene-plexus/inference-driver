@@ -52,6 +52,8 @@ def test_a_field_is_shown_for_every_provider_that_reads_it() -> None:
     assert "openrouter" in fields["baseUrl"].showWhen.equals
     assert "openai" in fields["runtimeName"].showWhen.equals
     assert "typesafe" in fields["apiKey"].showWhen.equals
+    assert "openrouter_systemone" in fields["apiKey"].showWhen.equals
+    assert "openrouter_systemone" in fields["baseUrl"].showWhen.equals
     assert "elevenlabs" in fields["catalogueRefreshMinutes"].showWhen.equals
     # And hidden where nothing reads it.
     assert "elevenlabs" not in fields["modelId"].showWhen.equals

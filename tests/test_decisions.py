@@ -191,6 +191,20 @@ async def test_translating_engine_reports_public_and_sends_upstream() -> None:
 
 
 @respx.mock
+async def test_provider_preferences_ride_as_the_provider_object() -> None:
+    route = respx.post(f"{BASE}/v1/systemone").mock(
+        return_value=httpx.Response(200, json=_kev_body())
+    )
+    engine = _engine(provider_preferences={"allow_fallbacks": False})
+
+    await engine.decide(_request())
+
+    sent = json.loads(route.calls[0].request.read())
+    assert set(sent) == {"model", "state", "questions", "provider"}
+    assert sent["provider"] == {"allow_fallbacks": False}
+
+
+@respx.mock
 async def test_absent_usage_stays_absent() -> None:
     body = _kev_body()
     del body["usage"]
@@ -392,6 +406,72 @@ def test_the_hosted_provider_requires_a_key() -> None:
         assert "API key" in str(e)
         return
     raise AssertionError("hosted engine constructed with no key")
+
+
+OPENROUTER = "https://openrouter.ai/api"
+
+
+def _openrouter_client(tmp_path, monkeypatch, *, api_key: str | None = "sk-or-test") -> TestClient:
+    config = tmp_path / "driver.yaml"
+    config.write_text(
+        "provider: openrouter_systemone\n"
+        + (f"apiKey: {api_key}\n" if api_key else "")
+        + "modelId: jev\n"
+        "upstreamModelId: typesafe/jev-1.13\n"
+        # Not declarable for this provider: it must not relabel a cloud
+        # router as local.
+        "backendLocality: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EUGENE_PLEXUS_DRIVER_CONFIG_FILE", str(config))
+    from eugene_plexus_inference_driver.app import create_app
+
+    return TestClient(create_app())
+
+
+@respx.mock
+def test_openrouter_provider_reaches_openrouters_door(tmp_path, monkeypatch) -> None:
+    """Shaped like the measured 2026-09-28 response through OpenRouter:
+    the reported model carries Jev's dated revision."""
+    route = respx.post(f"{OPENROUTER}/v1/systemone").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "gen-1",
+                "model": "typesafe/jev-1.13-20260917",
+                "provider": "TypeSafe",
+                "answers": {"q": {"type": "noul", "noul": 0.96}},
+                "usage": {"input_tokens": 476, "output_tokens": 70, "cost": 0.000019992},
+            },
+        )
+    )
+    with _openrouter_client(tmp_path, monkeypatch) as client:
+        info = client.get("/v1/info").json()
+        response = client.post(
+            "/v1/decide",
+            json={"state": "x", "questions": {"q": {"type": "noul", "instructions": "?"}}},
+        )
+    assert info["provider"] == "openrouter_systemone"
+    assert info["locality"] == "external"
+    (model,) = info["models"]
+    assert model["surfaces"] == ["decisions"]
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["modelId"] == "jev"
+    assert body["reportedModel"] == "typesafe/jev-1.13-20260917"
+    request = route.calls[0].request
+    assert request.headers["Authorization"] == "Bearer sk-or-test"
+    sent = json.loads(request.read())
+    assert sent["model"] == "typesafe/jev-1.13"
+    assert sent["provider"] == {"allow_fallbacks": False}
+
+
+def test_openrouter_provider_requires_a_key(tmp_path, monkeypatch) -> None:
+    with _openrouter_client(tmp_path, monkeypatch, api_key=None) as client:
+        health = client.get("/healthz").json()
+    assert health["status"] != "ok"
+    assert "API key" in json.dumps(health)
 
 
 def test_from_config_with_no_backend_says_both_fixes() -> None:
