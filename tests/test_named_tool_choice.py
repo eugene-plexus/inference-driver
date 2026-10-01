@@ -179,6 +179,20 @@ async def test_arguments_cut_off_by_the_budget_are_not_a_call() -> None:
 
 
 @respx.mock
+async def test_a_cut_off_answer_that_happens_to_parse_is_still_not_a_call() -> None:
+    """The failover thread's hazard: a truncated call can be valid JSON with
+    a 200. `{"city": "Os"}` parses; `length` says it was cut, so it is not
+    sent to be executed."""
+    _llama_server()
+    respx.post(f"{BASE}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_reply('{"city": "Os"}', finish="length"))
+    )
+    result = await _engine().generate(_ask())
+    assert result.toolCalls is None
+    assert result.finishReason is FinishReason.length
+
+
+@respx.mock
 async def test_another_backend_gets_the_named_choice_untouched() -> None:
     respx.get(f"{BASE}/props").mock(return_value=httpx.Response(404))
     route = respx.post(f"{BASE}/v1/chat/completions").mock(
