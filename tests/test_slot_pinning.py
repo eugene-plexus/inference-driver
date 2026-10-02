@@ -248,3 +248,19 @@ async def test_an_engine_that_will_not_say_its_slots_is_not_pinned():
     )
     await _engine(True).generate(_request("k:a"))
     assert "id_slot" not in json.loads(chat.calls[0].request.content)
+
+
+@pytest.mark.parametrize(
+    ("value", "on"), [(True, True), (None, False), (False, False), ("true", False)]
+)
+def test_the_setting_is_read_from_the_drivers_config(value, on):
+    """Only an explicit true pins: the agent writes the key, null when off."""
+    config = {"baseUrl": BASE, "modelId": "m", "slotPinning": value}
+    engine = OpenAiCompatibleHttpEngine.from_config(
+        config.get,
+        default_base_url=None,
+        fixed_temperature_pattern=None,
+        backend_kind=BackendKind.openai_compat_http,
+        auth_required=False,
+    )
+    assert engine._slot_pinning is on
