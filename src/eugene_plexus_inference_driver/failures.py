@@ -46,11 +46,22 @@ def credential_refused(error: Exception) -> int | None:
     return None
 
 
+#: llama-server answers 500 when the model's chat template refuses the
+#: request's SHAPE -- the Qwen 3.5+ templates' "System message must be at
+#: the beginning" -- and its message says so. Measured 2026-10-02: as a
+#: 502 it tripped the gateway's circuit, and every other client of that
+#: model got 503 "cooling down" (gateway#7). The same request fails the
+#: same way every time and says nothing about the backend's health.
+_TEMPLATE_REFUSAL = re.compile(r"Jinja Exception")
+
+
 def disposition(error: Exception) -> str:
     status = getattr(error, "upstream_status", None)
     if status == 429 or isinstance(error.__cause__, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "safe"
     if isinstance(status, int) and 400 <= status < 500 and status not in {408, 409, 425}:
+        return "terminal"
+    if _TEMPLATE_REFUSAL.search(str(error)):
         return "terminal"
     return "indeterminate"
 

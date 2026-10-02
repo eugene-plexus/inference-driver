@@ -34,6 +34,40 @@ def test_status_does_not_flatten_execution_outcomes(status, expected):
     assert failure.headers["Retry-After"] == "13"
 
 
+#: llama-server b11211's own words, Qwen3.5-4B, Claude Code's request (2026-10-02).
+_TEMPLATE_500 = (
+    'openai_compat_http returned 500: {"error":{"code":500,"message":"\\n------------\\n'
+    "While executing CallExpression at line 85, column 32 in source:\\n...first %}\\n"
+    "            {{- raise_exception('System message must be at the beginnin...\\n"
+    "                                           ^\\nError: Jinja Exception: System message "
+    'must be at the beginning.","type":"server_error"}}'
+)
+
+
+def test_a_template_refusing_the_request_is_the_requests_failure():
+    """**A 500 that says the chat template refused this request is the
+    request's, not the backend's** (gateway#7). As a 502 it tripped the
+    gateway's circuit and 503'd every other client of the model; as the
+    terminal 400 a 4xx refusal already is, it neither cascades nor counts."""
+    error = CliError(_TEMPLATE_500, upstream_status=500)
+    assert disposition(error) == "terminal"
+    failure = _backend_error(error, "fixture")
+    assert failure.status_code == 400
+    assert failure.detail["retryDisposition"] == "terminal"
+    assert "System message must be at the beginning" in failure.detail["detail"]
+
+
+def test_any_other_500_is_still_the_backends():
+    """The pair that tells the fix from the over-correction: a backend that
+    breaks answers 500 too, and that one must still count against it."""
+    error = CliError(
+        'openai_compat_http returned 500: {"error":{"code":500,"message":"CUDA error: out of memory"}}',
+        upstream_status=500,
+    )
+    assert disposition(error) == "indeterminate"
+    assert _backend_error(error, "fixture").status_code == 502
+
+
 @pytest.mark.parametrize(
     "cause,expected",
     [
