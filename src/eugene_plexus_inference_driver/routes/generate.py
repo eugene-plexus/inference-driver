@@ -34,7 +34,7 @@ from ..engines.base import (
     resolve_single_model,
 )
 from ..engines.systemone_http import validate_questions
-from ..failures import credential_refused, disposition, request_id
+from ..failures import capacity_refused, credential_refused, disposition, request_id
 from ..images import ImageRefusal, attachment_kinds, validate_messages
 from ..locality import enforce
 from ..raw_completion import CompletionRefusal
@@ -671,6 +671,27 @@ def _backend_error(e: Exception, kind_label: str) -> HTTPException:
                 component=f"inference-driver:{kind_label}",
                 retryDisposition=RetryDisposition.terminal,
                 retryAfterSeconds=wait,
+            ).model_dump(exclude_none=True),
+        )
+    if capacity_refused(e):
+        # CB3: the engine's shared pool is full of other requests' prompts.
+        # 503 and `safe`: another replica may take it, and the gateway
+        # neither counts it against this backend's circuit nor reads it
+        # as a broken engine (gateway#8).
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/inference-driver#backend-capacity",
+                title="Backend has no room for this request now",
+                status=503,
+                detail=(
+                    f"{e} The prompts in flight on this engine together outgrew the "
+                    "context its slots share; this request fits on its own. Nothing is "
+                    "wrong with the request or the engine. Retry, or give the model more "
+                    "context or another replica."
+                ),
+                component=f"inference-driver:{kind_label}",
+                retryDisposition=RetryDisposition.safe,
             ).model_dump(exclude_none=True),
         )
     outcome = disposition(e)

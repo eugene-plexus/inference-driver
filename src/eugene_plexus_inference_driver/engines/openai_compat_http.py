@@ -458,6 +458,27 @@ def _stop_sequence(choice: dict[str, Any], request: GenerateRequest) -> str | No
     return None
 
 
+def _stream_failure(event: Any) -> CliError | None:
+    """The failure an upstream frame reports, when it reports only that.
+
+    llama-server ends a stream it cannot finish with
+    `data: {"error": {"code": 500, "message": "..."}}` and closes. A frame
+    that also carries `choices` is not this: OpenRouter's mid-stream error
+    rides on a choice with `finish_reason: "error"`, and that path stands.
+    """
+    if not isinstance(event, dict) or "choices" in event:
+        return None
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    return CliError(
+        f"openai_compat_http stream error: {_redact(str(message)[:500])}",
+        upstream_status=code if isinstance(code, int) else None,
+    )
+
+
 def _sse_data(line: str) -> str | None:
     """The payload of one SSE `data:` line, or None for anything else.
 
@@ -1680,6 +1701,14 @@ class OpenAiCompatibleHttpEngine:
                         saw_first_data = True
                         log.debug("openai_compat_http: unparseable SSE frame (contents omitted)")
                         continue
+                    failure = _stream_failure(event)
+                    if failure is not None:
+                        # llama-server's own report of why it is cutting
+                        # this stream, then nothing: read before 2026-10-02
+                        # as a frame with no choices, so the cut surfaced as
+                        # "ended without [DONE]" and its reason -- a full
+                        # pool, which is load -- was lost (CB3).
+                        raise failure
                     read = event.get("prompt_progress") if isinstance(event, dict) else None
                     if isinstance(read, dict):
                         if report:

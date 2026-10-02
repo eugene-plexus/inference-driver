@@ -55,9 +55,38 @@ def credential_refused(error: Exception) -> int | None:
 _TEMPLATE_REFUSAL = re.compile(r"Jinja Exception")
 
 
+#: llama-server's words when the KV pool its slots share is full: the
+#: prompts in flight together outgrew `-c`. The engine refuses the next
+#: request (a 500) or cuts every stream in the batch it was decoding (an
+#: `error` frame, then nothing), and says the same either way. Measured
+#: 2026-10-02 on b11211: as a 502 it tripped the gateway's circuit, and on
+#: an 8B at 64k with four agents a replica 158 of 204 turns then failed,
+#: most of them "cooling down" on healthy replicas (gateway#8). A request
+#: that fits alone overflows only beside others, so it is load, not a
+#: broken backend: see `capacity_refused`.
+_POOL_FULL = re.compile(r"Context size has been exceeded")
+
+
+def capacity_refused(error: Exception) -> bool:
+    """True when the backend refused for want of room, not for a fault.
+
+    PC3's rule one case further: the request may go to another replica
+    (nothing was kept and nothing was answered), and it says nothing about
+    this backend's health, so the gateway's circuit must not count it.
+    A request bigger than the whole pool is a 400 from llama-server with
+    other words, and stays the caller's.
+    """
+    status = getattr(error, "upstream_status", None)
+    if isinstance(status, int) and status < 500:
+        return False
+    return bool(_POOL_FULL.search(str(error)))
+
+
 def disposition(error: Exception) -> str:
     status = getattr(error, "upstream_status", None)
     if status == 429 or isinstance(error.__cause__, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "safe"
+    if capacity_refused(error):
         return "safe"
     if isinstance(status, int) and 400 <= status < 500 and status not in {408, 409, 425}:
         return "terminal"
