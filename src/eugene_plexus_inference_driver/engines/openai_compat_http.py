@@ -24,6 +24,7 @@ read from config (`apiKey`, sensitive) with a fallback to the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -101,6 +102,7 @@ from ..raw_completion import (
 )
 from ..raw_completion import finish as raw_finish
 from ..raw_completion import usage as raw_usage
+from ..slots import SlotPins
 from ..speech import (
     ALL_FORMATS,
     OPENROUTER_FORMATS,
@@ -657,6 +659,7 @@ class OpenAiCompatibleHttpEngine:
         get: Callable[[str], Any] | None = None,
         catalogue_path: Path | None = None,
         provider: str | None = None,
+        slot_pinning: bool = False,
     ) -> None:
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
         if auth_required and not resolved_key:
@@ -681,6 +684,14 @@ class OpenAiCompatibleHttpEngine:
         self._upstream_model_id = upstream_model_id or model_id or ""
         self._timeout_seconds = timeout_seconds
         self._stall_seconds = stall_seconds
+        #: CB4: keep each conversation in one llama-server slot, never a busy
+        #: one. Set by the agent with `--no-cache-idle-slots`; see `slots.py`.
+        self._slot_pinning = slot_pinning
+        #: The slot map, built at the first pinned request from the engine's
+        #: own `total_slots`. None until then, and for good if the engine
+        #: will not say: then nothing is pinned and the engine chooses.
+        self._pins: SlotPins | None = None
+        self._pins_read = False
         self._fixed_temperature_pattern = fixed_temperature_pattern
         self._warned_dropped: set[tuple[str, str]] = set()
         # Matched against the upstream id — the pattern describes what
@@ -830,6 +841,26 @@ class OpenAiCompatibleHttpEngine:
                 showWhen=show_when,
             ),
             ConfigField(
+                key="slotPinning",
+                label="Keep each conversation in one slot",
+                description=(
+                    "llama.cpp only, and set by the agent from the model's "
+                    "settings profile together with the engine's "
+                    "`--no-cache-idle-slots`. Each conversation keeps one "
+                    "engine slot, least recently used out, and a request "
+                    "never names a slot that is busy: it waits here "
+                    "instead, because a request pinned to a busy slot "
+                    "wedged llama-server for up to 30 minutes. Worth about "
+                    "3 points of prompt reuse where the context per slot "
+                    "holds a whole conversation, and worse where it does not."
+                ),
+                category="adapter",
+                valueType=ConfigValueType.boolean,
+                default=False,
+                requiresRestart=True,
+                showWhen=show_when,
+            ),
+            ConfigField(
                 key="catalogueInclude",
                 label="Models to use",
                 description=(
@@ -939,6 +970,7 @@ class OpenAiCompatibleHttpEngine:
             get=get,
             catalogue_path=catalogue_path,
             provider=provider,
+            slot_pinning=get("slotPinning") is True,
         )
 
     # -- which model a request is for (P1) ---------------------------------
@@ -1357,7 +1389,38 @@ class OpenAiCompatibleHttpEngine:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
+    async def _slot_map(self) -> SlotPins | None:
+        """The slot map, read once from the engine's `/props`; None when
+        pinning is off or the engine does not say how many slots it has."""
+        if not self._slot_pinning:
+            return None
+        if not self._pins_read:
+            self._pins_read = True
+            total = None
+            try:
+                response = await self._client().get("/props", headers=self._headers())
+                total = response.json().get("total_slots") if response.is_success else None
+            except (httpx.HTTPError, ValueError, AttributeError) as e:
+                log.warning("slot pinning: could not read /props: %s", e)
+            if isinstance(total, int) and total >= 1:
+                self._pins = SlotPins(total)
+                log.info("slot pinning: %d slots, one conversation each", total)
+            else:
+                log.warning(
+                    "slot pinning is on but the engine reported no slot count; "
+                    "requests go unpinned and the engine chooses"
+                )
+        return self._pins
+
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        """`_generate`, in the conversation's own slot when pinning is on (CB4)."""
+        pins = await self._slot_map() if request.audioOutput is None else None
+        if pins is None:
+            return await self._generate(request, None)
+        async with pins.hold(request.conversationKey) as slot:
+            return await self._generate(request, slot)
+
+    async def _generate(self, request: GenerateRequest, slot: int | None) -> GenerateResponse:
         # **Brackets the same span `stream()` does, deliberately.** This
         # used to report `response.elapsed`, which httpx starts *after*
         # the client is built and stops when the body is read -- so the
@@ -1372,11 +1435,13 @@ class OpenAiCompatibleHttpEngine:
         if request.audioOutput is not None:
             return await self._assembled(request)
         if request.completion is not None:
-            return await self._complete(request)
+            return await self._complete(request, slot)
         started = time.perf_counter()
         target = self.resolve_model(request.model)
         forced = await self._forced_tool(request)
         payload = self._payload_for(request, target, forced)
+        if slot is not None:
+            payload["id_slot"] = slot
         hint = _attachment_hint(attachment_kinds(request.messages))
         attachment_request = hint is not None
 
@@ -1527,6 +1592,28 @@ class OpenAiCompatibleHttpEngine:
     async def stream(
         self, request: GenerateRequest, *, assemble_audio: bool = False
     ) -> AsyncGenerator[Chunk, None]:
+        """`_stream`, in the conversation's own slot when pinning is on (CB4):
+        the slot is held busy until the stream ends, however it ends."""
+        pins = await self._slot_map() if request.audioOutput is None else None
+        if pins is None:
+            async with contextlib.aclosing(
+                self._stream(request, None, assemble_audio=assemble_audio)
+            ) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+            return
+        async with (
+            pins.hold(request.conversationKey) as slot,
+            contextlib.aclosing(
+                self._stream(request, slot, assemble_audio=assemble_audio)
+            ) as chunks,
+        ):
+            async for chunk in chunks:
+                yield chunk
+
+    async def _stream(
+        self, request: GenerateRequest, slot: int | None, *, assemble_audio: bool = False
+    ) -> AsyncGenerator[Chunk, None]:
         """Token-by-token, over upstream's own SSE.
 
         The wire shape is OpenAI's: `data:` lines carrying a chunk whose
@@ -1553,12 +1640,14 @@ class OpenAiCompatibleHttpEngine:
         disconnect looks like from here.
         """
         if request.completion is not None:
-            async for chunk in self._complete_stream(request):
+            async for chunk in self._complete_stream(request, slot):
                 yield chunk
             return
         target = self.resolve_model(request.model)
         forced = await self._forced_tool(request)
         payload = self._payload_for(request, target, forced)
+        if slot is not None:
+            payload["id_slot"] = slot
         # A forced call's arguments arrive as text and are not the answer:
         # held here and turned into the call at the end.
         held: list[str] = []
@@ -2052,7 +2141,7 @@ class OpenAiCompatibleHttpEngine:
         return self._completion_caps
 
     async def _completion_route(
-        self, request: GenerateRequest, target: _Target, *, stream: bool
+        self, request: GenerateRequest, target: _Target, *, stream: bool, slot: int | None = None
     ) -> tuple[str, dict[str, Any], str]:
         """Where and how this backend continues raw text: `(path, payload,
         kind)`. Refused before anything is sent: a setting a raw completion
@@ -2080,14 +2169,25 @@ class OpenAiCompatibleHttpEngine:
                     f"suffix: {target.id!r} does not fill in the middle on this backend; send the "
                     "prompt alone, or a model whose fill_in_middle is true"
                 )
-            return "/infill", infill_payload(request, stream=stream), "infill"
-        return "/v1/completions", openai_payload(request, target.upstream, stream=stream), "openai"
+            route = "/infill", infill_payload(request, stream=stream), "infill"
+        else:
+            route = (
+                "/v1/completions",
+                openai_payload(request, target.upstream, stream=stream),
+                "openai",
+            )
+        if slot is not None:
+            # A raw completion takes a slot like a chat does (CB4).
+            route[1]["id_slot"] = slot
+        return route
 
-    async def _complete(self, request: GenerateRequest) -> GenerateResponse:
+    async def _complete(
+        self, request: GenerateRequest, slot: int | None = None
+    ) -> GenerateResponse:
         """A raw completion, whole (P6)."""
         started = time.perf_counter()
         target = self.resolve_model(request.model)
-        path, payload, kind = await self._completion_route(request, target, stream=False)
+        path, payload, kind = await self._completion_route(request, target, stream=False, slot=slot)
         try:
             response = await self._client().post(
                 path,
@@ -2125,7 +2225,9 @@ class OpenAiCompatibleHttpEngine:
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
-    async def _complete_stream(self, request: GenerateRequest) -> AsyncGenerator[Chunk, None]:
+    async def _complete_stream(
+        self, request: GenerateRequest, slot: int | None = None
+    ) -> AsyncGenerator[Chunk, None]:
         """A raw completion, as the backend makes it (P6): SSE from
         `/v1/completions` and `/infill`, NDJSON from Ollama's `/api/generate`.
 
@@ -2135,7 +2237,7 @@ class OpenAiCompatibleHttpEngine:
         """
         started = time.perf_counter()
         target = self.resolve_model(request.model)
-        path, payload, kind = await self._completion_route(request, target, stream=True)
+        path, payload, kind = await self._completion_route(request, target, stream=True, slot=slot)
         parts: list[str] = []
         reason = FinishReason.stop
         used: Usage | None = None
