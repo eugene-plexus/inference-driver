@@ -366,6 +366,14 @@ def _is_openai_endpoint(base_url: str) -> bool:
 # backend instead of trying it and failing.
 _LOCAL_ENGINE_SETTINGS = frozenset({"topK", "minP"})
 
+# Settings Ollama's OpenAI-compatible surface reads into nothing (its
+# request struct in `openai/openai.go` has no field for them, v0.35.1):
+# dropped without a word, so an explicit one must be refused instead (A2).
+# `tool_choice` and `parallel_tool_calls` are NOT here: Ollama ignoring them
+# is the same as honouring `auto` and `true`, which Codex sends on every
+# request, so they are refused per value in `_payload_for`.
+_OLLAMA_DROPPED_SETTINGS = frozenset({"topK", "minP"})
+
 # P2c (2026-09-28): settings only a hosted API is known to take -- OpenAI's
 # own, or an OpenRouter model whose listing names them (186 list
 # `reasoning_effort`, 149 `logprobs`, 141 `logit_bias`, measured). A local
@@ -1208,6 +1216,8 @@ class OpenAiCompatibleHttpEngine:
             unsupported |= _LOCAL_ENGINE_SETTINGS
         if self._chat_tools_unavailable(target.upstream):
             unsupported |= _CHAT_TOOL_SETTINGS
+        if self._catalogue_source == "ollama":
+            unsupported |= _OLLAMA_DROPPED_SETTINGS
         caps = target.entry.capabilities if target.entry is not None else None
         listed_by_provider = self._catalogue_source == "openrouter" and caps is not None
         if not _is_openai_endpoint(self._base_url) and not listed_by_provider:
@@ -1249,6 +1259,10 @@ class OpenAiCompatibleHttpEngine:
             )
         if unsupported:
             refuse_unsupported_settings(request, unsupported=set(unsupported))
+        ollama = self._catalogue_source == "ollama"
+        # What Ollama ignores by value: `auto` and `true` are what it does
+        # anyway; anything else it would drop without a word.
+        held = self._ollama_ignores(request) if ollama else set()
         # Apply the operator's thinkingMode by mutating the system
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
@@ -1257,7 +1271,14 @@ class OpenAiCompatibleHttpEngine:
         payload: dict[str, Any] = {
             "model": target.upstream,
             "messages": _to_openai_messages(
-                messages, send_reasoning=not _is_openai_endpoint(self._base_url)
+                messages,
+                send_reasoning=not _is_openai_endpoint(self._base_url),
+                # Ollama reads replayed reasoning as `reasoning` only
+                # (ollama#18534) and matches tool results by position
+                # (ollama#18762); llama.cpp reads `reasoning_content` and
+                # matches by id, so it keeps both as they were.
+                reasoning_key="reasoning" if ollama else "reasoning_content",
+                results_in_call_order=ollama,
             ),
         }
         if request.maxTokens is not None:
@@ -1311,7 +1332,7 @@ class OpenAiCompatibleHttpEngine:
         ):
             if value is None:
                 continue
-            if field in unsupported:
+            if field in unsupported or field in held:
                 self._warn_dropped(key, target)
                 continue
             payload[key] = value
@@ -1322,7 +1343,9 @@ class OpenAiCompatibleHttpEngine:
         # made one hop earlier.
         if request.tools:
             payload["tools"] = [t.model_dump(mode="json", exclude_none=True) for t in request.tools]
-        if request.toolChoice is not None:
+        if request.toolChoice is not None and "toolChoice" in held:
+            self._warn_dropped("tool_choice", target)
+        elif request.toolChoice is not None:
             choice = request.toolChoice
             payload["tool_choice"] = (
                 str(choice.value)
@@ -1376,6 +1399,39 @@ class OpenAiCompatibleHttpEngine:
             _force_by_schema(payload, forced)
         return payload
 
+    def _ollama_ignores(self, request: GenerateRequest) -> set[str]:
+        """The tool settings this request sets to something Ollama ignores.
+
+        Ollama's OpenAI-compatible request has no `tool_choice` and no
+        `parallel_tool_calls` (`openai/openai.go`, v0.35.1): it always
+        answers as if `auto` and `true`. Those two values are honoured by
+        that, and Codex sends both on every request; any other value would
+        be dropped without a word, so an explicit one is refused here (A2)
+        and an inherited one is left out with the once-per-field warning.
+        """
+        held: set[str] = set()
+        explicit = set(request.callerSettings or [])
+        choice = request.toolChoice
+        if choice is not None and getattr(choice, "value", None) != "auto":
+            if "toolChoice" in explicit:
+                raise CliError(
+                    "tool_choice: Ollama ignores tool_choice and answers as if it were "
+                    "`auto`, so a required, none or named choice cannot be honoured here; "
+                    "send `auto`, or choose a backend that honours tool_choice.",
+                    upstream_status=400,
+                )
+            held.add("toolChoice")
+        if request.parallelToolCalls is False:
+            if "parallelToolCalls" in explicit:
+                raise CliError(
+                    "parallel_tool_calls: Ollama ignores it and may make several calls in "
+                    "one turn, so false cannot be honoured here; remove it, or choose a "
+                    "backend that honours parallel_tool_calls.",
+                    upstream_status=400,
+                )
+            held.add("parallelToolCalls")
+        return held
+
     async def _forced_tool(self, request: GenerateRequest) -> Tool | None:
         """The tool a named `tool_choice` forces, when the backend is llama-server.
 
@@ -1386,6 +1442,11 @@ class OpenAiCompatibleHttpEngine:
         """
         choice = request.toolChoice
         if not isinstance(choice, NamedToolChoice) or not request.tools:
+            return None
+        if self._catalogue_source != "openai":
+            # Ollama, LM Studio and OpenRouter are never llama-server, so
+            # there is nothing to ask `/props` (and Ollama refuses a named
+            # choice in `_payload_for` before anything is sent).
             return None
         tool = next((t for t in request.tools if t.function.name == choice.function.name), None)
         if tool is None or not await self._answers_as_llama_cpp():
@@ -3166,9 +3227,12 @@ class OpenAiCompatibleHttpEngine:
         loaded, which is why a miss is cached briefly and never
         overwrites a previous hit.
         """
+        # The operator's key, like every other call: an Ollama behind an
+        # authenticating proxy answered this probe 401 and the window
+        # stayed unknown (upstream drift audit, 2026-10-03).
         response = await client.get(
             "/api/ps",
-            headers={"Accept": "application/json"},
+            headers=self._headers(),
             timeout=_CONTEXT_PROBE_TIMEOUT,
         )
         if response.status_code >= 400:
@@ -3231,7 +3295,11 @@ class OpenAiCompatibleHttpEngine:
 
 
 def _to_openai_messages(
-    messages: list[Any], *, send_reasoning: bool = True
+    messages: list[Any],
+    *,
+    send_reasoning: bool = True,
+    reasoning_key: str = "reasoning_content",
+    results_in_call_order: bool = False,
 ) -> list[dict[str, Any]]:
     """Map our Message[] to OpenAI chat-completions messages.
 
@@ -3252,6 +3320,13 @@ def _to_openai_messages(
     values; with `tool` in the enum it would have turned a tool result
     into something the model reads as the human talking, which is a
     plausible-looking transcript that quietly breaks the loop.
+
+    `reasoning_key` names the field reasoning goes back under: Ollama reads
+    `reasoning` only (ollama#18534). `results_in_call_order` puts each run
+    of `tool` messages in the order of the calls that asked for them,
+    for a backend that matches results to calls by position rather than
+    by id (Ollama, ollama#18762): a harness that answers the second call
+    first otherwise hands each call the other's result.
     """
     out: list[dict[str, Any]] = []
     for m in messages:
@@ -3268,7 +3343,7 @@ def _to_openai_messages(
                 msg["tool_calls"] = [_tool_call_to_wire(c) for c in calls]
             reasoning = getattr(m, "reasoning", None)
             if send_reasoning and reasoning:
-                msg["reasoning_content"] = reasoning
+                msg[reasoning_key] = reasoning
             out.append(msg)
         elif role == Role.tool:
             out.append(
@@ -3280,6 +3355,35 @@ def _to_openai_messages(
             )
         else:
             out.append({"role": "user", "content": content or ""})
+    return _results_in_call_order(out) if results_in_call_order else out
+
+
+def _results_in_call_order(wire: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each run of `tool` messages after an assistant's calls, in call order.
+
+    Only the run directly after the assistant turn that made the calls is
+    reordered, and only by the position of its `tool_call_id` among that
+    turn's calls; a result naming no call keeps its place after the rest.
+    Nothing else moves.
+    """
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(wire):
+        message = wire[i]
+        out.append(message)
+        i += 1
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if not calls:
+            continue
+        run_end = i
+        while run_end < len(wire) and wire[run_end].get("role") == "tool":
+            run_end += 1
+        position = {call.get("id"): n for n, call in enumerate(calls) if call.get("id")}
+        run = wire[i:run_end]
+        # `sorted` is stable, so unmatched results keep their own order.
+        run = sorted(run, key=lambda m: position.get(m.get("tool_call_id"), len(position)))
+        out.extend(run)
+        i = run_end
     return out
 
 
