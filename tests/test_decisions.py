@@ -495,6 +495,18 @@ async def test_list_models_reads_the_kev_shape() -> None:
 
 
 @respx.mock
+async def test_list_models_reads_kev_1_0s_names() -> None:
+    """Kev at `kev-1.0` lists `{models: [{name, ...}]}` with no `id` (drift
+    audit, 2026-10-03, read in its source), which read as no models at all."""
+    respx.get(f"{BASE}/v1/models").mock(
+        return_value=httpx.Response(
+            200, json={"models": [{"name": "kev-1.0", "device": "cpu"}, {"name": ""}, {}]}
+        )
+    )
+    assert await _engine().list_models() == ["kev-1.0"]
+
+
+@respx.mock
 def test_config_test_uses_the_operation_the_engine_serves(tmp_path, monkeypatch) -> None:
     """POST /v1/config/test on a decision driver runs one tiny noul
     question instead of generate() — which would report a healthy Kev as

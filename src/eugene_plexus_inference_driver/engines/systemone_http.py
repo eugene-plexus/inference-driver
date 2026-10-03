@@ -370,8 +370,11 @@ class SystemOneHttpEngine:
 
     async def list_models(self) -> list[str]:
         """What the backend says it serves — Kev's `GET /v1/models`
-        answers `{models: [{id, ...}]}` (measured). Suggestions only;
-        an unreachable backend is an empty list, not a failure."""
+        answers `{models: [{id, ...}]}` at the pinned commit (measured)
+        and `{models: [{name, ...}]}` with no `id` at `kev-1.0` (read in
+        its source, 2026-10-03), so either is the model's name.
+        Suggestions only; an unreachable backend is an empty list, not a
+        failure."""
         try:
             response = await self._client().get("/v1/models", timeout=5.0)
             body = response.json()
@@ -380,7 +383,8 @@ class SystemOneHttpEngine:
         models = body.get("models") if isinstance(body, dict) else None
         if not isinstance(models, list):
             return []
-        return [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
+        names = (m.get("id") or m.get("name") for m in models if isinstance(m, dict))
+        return [str(name) for name in names if name]
 
 
 def _usage_from(usage: dict[str, Any]) -> Usage | None:
