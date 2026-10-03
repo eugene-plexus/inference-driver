@@ -224,3 +224,66 @@ def test_from_config_zero_is_zero_not_the_default() -> None:
     assert build(0)._stall_seconds == 0.0
     assert build(None)._stall_seconds == DEFAULT_STREAM_STALL_SECONDS
     assert build(7)._stall_seconds == 7.0
+
+
+# --------------------------------------------------------------------------- #
+# llama-server's pings are not the model working (drift audit, 2026-10-03)
+# --------------------------------------------------------------------------- #
+#
+# llama-server sends an SSE comment every 30 s from its HTTP thread, even
+# while its main loop is frozen, and any line used to reset the stall clock
+# -- so above ~31 s a wedged engine was never called stalled. For a
+# llama-server only `data:` lines count; a hosted service's keepalives
+# (OpenRouter's `: OPENROUTER PROCESSING`) still do.
+
+PING = b": ping\n\n"
+PINGS = [(0.1, PING)] * 6
+
+
+def _learn_what_it_is(llama_server: bool) -> None:
+    """What `/v1/info`'s context probe teaches the engine before routing."""
+    props = {"default_generation_settings": {"n_ctx": 4096}}
+    respx.get("http://127.0.0.1:9/props").mock(
+        return_value=httpx.Response(200, json=props) if llama_server else httpx.Response(404)
+    )
+    respx.get("http://127.0.0.1:9/v1/models").mock(return_value=httpx.Response(404))
+    respx.get("http://127.0.0.1:9/api/ps").mock(return_value=httpx.Response(404))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_llama_server_pings_do_not_hide_a_stall() -> None:
+    _learn_what_it_is(llama_server=True)
+    _mock_stream([(0.0, TOKEN), *PINGS, (5.0, DONE)])
+    engine = _engine(stall_seconds=0.25)
+    await engine.context_window()
+    started = time.perf_counter()
+    with pytest.raises(BackendTimeout):
+        await _collect(engine)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.55, f"fired at {elapsed:.2f}s -- the pings were counted as work"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_hosted_services_keepalives_still_count() -> None:
+    """The pair: the same comments from a backend that is not llama-server."""
+    _learn_what_it_is(llama_server=False)
+    _mock_stream([(0.0, TOKEN), *PINGS, (0.0, FINISH), (0.0, DONE)])
+    engine = _engine(stall_seconds=0.25)
+    await engine.context_window()
+    assert await _collect(engine) == "Hi"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_llama_server_tokens_between_pings_keep_it_alive() -> None:
+    """Silence is counted from the last token, so a slow model that pings
+    between tokens is not cut off."""
+    _learn_what_it_is(llama_server=True)
+    _mock_stream(
+        [(0.0, TOKEN), (0.1, PING), (0.1, TOKEN), (0.1, PING), (0.1, TOKEN), (0.0, FINISH)]
+    )
+    engine = _engine(stall_seconds=0.25)
+    await engine.context_window()
+    assert await _collect(engine) == "HiHiHi"

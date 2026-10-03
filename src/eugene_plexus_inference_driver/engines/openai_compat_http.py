@@ -1856,12 +1856,27 @@ class OpenAiCompatibleHttpEngine:
                 # it: it is still the prompt being read, and a batch on a
                 # large model on the processor can take longer than the
                 # stall window.
+                #
+                # **Except llama-server's pings** (upstream drift audit,
+                # 2026-10-03): it sends a `:` comment every 30 s from its
+                # HTTP thread even while its main loop is frozen, so above
+                # ~31 s a wedged engine never read as stalled. For it only
+                # `data:` lines count, and the silence between them adds up
+                # across pings. Known from `/props`, which `/v1/info`'s
+                # context probe reads before the gateway routes here; an
+                # engine not yet known keeps the old rule. The silence is
+                # summed over the waits alone, so a slow consumer still
+                # never trips it.
+                hollow_pings = self._llama_cpp is True
+                quiet = 0.0
                 saw_first_data = False
                 while True:
+                    waited = 0.0
                     try:
                         if saw_first_data and self._stall_seconds > 0:
+                            began = time.perf_counter()
                             try:
-                                async with asyncio.timeout(self._stall_seconds):
+                                async with asyncio.timeout(max(self._stall_seconds - quiet, 0.0)):
                                     line = await anext(lines)
                             except TimeoutError as stall:
                                 if saw_terminator:
@@ -1880,10 +1895,15 @@ class OpenAiCompatibleHttpEngine:
                                     self._stall_seconds,
                                     len("".join(emitted)) + len("".join(reasoned)),
                                 ) from stall
+                            waited = time.perf_counter() - began
                         else:
                             line = await anext(lines)
                     except StopAsyncIteration:
                         break
+                    if hollow_pings and not line.startswith("data:"):
+                        quiet += waited
+                    else:
+                        quiet = 0.0
                     if report and line.startswith(":"):
                         # An SSE keepalive comment: the service saying it
                         # is still working (OpenRouter's `: OPENROUTER
