@@ -35,10 +35,13 @@ those totals as-is.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import tempfile
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from typing import Any
 
 from .._generated.models import (
@@ -149,6 +152,36 @@ _ROUTING_ENV = frozenset(
 )
 
 
+@contextlib.contextmanager
+def _system_prompt_file(text: str) -> Iterator[str | None]:
+    """The system prompt in a file of its own for one call, or None for none.
+
+    **Never on the command line** (upstream drift audit, 2026-10-03). npm
+    installs `claude` on Windows as a `.cmd` shim, so its argv passes
+    through cmd.exe: a newline ends the command, the line stops at 8191
+    characters, and -- measured here with a shim like npm's -- a `"` in the
+    text closes cmd.exe's quoting, after which `&` ran a command of the
+    client's choosing on the driver host. `--system-prompt-file` exists in
+    every Claude Code this was checked against (2.1.283's binary registers
+    it; the changelog has it since print mode's early days).
+
+    `mkstemp` makes the file readable by this account only (0600 on POSIX;
+    on Windows the user's own temp directory), and it is removed when the
+    call ends however it ends. Written as bytes: no newline translation.
+    """
+    if not text:
+        yield None
+        return
+    fd, path = tempfile.mkstemp(prefix="eugene-plexus-system-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 class ClaudeCodeCliEngine:
     backend_kind = BackendKind.claude_code_cli
 
@@ -249,29 +282,32 @@ class ClaudeCodeCliEngine:
         # Windows, putting that on argv breaks: cmd.exe — which wraps
         # `claude.cmd` — treats a literal newline inside a quoted arg as a
         # command separator. Pipe via stdin instead. Claude Code reads
-        # stdin under --print when no positional prompt is given.
-        argv = self._build_argv(system_prompt=system_prompt)
+        # stdin under --print when no positional prompt is given. The
+        # system prompt goes in a file, for the same reason and a worse
+        # one (see `_system_prompt_file`).
+        with _system_prompt_file(system_prompt) as prompt_file:
+            argv = self._build_argv(system_prompt_file=prompt_file)
 
-        # DEBUG-level full-payload trace. CLI adapters flatten the
-        # gateway's structured message list into a single labeled
-        # transcript string before sending — the operator's copy-trace
-        # shows the pre-flattening shape, this shows what actually
-        # reaches the model.
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug(
-                "claude_code_cli → argv:\n%s\n--- system prompt ---\n%s\n"
-                "--- user prompt (stdin) ---\n%s",
+            # DEBUG-level full-payload trace. CLI adapters flatten the
+            # gateway's structured message list into a single labeled
+            # transcript string before sending — the operator's copy-trace
+            # shows the pre-flattening shape, this shows what actually
+            # reaches the model.
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "claude_code_cli → argv:\n%s\n--- system prompt (file) ---\n%s\n"
+                    "--- user prompt (stdin) ---\n%s",
+                    argv,
+                    system_prompt or "(empty)",
+                    user_prompt,
+                )
+
+            result = await run_cli(
                 argv,
-                system_prompt or "(empty)",
-                user_prompt,
+                timeout_seconds=self._timeout_seconds,
+                stdin_input=user_prompt.encode("utf-8"),
+                drop_env=_ROUTING_ENV,
             )
-
-        result = await run_cli(
-            argv,
-            timeout_seconds=self._timeout_seconds,
-            stdin_input=user_prompt.encode("utf-8"),
-            drop_env=_ROUTING_ENV,
-        )
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
@@ -357,10 +393,6 @@ class ClaudeCodeCliEngine:
         system_prompt = "\n\n".join(text_content(m.content) for m in system_messages).strip()
         user_prompt = messages_to_prompt(other_messages)
 
-        argv = self._build_argv(system_prompt=system_prompt, stream=True)
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("claude_code_cli → (stream) argv:\n%s", argv)
-
         started = time.perf_counter()
         emitted: list[str] = []
         thoughts: list[str] = []
@@ -368,12 +400,7 @@ class ClaudeCodeCliEngine:
         report = bool(request.reportProgress)
         show_reasoning = self._thinking_mode != "off"
 
-        async for line in stream_cli_lines(
-            argv,
-            timeout_seconds=self._timeout_seconds,
-            stdin_input=user_prompt.encode("utf-8"),
-            drop_env=_ROUTING_ENV,
-        ):
+        async for line in self._stream_lines(system_prompt, user_prompt):
             if not line:
                 continue
             try:
@@ -466,6 +493,24 @@ class ClaudeCodeCliEngine:
             ),
         )
 
+    async def _stream_lines(self, system_prompt: str, user_prompt: str) -> AsyncIterator[str]:
+        """The CLI's stdout lines, with the system prompt's file alive for
+        exactly as long as the child: closed explicitly, so a stream that
+        ends early kills the child first and removes the file after."""
+        with _system_prompt_file(system_prompt) as prompt_file:
+            argv = self._build_argv(system_prompt_file=prompt_file, stream=True)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("claude_code_cli → (stream) argv:\n%s", argv)
+            lines = stream_cli_lines(
+                argv,
+                timeout_seconds=self._timeout_seconds,
+                stdin_input=user_prompt.encode("utf-8"),
+                drop_env=_ROUTING_ENV,
+            )
+            async with contextlib.aclosing(lines):
+                async for line in lines:
+                    yield line
+
     async def embed(self, inputs: list[str]) -> EmbedResponse:
         """Refused. A CLI subscription exposes no embeddings surface at
         all -- there is no flag that makes the harness on the other side
@@ -495,7 +540,7 @@ class ClaudeCodeCliEngine:
         # models support tunable temperature.
         return list(_KNOWN_CLAUDE_MODELS)
 
-    def _build_argv(self, *, system_prompt: str, stream: bool = False) -> list[str]:
+    def _build_argv(self, *, system_prompt_file: str | None, stream: bool = False) -> list[str]:
         argv = [
             self._binary_path,
             "--print",
@@ -508,8 +553,10 @@ class ClaudeCodeCliEngine:
             # under --print without it. `--include-partial-messages` is
             # what turns whole-message events into text deltas.
             argv += ["--include-partial-messages", "--verbose"]
-        if system_prompt:
-            argv += ["--system-prompt", system_prompt]
+        if system_prompt_file:
+            # Replaces Claude Code's own system prompt, as `--system-prompt`
+            # did; read from a file since 2026-10-03.
+            argv += ["--system-prompt-file", system_prompt_file]
         if self._upstream_model_id:
             argv += ["--model", self._upstream_model_id]
         # No positional prompt; user prompt is piped via stdin.

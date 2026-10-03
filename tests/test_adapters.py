@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -212,20 +213,24 @@ async def test_claude_adapter_passes_system_prompt_when_system_messages_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Persona / cwd-leak fix: when the request includes system messages,
-    we send them as `--system-prompt`. Per Claude Code's docs, that flag
+    we send them as the system prompt. Per Claude Code's docs, that flag
     *replaces* the default system prompt, which transitively disables the
     automatic cwd-injection that was leaking hemisphere identity in the
-    smoke test.
+    smoke test. Since 2026-10-03 it is `--system-prompt-file`, read here
+    while the call is running, because the file is gone after it.
     """
-    captured = _patch_run_cli(
-        monkeypatch,
-        lambda argv: CliResult(
+    seen: dict[str, str] = {}
+
+    def answer(argv: list[str]) -> CliResult:
+        seen["text"] = Path(argv[argv.index("--system-prompt-file") + 1]).read_text("utf-8")
+        return CliResult(
             stdout=json.dumps(CLAUDE_OK_ENVELOPE).encode(),
             stderr=b"",
             returncode=0,
             elapsed_ms=1000,
-        ),
-    )
+        )
+
+    captured = _patch_run_cli(monkeypatch, answer)
     adapter = ClaudeCodeCliEngine()
     await adapter.generate(
         GenerateRequest(
@@ -236,9 +241,8 @@ async def test_claude_adapter_passes_system_prompt_when_system_messages_exist(
         )
     )
     argv = captured["argv"]
-    assert "--system-prompt" in argv
-    idx = argv.index("--system-prompt")
-    assert argv[idx + 1] == "You are Eugene."
+    assert "--system-prompt" not in argv
+    assert seen["text"] == "You are Eugene."
 
 
 async def test_claude_adapter_omits_system_prompt_when_no_system_messages(
@@ -260,6 +264,7 @@ async def test_claude_adapter_omits_system_prompt_when_no_system_messages(
     adapter = ClaudeCodeCliEngine()
     await adapter.generate(_request())  # user-only message
     assert "--system-prompt" not in captured["argv"]
+    assert "--system-prompt-file" not in captured["argv"]
 
 
 async def test_claude_adapter_preserves_utf8_em_dash(

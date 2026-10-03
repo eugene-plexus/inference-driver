@@ -24,6 +24,7 @@ names and system-prompt file back as the answer.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -95,6 +96,10 @@ async def _report(engine: Any, request: GenerateRequest, *, stream: bool) -> dic
             final = chunk.result
     assert final is not None
     return json.loads(final.content)
+
+
+def _absent(path: str | Path) -> bool:
+    return not os.path.exists(path)
 
 
 def _after(argv: list[str], flag: str) -> str:
@@ -214,3 +219,110 @@ async def test_codex_never_sees_a_route_back_into_eugene(
     assert "EUGENE_API_KEY" not in names
     assert "OPENAI_BASE_URL" not in names
     assert {"CODEX_API_KEY", "OPENAI_API_KEY"} <= names
+
+
+# --------------------------------------------------------------------------- #
+# Client text never travels on a command line
+# --------------------------------------------------------------------------- #
+#
+# On Windows npm installs both CLIs as `.cmd` shims, so their argv passes
+# through cmd.exe. A newline there ends the command, the line stops at
+# 8191 characters, and a `"` in the text closes cmd.exe's quoting -- after
+# which `&` starts a command of the client's choosing on the driver host.
+# The system prompt (Claude) and the whole transcript (Codex) were argv.
+
+ON_WINDOWS = pytest.mark.skipif(os.name != "nt", reason="cmd.exe parses a .cmd shim's argv")
+
+
+def _escape(marker: Path) -> str:
+    """Text that runs `echo` into `marker` if cmd.exe ever parses it."""
+    assert " " not in str(marker), "the payload needs a path with no spaces"
+    return f'x" & echo pwned> {marker} & rem "'
+
+
+@ON_WINDOWS
+@pytest.mark.parametrize("stream", [False, True])
+async def test_a_system_message_cannot_run_a_command_through_claudes_shim(
+    tmp_path: Path, stream: bool
+) -> None:
+    marker = tmp_path / "pwned.txt"
+    engine = ClaudeCodeCliEngine(binary_path=_fake(tmp_path, "claude"), timeout_seconds=30)
+    request = _request((Role.system, _escape(marker)), (Role.user, "hi"))
+    with contextlib.suppress(Exception):  # the old argv also mangled the call itself
+        await _report(engine, request, stream=stream)
+    assert _absent(marker), "a client's system message ran a command on the host"
+
+
+@ON_WINDOWS
+@pytest.mark.parametrize("stream", [False, True])
+async def test_a_user_message_cannot_run_a_command_through_codexs_shim(
+    tmp_path: Path, stream: bool
+) -> None:
+    marker = tmp_path / "pwned.txt"
+    engine = CodexCliEngine(binary_path=_fake(tmp_path, "codex"), timeout_seconds=30)
+    with contextlib.suppress(Exception):
+        await _report(engine, _request((Role.user, _escape(marker))), stream=stream)
+    assert _absent(marker), "a client's message ran a command on the driver host"
+
+
+# > 8191 chars; no outer whitespace, which the engine has always stripped.
+SYSTEM = "You are Eugene.\n\nSecond paragraph.\n" + "Long line. " * 1200 + "End."
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_claudes_system_prompt_arrives_whole_from_a_private_file(
+    tmp_path: Path, stream: bool
+) -> None:
+    engine = ClaudeCodeCliEngine(binary_path=_fake(tmp_path, "claude"), timeout_seconds=30)
+    report = await _report(
+        engine, _request((Role.system, SYSTEM), (Role.user, "hi")), stream=stream
+    )
+    assert report["system_prompt"] == SYSTEM
+    assert "--system-prompt" not in report["argv"]
+    assert all("Second paragraph" not in a for a in report["argv"])
+    # Written for this one call and gone after it.
+    assert _absent(report["system_prompt_path"])
+
+
+async def test_no_system_message_means_no_system_prompt_file(tmp_path: Path) -> None:
+    """Claude Code's own system prompt applies then, as it always did."""
+    engine = ClaudeCodeCliEngine(binary_path=_fake(tmp_path, "claude"), timeout_seconds=30)
+    report = await _report(engine, _request((Role.user, "hi")), stream=False)
+    assert "--system-prompt-file" not in report["argv"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+async def test_the_system_prompt_file_is_readable_by_this_account_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_inference_driver.engines import claude_code_cli
+
+    seen: dict[str, int] = {}
+    real = claude_code_cli.run_cli
+
+    async def spy(argv: list[str], **kwargs: Any) -> Any:
+        path = argv[argv.index("--system-prompt-file") + 1]
+        seen["mode"] = stat.S_IMODE(os.stat(path).st_mode)
+        return await real(argv, **kwargs)
+
+    monkeypatch.setattr(claude_code_cli, "run_cli", spy)
+    engine = ClaudeCodeCliEngine(binary_path=_fake(tmp_path, "claude"), timeout_seconds=30)
+    await _report(
+        engine, _request((Role.system, "secret persona"), (Role.user, "hi")), stream=False
+    )
+    assert seen["mode"] == 0o600
+
+
+TRANSCRIPT_LINE = "Follow-up\nwith\nnewlines " + "and length " * 900  # > 8191 chars
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_codex_reads_the_whole_transcript_from_stdin(tmp_path: Path, stream: bool) -> None:
+    engine = CodexCliEngine(binary_path=_fake(tmp_path, "codex"), timeout_seconds=30)
+    request = _request((Role.system, "Be brief."), (Role.user, TRANSCRIPT_LINE))
+    report = await _report(engine, request, stream=stream)
+    # `-` is Codex's "the prompt is on stdin" (0.130 and 0.160 alike).
+    assert report["argv"][-1] == "-"
+    assert all("Follow-up" not in a for a in report["argv"])
+    assert "[SYSTEM] Be brief." in report["stdin"]
+    assert TRANSCRIPT_LINE in report["stdin"]

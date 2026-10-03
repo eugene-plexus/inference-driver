@@ -11,7 +11,7 @@ import contextlib
 import os
 import shutil
 import time
-from collections.abc import AsyncIterator, Collection
+from collections.abc import AsyncGenerator, Collection
 from dataclasses import dataclass
 
 # Forced-UTF-8 environment for child processes. The smoke test on
@@ -136,7 +136,7 @@ async def stream_cli_lines(
     timeout_seconds: float,
     stdin_input: bytes | None = None,
     drop_env: Collection[str] = (),
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str, None]:
     """Run argv and yield its stdout a line at a time, as it arrives.
 
     The streaming counterpart to `run_cli`, which buffers to completion

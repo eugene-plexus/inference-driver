@@ -205,7 +205,7 @@ class CodexCliEngine:
         # surface as Codex backends from time to time.
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         flattened_prompt = messages_to_prompt(messages)
-        argv = self._build_argv(flattened_prompt)
+        argv = self._build_argv()
 
         # DEBUG-level full-payload trace. CLI adapters flatten the
         # gateway's structured message list into a single labeled
@@ -214,12 +214,17 @@ class CodexCliEngine:
         # reaches the model.
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
-                "codex_cli → argv:\n%s\n--- flattened prompt ---\n%s",
+                "codex_cli → argv:\n%s\n--- flattened prompt (stdin) ---\n%s",
                 argv,
                 flattened_prompt,
             )
 
-        result = await run_cli(argv, timeout_seconds=self._timeout_seconds, drop_env=_ROUTING_ENV)
+        result = await run_cli(
+            argv,
+            timeout_seconds=self._timeout_seconds,
+            stdin_input=flattened_prompt.encode("utf-8"),
+            drop_env=_ROUTING_ENV,
+        )
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
@@ -323,7 +328,7 @@ class CodexCliEngine:
 
         messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
         flattened_prompt = messages_to_prompt(messages)
-        argv = self._build_argv(flattened_prompt)
+        argv = self._build_argv()
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug("codex_cli → (stream) argv:\n%s", argv)
@@ -337,7 +342,12 @@ class CodexCliEngine:
         report = bool(request.reportProgress)
         show_reasoning = self._thinking_mode != "off"
 
-        lines = stream_cli_lines(argv, timeout_seconds=self._timeout_seconds, drop_env=_ROUTING_ENV)
+        lines = stream_cli_lines(
+            argv,
+            timeout_seconds=self._timeout_seconds,
+            stdin_input=flattened_prompt.encode("utf-8"),
+            drop_env=_ROUTING_ENV,
+        )
         try:
             async for raw_line in lines:
                 line = raw_line.strip()
@@ -441,7 +451,7 @@ class CodexCliEngine:
         # actual model selection is driven by Codex's own config.
         return list(_KNOWN_CODEX_MODELS)
 
-    def _build_argv(self, prompt: str) -> list[str]:
+    def _build_argv(self) -> list[str]:
         argv = [
             self._binary_path,
             "exec",
@@ -454,7 +464,14 @@ class CodexCliEngine:
         ]
         if self._upstream_model_id:
             argv += ["--model", self._upstream_model_id]
-        argv.append(prompt)
+        # `-`: the transcript is read from stdin, never the command line.
+        # npm installs `codex` on Windows as a `.cmd` shim, so argv passes
+        # through cmd.exe, where a newline ends the command, the line stops
+        # at 8191 characters, and a `"` in a client's message closes the
+        # quoting so that `&` runs a command on the driver host (measured
+        # 2026-10-03 with a shim like npm's). `codex exec -` reads stdin in
+        # 0.130 and 0.160 alike.
+        argv.append("-")
         return argv
 
 
