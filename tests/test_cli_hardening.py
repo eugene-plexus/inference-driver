@@ -206,6 +206,35 @@ async def test_codex_config_cannot_choose_eugene_or_a_reviewer(
 
 
 @pytest.mark.parametrize("stream", [False, True])
+async def test_codex_runs_no_shell_and_no_other_tool(tmp_path: Path, stream: bool) -> None:
+    """The read-only sandbox still lets a shell READ the driver host.
+
+    Codex's `read-only` sandbox blocks writes, not reads: a shell command
+    that prints a file returns it to the caller, and any client key can
+    ask. A text backend has no use for a tool, so every one Codex would
+    offer is switched off by name. Each name is a feature of 0.130
+    (`codex features list` honoured the override, checked 2026-10-03
+    without a prompt) and of 0.160 (`codex-rs/features/src/lib.rs`).
+    """
+    engine = CodexCliEngine(binary_path=_fake(tmp_path, "codex"), timeout_seconds=30)
+    argv = (await _report(engine, _request(), stream=stream))["argv"]
+    overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+    for feature in (
+        "shell_tool",
+        "unified_exec",
+        "apps",
+        "plugins",
+        "browser_use",
+        "browser_use_external",
+        "in_app_browser",
+        "computer_use",
+        "image_generation",
+        "multi_agent",
+    ):
+        assert f"features.{feature}=false" in overrides, feature
+
+
+@pytest.mark.parametrize("stream", [False, True])
 async def test_codex_never_sees_a_route_back_into_eugene(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool
 ) -> None:

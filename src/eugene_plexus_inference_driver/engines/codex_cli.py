@@ -107,9 +107,29 @@ _KNOWN_CODEX_MODELS: list[str] = [
 #:   (`exec/src/lib.rs` `build_exec_config` at rust-v0.160.0), under which
 #:   a classifier could approve a command outside the read-only sandbox.
 #:
+#: * `features.<tool>=false` for every tool Codex would offer -- **the
+#:   read-only sandbox blocks writes, not reads**: a shell command that
+#:   prints a file returns it to the caller, and any client key can ask.
+#:   A text backend has no use for a tool. Each name is a feature of 0.130
+#:   (`codex features list` showed the override take, 2026-10-03, without
+#:   a prompt) and of 0.160 (`codex-rs/features/src/lib.rs`).
+#:
 #: The rest of the file stays in force on purpose: it also says where the
 #: subscription's credentials live (`cli_auth_credentials_store`), so
-#: `--ignore-user-config` would log a keyring user out.
+#: `--ignore-user-config` would log a keyring user out. MCP servers the
+#: operator configured there still load; they are the operator's choice.
+_DISABLED_FEATURES: tuple[str, ...] = (
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "plugins",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "multi_agent",
+)
 _PINNED_CONFIG: tuple[str, ...] = (
     "-c",
     "model_provider=openai",
@@ -117,6 +137,7 @@ _PINNED_CONFIG: tuple[str, ...] = (
     "approval_policy=never",
     "-c",
     "approvals_reviewer=user",
+    *(arg for feature in _DISABLED_FEATURES for arg in ("-c", f"features.{feature}=false")),
 )
 
 #: Environment the Codex child must not see. `OPENAI_BASE_URL` addressed
