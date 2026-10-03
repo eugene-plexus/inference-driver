@@ -206,6 +206,20 @@ def test_each_setting_reaches_the_backend_in_openais_names(tmp_path: Path) -> No
     assert sent["provider"] == {"require_parameters": True}
 
 
+@respx.mock
+def test_reasoning_effort_max_reaches_the_backend(tmp_path: Path) -> None:
+    """`max` joined `ReasoningEffort` on 2026-10-03 (specs 8c41b85): GPT-6
+    and OpenRouter take it, and before the pin a caller sending it was a 422
+    here -- the value never reached a backend that would have honoured it."""
+    client, upstream = _serve(_account(tmp_path), httpx.Response(200, json=_completion()))
+    with client:
+        _ready(client)
+        response = client.post("/v1/generate", json=ask("acme/everything", reasoningEffort="max"))
+    assert response.status_code == 200, response.text
+    sent = json.loads(upstream.calls[0].request.content)
+    assert sent["reasoning_effort"] == "max"
+
+
 @pytest.mark.parametrize(
     ("setting", "wire"),
     [
