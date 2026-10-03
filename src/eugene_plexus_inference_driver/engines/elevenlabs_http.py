@@ -98,6 +98,22 @@ def _named_models(response: httpx.Response) -> list[str]:
     return _QUOTED.findall(match.group(1)) if match else []
 
 
+_SCRIBE_VERSION = re.compile(r"scribe_v(\d+)\Z")
+
+
+def _probe_model(ids: list[str]) -> str:
+    """The model the permission probe asks for: the newest `scribe_vN`.
+
+    ElevenLabs names its models oldest first, and the first was what the
+    probe used: `scribe_v1`, deprecated by 2026-10-03 (drift audit). A probe
+    must not depend on a model on its way out. Only the plain batch names
+    count (`scribe_v2_realtime` is not a batch model); a list with none of
+    them falls back to the last id named.
+    """
+    versions = [(int(m.group(1)), i) for i in ids if (m := _SCRIBE_VERSION.match(i))]
+    return max(versions)[1] if versions else ids[-1]
+
+
 def _refused_as_empty(response: httpx.Response) -> bool:
     """Whether ElevenLabs refused a probe for its empty file, which it does
     only after the key's permission passed (measured)."""
@@ -326,7 +342,7 @@ class ElevenLabsHttpEngine:
             allowed = await client.post(
                 "/v1/speech-to-text",
                 headers=headers,
-                data={"model_id": ids[0]},
+                data={"model_id": _probe_model(ids)},
                 files={"file": ("empty.mp3", b"", "audio/mpeg")},
                 timeout=_LIST_TIMEOUT,
             )

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import respx
 from fastapi.testclient import TestClient
 
@@ -178,8 +179,25 @@ def test_a_key_that_may_transcribe_lists_the_models_elevenlabs_names(tmp_path: P
     # for a model ElevenLabs named.
     assert _form(listing) == {"model_id": "eugene-plexus-lists-models"}
     assert b"filename=" not in _fields(listing)
-    assert _form(permission)["model_id"] == "scribe_v1"
+    # The newest it named: `scribe_v1` is deprecated (drift audit,
+    # 2026-10-03), and a probe should not depend on a model on its way out.
+    assert _form(permission)["model_id"] == "scribe_v2"
     assert permission.headers["xi-api-key"] == "sk-test"
+
+
+@pytest.mark.parametrize(
+    ("named", "probed"),
+    [
+        (["scribe_v1", "scribe_v2"], "scribe_v2"),
+        (["scribe_v2", "scribe_v1"], "scribe_v2"),
+        (["scribe_v1", "scribe_v2", "scribe_v2_realtime", "scribe_v10"], "scribe_v10"),
+        (["scribe_experimental"], "scribe_experimental"),
+    ],
+)
+def test_the_permission_probe_uses_the_newest_batch_model(named: list[str], probed: str) -> None:
+    from eugene_plexus_inference_driver.engines.elevenlabs_http import _probe_model
+
+    assert _probe_model(named) == probed
 
 
 @respx.mock
