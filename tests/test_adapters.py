@@ -371,8 +371,15 @@ async def test_codex_adapter_parses_jsonl_stream(
     assert response.modelId == "gpt-5"
     assert response.latencyMs == 1500
     assert response.usage is not None
-    assert response.usage.promptTokens == 26820 + 6528
-    assert response.usage.completionTokens == 21 + 14
+    # Codex's `input_tokens` already contains the cached ones, and its
+    # `output_tokens` the reasoning ones (TokenUsage::non_cached_input and
+    # the Responses SSE parser at rust-v0.160.0). Adding them counted both
+    # twice until 2026-10-03; they are the details now.
+    assert response.usage.promptTokens == 26820
+    assert response.usage.cachedPromptTokens == 6528
+    assert response.usage.completionTokens == 21
+    assert response.usage.reasoningTokens == 14
+    assert response.usage.totalTokens == 26820 + 21
 
     argv = captured["argv"]
     assert argv[0] == "codex"

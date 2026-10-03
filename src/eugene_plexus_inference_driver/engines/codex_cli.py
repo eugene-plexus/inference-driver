@@ -533,14 +533,30 @@ def _failure_in(lines: list[str]) -> str | None:
 
 
 def _usage_from_codex(usage: dict[str, Any] | None) -> Usage | None:
+    """Codex's `turn.completed` usage in ours.
+
+    **Its totals already contain their parts** (rust-v0.160.0:
+    `TokenUsage::non_cached_input` is `input_tokens - cached_input_tokens`,
+    and the Responses parser copies `output_tokens` whole and takes
+    `reasoning_output_tokens` from its details). Until 2026-10-03 the parts
+    were added on top, so a turn with a warm cache reported its cached
+    prompt twice. The parts are reported as the details they are.
+    """
     if not usage:
         return None
-    prompt = (usage.get("input_tokens") or 0) + (usage.get("cached_input_tokens") or 0)
-    completion = (usage.get("output_tokens") or 0) + (usage.get("reasoning_output_tokens") or 0)
+
+    def count(key: str) -> int | None:
+        value = usage.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    prompt = count("input_tokens") or 0
+    completion = count("output_tokens") or 0
     if prompt == 0 and completion == 0:
         return None
     return Usage(
         promptTokens=prompt,
         completionTokens=completion,
         totalTokens=prompt + completion,
+        cachedPromptTokens=count("cached_input_tokens"),
+        reasoningTokens=count("reasoning_output_tokens"),
     )
