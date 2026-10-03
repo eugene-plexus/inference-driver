@@ -121,7 +121,10 @@ def test_an_accounts_transcription_model_is_asked_in_openais_multipart_form(tmp_
     )
     with client:
         info = _ready(client)
-        response = client.post("/v1/transcribe", json=ask(language="en", prompt="Foxes."))
+        response = client.post("/v1/transcribe", json=ask(language="en"))
+        # OpenRouter's transcription request has no `prompt` (its API
+        # reference, 2026-10-03): refused before any audio is sent.
+        refused = client.post("/v1/transcribe", json=ask(language="en", prompt="Foxes."))
     surfaces = {m["id"]: m["surfaces"] for m in info["models"]}
     assert surfaces[WHISPER] == ["transcription"]
     assert response.status_code == 200, response.text
@@ -129,7 +132,10 @@ def test_an_accounts_transcription_model_is_asked_in_openais_multipart_form(tmp_
     assert body["text"] == " The quick brown fox." and _set(body["usage"]) == {"seconds": 3.5}
     sent = _fields(upstream.calls[0].request)
     assert b'name="model"\r\n\r\nopenai/whisper-large-v3-turbo\r\n' in sent
-    assert b'name="language"\r\n\r\nen\r\n' in sent and b'name="prompt"\r\n\r\nFoxes.\r\n' in sent
+    assert b'name="language"\r\n\r\nen\r\n' in sent and b'name="prompt"' not in sent
+    assert refused.status_code == 400, refused.text
+    assert "prompt" in refused.json()["detail"]["detail"]
+    assert len(upstream.calls) == 1
     assert b'filename="fox.mp3"' in sent and FOX in sent
     # `json` is every backend's default, and llama-server refuses the rest.
     assert b'name="response_format"' not in sent

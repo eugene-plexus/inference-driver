@@ -176,6 +176,11 @@ def from_openrouter(body: Any) -> list[DriverModel]:
     for entry in data:
         if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
             continue
+        # OpenRouter's own retirement date, read as OpenAI's
+        # `shutdown_date` is (2026-10-03: 35 listed models carried one, and
+        # it was ignored, so a retired model stayed routed with no warning).
+        if shut_down(entry, key="expiration_date"):
+            continue
         raw_arch = entry.get("architecture")
         arch: dict[str, Any] = raw_arch if isinstance(raw_arch, dict) else {}
         inputs = [m for m in (arch.get("input_modalities") or []) if isinstance(m, str)]
@@ -277,14 +282,18 @@ def with_openrouter_videos(models: list[DriverModel], body: Any) -> list[DriverM
     return models
 
 
-def shut_down(entry: dict[str, Any], today: _dt.date | None = None) -> bool:
-    """Whether OpenAI's list says this model's `shutdown_date` has passed.
+def shut_down(
+    entry: dict[str, Any], today: _dt.date | None = None, *, key: str = "shutdown_date"
+) -> bool:
+    """Whether a listing says this model's retirement date has passed.
 
-    OpenAI's `/v1/models` carries the date (56 of 134 on the account Troy
-    added, measured 2026-09-28), and a model past it serves nothing: `sora-2`
-    said 2026-09-24 and `/v1/videos` answered an empty 404.
+    OpenAI's `/v1/models` carries `shutdown_date` (56 of 134 on the account
+    Troy added, measured 2026-09-28), and a model past it serves nothing:
+    `sora-2` said 2026-09-24 and `/v1/videos` answered an empty 404.
+    OpenRouter's listing says the same as `expiration_date` (`key`), and the
+    same rule applies: served through the day, not after it.
     """
-    raw = entry.get("shutdown_date")
+    raw = entry.get(key)
     if not isinstance(raw, str):
         return False
     try:

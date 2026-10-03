@@ -111,7 +111,7 @@ from ..speech import (
     refuse_format,
     streaming_wav_header,
 )
-from ..transcription import response_from
+from ..transcription import TranscriptionRefusal, response_from
 from ..videos_out import VideoRefusal
 from ..videos_out import job_from as video_job_from
 from ._catalogue import (
@@ -337,16 +337,19 @@ _FINISH_REASON_MAP = {
 }
 
 
-def _max_tokens_field_for(base_url: str) -> str:
-    """Pick the right output-cap field name for this base URL.
+def _max_tokens_field_for(base_url: str, catalogue_source: str = "openai") -> str:
+    """Pick the right output-cap field name for this backend.
 
     OpenAI's chat-completions API now requires `max_completion_tokens`
-    for newer models and explicitly rejects `max_tokens`. Self-hosted
-    OpenAI-compatible servers (Ollama, vLLM, LM Studio, llama.cpp)
-    still implement the older spec and only understand `max_tokens`.
-    Pick by base URL: openai.com → new field; anything else → legacy.
+    for newer models and explicitly rejects `max_tokens`. OpenRouter
+    documents `max_tokens` as "deprecated, use max_completion_tokens"
+    (2026-10-03). Self-hosted OpenAI-compatible servers (Ollama, vLLM,
+    LM Studio, llama.cpp) still implement the older spec and only
+    understand `max_tokens`.
     """
-    return "max_completion_tokens" if _is_openai_endpoint(base_url) else "max_tokens"
+    if _is_openai_endpoint(base_url) or catalogue_source == "openrouter":
+        return "max_completion_tokens"
+    return "max_tokens"
 
 
 def _is_openai_endpoint(base_url: str) -> bool:
@@ -1282,7 +1285,8 @@ class OpenAiCompatibleHttpEngine:
             ),
         }
         if request.maxTokens is not None:
-            payload[_max_tokens_field_for(self._base_url)] = request.maxTokens
+            cap = _max_tokens_field_for(self._base_url, self._catalogue_source)
+            payload[cap] = request.maxTokens
         if request.temperature is not None and not target.temperature_fixed:
             payload["temperature"] = float(request.temperature)
         # **Carried since 2026-09-19.** `GenerateRequest` had no field
@@ -2126,6 +2130,14 @@ class OpenAiCompatibleHttpEngine:
         formats = self.speech_formats(target)
         asked = request.format or SpeechFormat.mp3
         refuse_format(asked, formats)
+        if request.instructions and self._catalogue_source == "openrouter":
+            # Not in OpenRouter's speech request (its API reference,
+            # 2026-10-03), so it would be dropped: refused, as ElevenLabs
+            # refuses it.
+            raise SpeechRefusal(
+                "instructions: OpenRouter's speech API takes no speaking instructions, so "
+                "they would be dropped; remove them, or choose a model that takes them"
+            )
         made_here = asked is SpeechFormat.wav and self._catalogue_source == "openrouter"
         payload: dict[str, Any] = {
             "model": target.upstream,
@@ -2186,6 +2198,13 @@ class OpenAiCompatibleHttpEngine:
         """
         started = time.perf_counter()
         target = self.resolve_model(request.model)
+        if request.prompt and self._catalogue_source == "openrouter":
+            # Not in OpenRouter's transcription request (JSON or multipart,
+            # its API reference, 2026-10-03), so it would be ignored.
+            raise TranscriptionRefusal(
+                "prompt: OpenRouter's transcription API takes no prompt and would ignore "
+                "one; remove it, or choose a model that takes one"
+            )
         fields: dict[str, Any] = {"model": target.upstream}
         if request.verbose:
             fields["response_format"] = "verbose_json"
@@ -2597,6 +2616,11 @@ class OpenAiCompatibleHttpEngine:
                 ]
             if dall_e:
                 payload["response_format"] = "b64_json"
+            # OpenRouter documents `POST /api/v1/images` with this same body
+            # (2026-10-03); `/images/generations` still answers there, but it
+            # is no longer the route it describes. OpenAI keeps its own.
+            if self._catalogue_source == "openrouter":
+                return "/v1/images", {"json": payload}
             return "/v1/images/generations", {"json": payload}
         fields: dict[str, Any] = {"model": target.upstream, "prompt": request.prompt}
         for key, value in chosen.items():

@@ -126,8 +126,11 @@ def test_speech_is_asked_for_in_openais_shape_and_streamed_back(tmp_path: Path) 
     client, upstream = _openrouter(tmp_path, _audio(MP3))
     with client:
         _ready(client)
-        response = client.post(
-            "/v1/speak", json=speak("hexgrad/kokoro-82m", speed=1.1, instructions="cheerful")
+        response = client.post("/v1/speak", json=speak("hexgrad/kokoro-82m", speed=1.1))
+        # OpenRouter's speech request has no `instructions` (its API
+        # reference, 2026-10-03): refused before any network, not dropped.
+        refused = client.post(
+            "/v1/speak", json=speak("hexgrad/kokoro-82m", instructions="cheerful")
         )
     assert response.status_code == 200, response.text
     assert response.headers["content-type"] == "audio/mpeg" and response.content == MP3
@@ -138,8 +141,10 @@ def test_speech_is_asked_for_in_openais_shape_and_streamed_back(tmp_path: Path) 
         "voice": "af_heart",
         "response_format": "mp3",
         "speed": 1.1,
-        "instructions": "cheerful",
     }
+    assert refused.status_code == 400, refused.text
+    assert "instructions" in refused.json()["detail"]["detail"]
+    assert len(upstream.calls) == 1
 
 
 @respx.mock

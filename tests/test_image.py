@@ -2,7 +2,8 @@
 
 Measured 2026-09-28 (`provider-accounts-measurement.md` section 9): OpenRouter
 has no edit route, takes reference images as `input_references` OBJECTS on
-`/images/generations`, lists image settings only on `/images/models`, ignores
+`/images/generations` (documented as `/images` since; asked there from
+2026-10-03), lists image settings only on `/images/models`, ignores
 `mask`, answers `created: 0` from some providers, streams bare `data:` frames
 with `: ` keepalives, and answers plain JSON to a model that cannot stream.
 OpenAI's SDK sends an edit as multipart with `image[]` for several images.
@@ -220,7 +221,7 @@ def test_an_openai_accounts_image_models_are_carried_as_its_api_checks(tmp_path:
 
 @respx.mock
 def test_a_generation_through_openrouter_is_answered_in_our_shape(tmp_path: Path) -> None:
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(JPEG))
     )
     with _openrouter(tmp_path) as client:
@@ -250,9 +251,7 @@ def test_a_generation_through_openrouter_is_answered_in_our_shape(tmp_path: Path
 
 @respx.mock
 def test_the_answer_is_labelled_by_its_bytes_not_by_what_was_asked(tmp_path: Path) -> None:
-    respx.post(f"{OPENROUTER}/v1/images/generations").mock(
-        return_value=httpx.Response(200, json=_answer(PNG))
-    )
+    respx.post(f"{OPENROUTER}/v1/images").mock(return_value=httpx.Response(200, json=_answer(PNG)))
     with _openrouter(tmp_path) as client:
         _ready(client)
         body = client.post("/v1/image", json=_ask(MINI, outputFormat="webp")).json()
@@ -261,7 +260,7 @@ def test_the_answer_is_labelled_by_its_bytes_not_by_what_was_asked(tmp_path: Pat
 
 @respx.mock
 def test_an_edit_through_openrouter_sends_input_references_as_objects(tmp_path: Path) -> None:
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(JPEG))
     )
     with _openrouter(tmp_path) as client:
@@ -280,7 +279,7 @@ def test_an_edit_through_openrouter_sends_input_references_as_objects(tmp_path: 
 
 @respx.mock
 def test_a_mask_is_refused_for_a_backend_that_would_ignore_it(tmp_path: Path) -> None:
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(JPEG))
     )
     with _openrouter(tmp_path) as client:
@@ -350,7 +349,7 @@ def test_dall_e_on_openais_api_is_asked_for_base64(tmp_path: Path) -> None:
 
 @respx.mock
 def test_an_upload_that_is_not_an_image_is_refused_unsent(tmp_path: Path) -> None:
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(JPEG))
     )
     with _openrouter(tmp_path) as client:
@@ -368,7 +367,7 @@ def test_uploads_over_25_mib_in_all_are_413(
     from eugene_plexus_inference_driver.routes import image as image_route
 
     monkeypatch.setattr(image_route, "MAX_UPLOAD_BYTES", len(PNG) * 2 - 1)
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(JPEG))
     )
     with _openrouter(tmp_path) as client:
@@ -390,7 +389,7 @@ def test_a_model_that_makes_no_images_is_refused(tmp_path: Path) -> None:
 @respx.mock
 def test_a_providers_refusal_is_relayed_as_a_400_with_its_words(tmp_path: Path) -> None:
     words = "Black Forest Labs refused this prompt for graphic violence"
-    respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(400, json={"error": {"message": words, "code": 400}})
     )
     with _openrouter(tmp_path) as client:
@@ -403,7 +402,7 @@ def test_a_providers_refusal_is_relayed_as_a_400_with_its_words(tmp_path: Path) 
 
 @respx.mock
 def test_an_answer_that_is_not_an_image_is_a_backend_error(tmp_path: Path) -> None:
-    respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(b"<html>oops</html>"))
     )
     with _openrouter(tmp_path) as client:
@@ -443,7 +442,7 @@ def test_openrouters_bare_stream_becomes_partial_then_done(tmp_path: Path) -> No
         "media_type": "image/png",
         "usage": {"prompt_tokens": 9, "completion_tokens": 372, "total_tokens": 381, "cost": 0.003},
     }
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -509,7 +508,7 @@ def test_openais_named_event_stream_is_read_the_same_way(tmp_path: Path) -> None
 
 @respx.mock
 def test_a_model_that_does_not_stream_is_refused_before_anything_is_sent(tmp_path: Path) -> None:
-    route = respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    route = respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(200, json=_answer(JPEG))
     )
     with _openrouter(tmp_path) as client:
@@ -524,9 +523,7 @@ def test_a_model_that_does_not_stream_is_refused_before_anything_is_sent(tmp_pat
 def test_json_where_a_stream_was_asked_for_is_refused_not_passed_off(tmp_path: Path) -> None:
     """OpenRouter answers plain JSON to a model that cannot stream (measured).
     Here the listing said it streams and the backend disagreed."""
-    respx.post(f"{OPENROUTER}/v1/images/generations").mock(
-        return_value=httpx.Response(200, json=_answer(PNG))
-    )
+    respx.post(f"{OPENROUTER}/v1/images").mock(return_value=httpx.Response(200, json=_answer(PNG)))
     with _openrouter(tmp_path) as client:
         _ready(client)
         response = client.post("/v1/image/stream", json=_ask(MINI))
@@ -536,7 +533,7 @@ def test_json_where_a_stream_was_asked_for_is_refused_not_passed_off(tmp_path: P
 
 @respx.mock
 def test_an_error_event_before_any_image_is_a_status_code(tmp_path: Path) -> None:
-    respx.post(f"{OPENROUTER}/v1/images/generations").mock(
+    respx.post(f"{OPENROUTER}/v1/images").mock(
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
