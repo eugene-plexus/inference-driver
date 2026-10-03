@@ -114,6 +114,7 @@ from ..speech import (
 from ..transcription import TranscriptionRefusal, response_from
 from ..videos_out import VideoRefusal
 from ..videos_out import job_from as video_job_from
+from . import dialects
 from ._catalogue import (
     _LIST_TIMEOUT,
     _SHOW_CONCURRENCY,
@@ -338,30 +339,11 @@ _FINISH_REASON_MAP = {
 
 
 def _max_tokens_field_for(base_url: str, catalogue_source: str = "openai") -> str:
-    """Pick the right output-cap field name for this backend.
-
-    OpenAI's chat-completions API now requires `max_completion_tokens`
-    for newer models and explicitly rejects `max_tokens`. OpenRouter
-    documents `max_tokens` as "deprecated, use max_completion_tokens"
-    (2026-10-03). Self-hosted OpenAI-compatible servers (Ollama, vLLM,
-    LM Studio, llama.cpp) still implement the older spec and only
-    understand `max_tokens`.
-    """
-    if _is_openai_endpoint(base_url) or catalogue_source == "openrouter":
-        return "max_completion_tokens"
-    return "max_tokens"
+    return dialects.select(None, base_url=base_url, catalogue=catalogue_source).max_tokens_field
 
 
 def _is_openai_endpoint(base_url: str) -> bool:
-    """OpenAI's own API, rather than something that speaks its shape.
-
-    The one backend behind this engine known to REJECT the local-engine
-    extensions: it answers `top_k` with "Unrecognized request argument
-    supplied", and a history message carrying `reasoning_content` with
-    an unexpected-property 400. Everything else -- llama.cpp, vLLM,
-    Ollama, LM Studio -- either reads them or ignores them.
-    """
-    return "openai.com" in base_url.lower()
+    return dialects.is_openai_endpoint(base_url)
 
 
 # Settings OpenAI's own endpoint does not take. Refused when explicit and
@@ -683,6 +665,7 @@ class OpenAiCompatibleHttpEngine:
         filter_models: bool = True,
         runtime: str | None = None,
         catalogue_source: str = "openai",
+        dialect: str | None = None,
         require_parameters: bool = False,
         get: Callable[[str], Any] | None = None,
         catalogue_path: Path | None = None,
@@ -697,6 +680,7 @@ class OpenAiCompatibleHttpEngine:
             )
         self._api_key = resolved_key
         self._base_url = base_url.rstrip("/")
+        self._dialect = dialects.select(dialect, base_url=base_url, catalogue=catalogue_source)
         #: None makes this driver a provider ACCOUNT (P1): it serves every
         #: model its backend lists, and each request names one. A single
         #: model is the degenerate case and behaves exactly as before.
@@ -750,14 +734,13 @@ class OpenAiCompatibleHttpEngine:
         #: this a setting the caller asked for can be dropped by whichever
         #: provider it picks -- exactly what A2 forbids.
         self._require_parameters = require_parameters
-        self._catalogue_source = catalogue_source
         #: `(continues raw text, fills in the middle)`, once definite (P6).
         self._completion_caps: tuple[bool, bool] | None = None
         #: The account's model list, or None for a single-model driver.
         self.catalogue: Catalogue | None = None
         if model_id is None:
             self.catalogue = Catalogue(
-                source=catalogue_source,
+                source=self._dialect.catalogue,
                 origin=f"{provider or catalogue_source}|{self._base_url}",
                 fetch=self._fetch_catalogue,
                 get=get or (lambda _key: None),
@@ -956,6 +939,7 @@ class OpenAiCompatibleHttpEngine:
         runtime_url: str | None = None,
         runtime_name: str | None = None,
         catalogue_source: str = "openai",
+        dialect: str | None = None,
         require_parameters: bool = False,
         catalogue_path: Path | None = None,
         provider: str | None = None,
@@ -1000,6 +984,9 @@ class OpenAiCompatibleHttpEngine:
             filter_models=filter_models,
             runtime=runtime_name if runtime_url else None,
             catalogue_source=catalogue_source,
+            dialect=str(
+                (get("wireDialect") if dialect in (None, "auto") else None) or dialect or "auto"
+            ),
             require_parameters=require_parameters,
             get=get,
             catalogue_path=catalogue_path,
@@ -1020,7 +1007,7 @@ class OpenAiCompatibleHttpEngine:
 
     def _chat_tools_unavailable(self, upstream: str) -> bool:
         """A model OpenAI's own Chat Completions serves without tools."""
-        return _is_openai_endpoint(self._base_url) and bool(_RESPONSES_ONLY_TOOLS.match(upstream))
+        return self._dialect.openai_parameters and bool(_RESPONSES_ONLY_TOOLS.match(upstream))
 
     def resolve_model(self, requested: str | None) -> _Target:
         """The model a request is for, or `ModelNotServed` / `ModelRequired`.
@@ -1070,7 +1057,7 @@ class OpenAiCompatibleHttpEngine:
         """Read this account's list from the provider's own listing."""
         client = self._client()
         headers = self._headers()
-        source = self._catalogue_source
+        source = self._dialect.catalogue
 
         async def read(path: str) -> Any:
             response = await client.get(path, headers=headers, timeout=_LIST_TIMEOUT)
@@ -1215,15 +1202,15 @@ class OpenAiCompatibleHttpEngine:
         unsupported: set[str] = set()
         if target.temperature_fixed:
             unsupported |= _FIXED_SAMPLER_SETTINGS
-        if _is_openai_endpoint(self._base_url):
+        if self._dialect.openai_parameters:
             unsupported |= _LOCAL_ENGINE_SETTINGS
         if self._chat_tools_unavailable(target.upstream):
             unsupported |= _CHAT_TOOL_SETTINGS
-        if self._catalogue_source == "ollama":
+        if self._dialect.catalogue == "ollama":
             unsupported |= _OLLAMA_DROPPED_SETTINGS
         caps = target.entry.capabilities if target.entry is not None else None
-        listed_by_provider = self._catalogue_source == "openrouter" and caps is not None
-        if not _is_openai_endpoint(self._base_url) and not listed_by_provider:
+        listed_by_provider = self._dialect.catalogue == "openrouter" and caps is not None
+        if not self._dialect.openai_parameters and not listed_by_provider:
             unsupported |= _HOSTED_SETTINGS
         if listed_by_provider and caps is not None:
             # The listing is the authority for what this model accepts; a
@@ -1262,7 +1249,7 @@ class OpenAiCompatibleHttpEngine:
             )
         if unsupported:
             refuse_unsupported_settings(request, unsupported=set(unsupported))
-        ollama = self._catalogue_source == "ollama"
+        ollama = self._dialect.catalogue == "ollama"
         # What Ollama ignores by value: `auto` and `true` are what it does
         # anyway; anything else it would drop without a word.
         held = self._ollama_ignores(request) if ollama else set()
@@ -1275,17 +1262,17 @@ class OpenAiCompatibleHttpEngine:
             "model": target.upstream,
             "messages": _to_openai_messages(
                 messages,
-                send_reasoning=not _is_openai_endpoint(self._base_url),
+                send_reasoning=self._dialect.send_reasoning,
                 # Ollama reads replayed reasoning as `reasoning` only
                 # (ollama#18534) and matches tool results by position
                 # (ollama#18762); llama.cpp reads `reasoning_content` and
                 # matches by id, so it keeps both as they were.
-                reasoning_key="reasoning" if ollama else "reasoning_content",
-                results_in_call_order=ollama,
+                reasoning_key=self._dialect.reasoning_key,
+                results_in_call_order=self._dialect.results_in_call_order,
             ),
         }
         if request.maxTokens is not None:
-            cap = _max_tokens_field_for(self._base_url, self._catalogue_source)
+            cap = self._dialect.max_tokens_field
             payload[cap] = request.maxTokens
         if request.temperature is not None and not target.temperature_fixed:
             payload["temperature"] = float(request.temperature)
@@ -1386,7 +1373,7 @@ class OpenAiCompatibleHttpEngine:
             value = getattr(request, ours)
             if value is None:
                 continue
-            if _is_openai_endpoint(self._base_url):
+            if self._dialect.openai_parameters:
                 payload[theirs] = getattr(value, "value", value)
             else:
                 self._warn_dropped(theirs, target)
@@ -1447,7 +1434,7 @@ class OpenAiCompatibleHttpEngine:
         choice = request.toolChoice
         if not isinstance(choice, NamedToolChoice) or not request.tools:
             return None
-        if self._catalogue_source != "openai":
+        if self._dialect.catalogue != "openai":
             # Ollama, LM Studio and OpenRouter are never llama-server, so
             # there is nothing to ask `/props` (and Ollama refuses a named
             # choice in `_payload_for` before anything is sent).
@@ -2109,7 +2096,7 @@ class OpenAiCompatibleHttpEngine:
         caps = target.entry.capabilities if target.entry is not None else None
         if caps is not None and caps.speechFormats:
             return tuple(caps.speechFormats)
-        if self._catalogue_source == "openrouter":
+        if self._dialect.catalogue == "openrouter":
             return OPENROUTER_FORMATS
         return ALL_FORMATS
 
@@ -2130,7 +2117,7 @@ class OpenAiCompatibleHttpEngine:
         formats = self.speech_formats(target)
         asked = request.format or SpeechFormat.mp3
         refuse_format(asked, formats)
-        if request.instructions and self._catalogue_source == "openrouter":
+        if request.instructions and self._dialect.catalogue == "openrouter":
             # Not in OpenRouter's speech request (its API reference,
             # 2026-10-03), so it would be dropped: refused, as ElevenLabs
             # refuses it.
@@ -2138,7 +2125,7 @@ class OpenAiCompatibleHttpEngine:
                 "instructions: OpenRouter's speech API takes no speaking instructions, so "
                 "they would be dropped; remove them, or choose a model that takes them"
             )
-        made_here = asked is SpeechFormat.wav and self._catalogue_source == "openrouter"
+        made_here = asked is SpeechFormat.wav and self._dialect.catalogue == "openrouter"
         payload: dict[str, Any] = {
             "model": target.upstream,
             "input": request.input,
@@ -2198,7 +2185,7 @@ class OpenAiCompatibleHttpEngine:
         """
         started = time.perf_counter()
         target = self.resolve_model(request.model)
-        if request.prompt and self._catalogue_source == "openrouter":
+        if request.prompt and self._dialect.catalogue == "openrouter":
             # Not in OpenRouter's transcription request (JSON or multipart,
             # its API reference, 2026-10-03), so it would be ignored.
             raise TranscriptionRefusal(
@@ -2306,7 +2293,7 @@ class OpenAiCompatibleHttpEngine:
         would drop, and a suffix for a model that does not fill the middle."""
         completion = request.completion
         assert completion is not None
-        if self._catalogue_source == "ollama":
+        if self._dialect.catalogue == "ollama":
             refuse_uncarried(request, OLLAMA_CARRIED)
             caps = target.entry.capabilities if target.entry is not None else None
             if completion.suffix is not None and not (caps is not None and caps.fillInMiddle):
@@ -2604,7 +2591,7 @@ class OpenAiCompatibleHttpEngine:
             settings.append(("partial_images", request.partialImages))
         chosen = {key: value for key, value in settings if value is not None}
         dall_e = target.upstream.lower().startswith("dall-e-")
-        if self._catalogue_source == "openrouter" or not request.references:
+        if self._dialect.catalogue == "openrouter" or not request.references:
             payload: dict[str, Any] = {"model": target.upstream, "prompt": request.prompt, **chosen}
             if request.references:
                 payload["input_references"] = [
@@ -2619,7 +2606,7 @@ class OpenAiCompatibleHttpEngine:
             # OpenRouter documents `POST /api/v1/images` with this same body
             # (2026-10-03); `/images/generations` still answers there, but it
             # is no longer the route it describes. OpenAI keeps its own.
-            if self._catalogue_source == "openrouter":
+            if self._dialect.catalogue == "openrouter":
                 return "/v1/images", {"json": payload}
             return "/v1/images/generations", {"json": payload}
         fields: dict[str, Any] = {"model": target.upstream, "prompt": request.prompt}
@@ -2778,7 +2765,7 @@ class OpenAiCompatibleHttpEngine:
     def _video_source(self) -> None:
         """Only OpenRouter makes videos here: OpenAI's video API shut down on
         2026-09-24 (measured), and no other provider speaks a video shape."""
-        if self._catalogue_source != "openrouter":
+        if self._dialect.catalogue != "openrouter":
             raise VideoRefusal(
                 "This backend makes no videos: only an OpenRouter account does (OpenAI's own "
                 "video API shut down on 2026-09-24)."
@@ -2984,7 +2971,7 @@ class OpenAiCompatibleHttpEngine:
                 "an attachment's token cost is decided by the encoder that reads it, and "
                 "the chat template renders only a marker for it"
             )
-        if _is_openai_endpoint(self._base_url):
+        if self._dialect.openai_parameters:
             raise TokenCountUnsupported("OpenAI's own API cannot count a chat prompt here")
         payload = self._payload_for(request, self.resolve_model(request.model))
         client = self._client()

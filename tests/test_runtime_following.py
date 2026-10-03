@@ -213,7 +213,8 @@ def test_schema_offers_runtime_name_for_the_custom_provider() -> None:
     # And it is the custom provider's, not every HTTP provider's: a
     # cloud API is not a runtime we supervise.
     custom = PROVIDERS["openai_compat_custom"]
-    assert {f.key for f in custom.extra_field_specs} == {"runtimeName", "baseUrl"}
+    assert {f.key for f in custom.extra_field_specs} == {"runtimeName", "baseUrl", "wireDialect"}
+    assert fields["wireDialect"].showWhen.equals == ["openai_compat_custom"]
     assert not PROVIDERS["openai"].extra_field_specs
 
 

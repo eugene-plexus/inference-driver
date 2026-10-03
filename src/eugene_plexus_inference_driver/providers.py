@@ -71,6 +71,20 @@ def _custom_backend_fields() -> list[ConfigField]:
     )
     return [
         ConfigField(
+            key="wireDialect",
+            label="Wire protocol",
+            description=(
+                "Choose the provider protocol when this address is a proxy. Auto recognizes "
+                "exact OpenAI hosts; other addresses use the compatible-server protocol."
+            ),
+            category="adapter",
+            valueType=ConfigValueType.enum,
+            default="auto",
+            enumValues=["auto", "compatible", "openai", "openrouter", "ollama", "lmstudio"],
+            requiresRestart=True,
+            showWhen=ConfigFieldShowWhen(key="provider", equals=["openai_compat_custom"]),
+        ),
+        ConfigField(
             key="runtimeName",
             label="Supervised runtime",
             description=(
@@ -135,6 +149,7 @@ PROVIDERS: dict[str, Provider] = {
         label="OpenAI API",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "openai",
             "default_base_url": "https://api.openai.com",
             "fixed_temperature_pattern": OPENAI_FIXED_TEMPERATURE_PATTERN,
             "backend_kind": BackendKind.openai_api,
@@ -146,6 +161,7 @@ PROVIDERS: dict[str, Provider] = {
         label="xAI (Grok)",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "compatible",
             "default_base_url": "https://api.x.ai",
             "fixed_temperature_pattern": _XAI_FIXED_TEMPERATURE_PATTERN,
             "backend_kind": BackendKind.openai_compat_http,
@@ -157,6 +173,7 @@ PROVIDERS: dict[str, Provider] = {
         label="OpenRouter",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "openrouter",
             "default_base_url": "https://openrouter.ai/api",
             # OpenRouter proxies many providers — we don't try to
             # second-guess which models are temp-tunable here. If a
@@ -180,6 +197,7 @@ PROVIDERS: dict[str, Provider] = {
         label="MiniMax",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "compatible",
             "default_base_url": "https://api.minimax.io",
             "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
@@ -191,6 +209,7 @@ PROVIDERS: dict[str, Provider] = {
         label="Local — Ollama",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "ollama",
             "default_base_url": "http://127.0.0.1:11434",
             "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
@@ -213,6 +232,7 @@ PROVIDERS: dict[str, Provider] = {
         label="Local — LM Studio",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "lmstudio",
             "default_base_url": "http://127.0.0.1:1234",
             "fixed_temperature_pattern": None,
             "backend_kind": BackendKind.openai_compat_http,
@@ -226,6 +246,7 @@ PROVIDERS: dict[str, Provider] = {
         label="Custom OpenAI-compatible URL",
         engine_class=OpenAiCompatibleHttpEngine,
         engine_kwargs={
+            "dialect": "auto",
             # No default — user must supply baseUrl.
             "default_base_url": None,
             "fixed_temperature_pattern": None,
