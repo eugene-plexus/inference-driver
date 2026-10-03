@@ -61,6 +61,7 @@ from .._generated.models import (
     ModerateResponse,
     ModerationPartType,
     NamedToolChoice,
+    ReasoningEffort,
     Role,
     SpeakRequest,
     SpeechFormat,
@@ -233,15 +234,31 @@ def _only_or_named(
 # the parameter outright, and the gpt-5 family schema-accepts it but
 # errors on any value other than the default. Sending it is a 400, so
 # the adapter drops it and warns rather than refusing the model — see
-# `_temperature_for`. Catches every gpt-5 family member that uses
-# either `-` or `.` after the family name, plus the o-series, while
-# explicitly NOT matching hypothetical `gpt-50` / `gpt-5o` style names
-# that aren't actually 5.x. Other providers pass their own pattern (or
-# None) via the registry.
+# `_temperature_for`. Catches every family member that uses either `-`
+# or `.` after the family name, plus the o-series, while explicitly NOT
+# matching `gpt-50` / `gpt-5o` / `gpt-10` style names. **gpt-5 through
+# gpt-9 since 2026-10-03**: OpenAI's "Using GPT-6" guide says GPT-6
+# answers `temperature` and `top_p` with a 400 as gpt-5 does, and the
+# pattern matched `gpt-5` alone, so every GPT-6 request carried both.
+# Other providers pass their own pattern (or None) via the registry.
 OPENAI_FIXED_TEMPERATURE_PATTERN: re.Pattern[str] = re.compile(
-    r"^(?:o\d+|gpt-5)(?:[-.]|$)",
+    r"^(?:o\d+|gpt-[5-9])(?:[-.]|$)",
     re.IGNORECASE,
 )
+
+# GPT-6 models that take tools on OpenAI's Responses API only ("Using
+# GPT-6", 2026-10-03). This engine speaks Chat Completions, so on OpenAI's
+# own endpoint they are not offered as tool-capable: a request with tools
+# is refused here and the gateway routes it elsewhere, rather than OpenAI
+# refusing it after the cascade has committed to this backend. OpenRouter
+# says per model in its listing and is not affected.
+_RESPONSES_ONLY_TOOLS: re.Pattern[str] = re.compile(
+    r"^(?:gpt-6-astra|gpt-6\.1-sol)(?:[-.]|$)",
+    re.IGNORECASE,
+)
+
+# The settings that only mean something with tools.
+_CHAT_TOOL_SETTINGS = frozenset({"tools", "toolChoice", "parallelToolCalls"})
 
 # OpenAI's `/v1/models` returns every model on the account — embeddings,
 # image, audio, moderation, retired completion-only models, etc. — and
@@ -706,6 +723,12 @@ class OpenAiCompatibleHttpEngine:
                 "use its own default. Everything else works normally.",
                 model_id,
             )
+        #: Per instance, shadowing the class's True: one model on OpenAI's
+        #: own endpoint takes tools on Responses only (`_RESPONSES_ONLY_TOOLS`).
+        #: An account says per model in its catalogue instead.
+        self.supports_tool_calling = not (
+            model_id is not None and self._chat_tools_unavailable(self._upstream_model_id)
+        )
         self.backend_kind = backend_kind
         self._thinking_mode = thinking_mode or "auto"
         self._filter_models = filter_models
@@ -984,6 +1007,10 @@ class OpenAiCompatibleHttpEngine:
         pattern = self._fixed_temperature_pattern
         return pattern is not None and bool(pattern.match(upstream))
 
+    def _chat_tools_unavailable(self, upstream: str) -> bool:
+        """A model OpenAI's own Chat Completions serves without tools."""
+        return _is_openai_endpoint(self._base_url) and bool(_RESPONSES_ONLY_TOOLS.match(upstream))
+
     def resolve_model(self, requested: str | None) -> _Target:
         """The model a request is for, or `ModelNotServed` / `ModelRequired`.
 
@@ -1122,7 +1149,7 @@ class OpenAiCompatibleHttpEngine:
         body = await read("/v1/models")
         classify = classify_openai_model if self._filter_models else None
         return [
-            self._with_fixed_temperature(m)
+            self._with_chat_tools(self._with_fixed_temperature(m))
             for m in from_openai_list(body, self.engine_defaults(), classify=classify)
         ]
 
@@ -1133,6 +1160,17 @@ class OpenAiCompatibleHttpEngine:
         caps = model.capabilities
         caps.supportedSettings = [
             s for s in (caps.supportedSettings or []) if s not in _FIXED_SAMPLER_SETTINGS
+        ]
+        return model
+
+    def _with_chat_tools(self, model: DriverModel) -> DriverModel:
+        """Take tools off a model this endpoint serves without them."""
+        caps = model.capabilities
+        if caps is None or not self._chat_tools_unavailable(model.upstreamId or model.id):
+            return model
+        caps.toolCalling = False
+        caps.supportedSettings = [
+            s for s in (caps.supportedSettings or []) if s not in _CHAT_TOOL_SETTINGS
         ]
         return model
 
@@ -1168,6 +1206,8 @@ class OpenAiCompatibleHttpEngine:
             unsupported |= _FIXED_SAMPLER_SETTINGS
         if _is_openai_endpoint(self._base_url):
             unsupported |= _LOCAL_ENGINE_SETTINGS
+        if self._chat_tools_unavailable(target.upstream):
+            unsupported |= _CHAT_TOOL_SETTINGS
         caps = target.entry.capabilities if target.entry is not None else None
         listed_by_provider = self._catalogue_source == "openrouter" and caps is not None
         if not _is_openai_endpoint(self._base_url) and not listed_by_provider:
@@ -1191,6 +1231,22 @@ class OpenAiCompatibleHttpEngine:
         named `tool_choice` forces on llama-server (`_forced_tool`).
         """
         unsupported = self._unsupported_settings(target)
+        # **A fixed-sampler model takes logprobs only at reasoning effort
+        # `none`** (OpenAI's "Using GPT-6", 2026-10-03), so whether it is
+        # carried depends on the request, not the model: still listed for
+        # routing, refused here when explicit, dropped when inherited. An
+        # absent effort is the model's own default, which is not `none`
+        # for every model the pattern covers.
+        logprobs_held = target.temperature_fixed and request.reasoningEffort is not (
+            ReasoningEffort.none
+        )
+        if logprobs_held and request.logprobs and "logprobs" in (request.callerSettings or []):
+            raise CliError(
+                f"logprobs: {target.id!r} returns log probabilities only with "
+                "reasoning_effort set to none; set reasoning_effort to none, or remove "
+                "logprobs.",
+                upstream_status=400,
+            )
         if unsupported:
             refuse_unsupported_settings(request, unsupported=set(unsupported))
         # Apply the operator's thinkingMode by mutating the system
@@ -1281,7 +1337,9 @@ class OpenAiCompatibleHttpEngine:
             )
         if self._require_parameters and request.callerSettings:
             payload["provider"] = {"require_parameters": True}
-        if request.logprobs is not None:
+        if request.logprobs is not None and logprobs_held:
+            self._warn_dropped("logprobs", target)
+        elif request.logprobs is not None:
             payload["logprobs"] = request.logprobs
             if request.topLogprobs is not None:
                 payload["top_logprobs"] = request.topLogprobs
