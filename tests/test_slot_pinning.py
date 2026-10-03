@@ -32,13 +32,9 @@ BASE = "http://127.0.0.1:9"
 
 async def test_a_conversation_keeps_its_slot():
     pins = SlotPins(4)
-    async with pins.hold("a") as first:
-        pass
-    async with pins.hold("b"):
-        pass
-    async with pins.hold("a") as again:
-        pass
-    assert again == first
+    first = await _take(pins, "a")
+    await _take(pins, "b")
+    assert await _take(pins, "a") == first
 
 
 async def test_a_turn_whose_slot_is_busy_waits_for_it():
@@ -62,7 +58,7 @@ async def test_a_turn_whose_slot_is_busy_waits_for_it():
     await asyncio.sleep(0.05)
     assert len(got) == 1, "the second turn was given a slot while its own was busy"
     release.set()
-    await asyncio.gather(one, two)
+    await asyncio.wait_for(asyncio.gather(one, two), 2)
     assert got[0] == got[1], "it must come back to its own slot, not another"
 
 
@@ -80,13 +76,19 @@ async def test_a_new_conversation_waits_when_no_slot_is_idle():
     await asyncio.sleep(0.05)
     assert not third.done(), "a new conversation was given a busy slot"
     release.set()
-    await asyncio.gather(*holders)
-    assert await third in (0, 1)
+    await asyncio.wait_for(asyncio.gather(*holders), 2)
+    assert await asyncio.wait_for(third, 2) in (0, 1)
 
 
 async def _take(pins: SlotPins, key: str | None) -> int:
-    async with pins.hold(key) as slot:
-        return slot
+    """One request's slot. Bounded: a slot that is never given back must fail
+    the test, not hang it."""
+
+    async def take() -> int:
+        async with pins.hold(key) as slot:
+            return slot
+
+    return await asyncio.wait_for(take(), 2)
 
 
 async def test_the_least_recently_used_conversation_gives_up_its_slot():
@@ -208,7 +210,7 @@ async def test_through_the_engine_a_busy_slot_is_never_named():
     await asyncio.sleep(0.05)
     assert peak == [1], "the second turn was sent while its slot was busy"
     gate.set()
-    await asyncio.gather(*turns)
+    await asyncio.wait_for(asyncio.gather(*turns), 2)
     assert max(peak) == 1
 
 
