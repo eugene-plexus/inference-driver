@@ -73,18 +73,22 @@ from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, warn_dropped_sampling
 
 log = logging.getLogger(__name__)
 
-# Models that Codex CLI is known to surface to the user. The CLI itself
-# decides which model to call based on its own config and the active
-# ChatGPT subscription tier — our `modelId` field is informational only,
-# not directly bound to the backend call. Keep the list short and
-# deliberately exclude reasoning models that wouldn't pass our
-# temperature-controllability bar (see openai_api).
+# Suggestions for the Model field (sent as `--model`): what a ChatGPT
+# subscription answers through Codex. Checked 2026-10-03 against Codex
+# rust-v0.160.0 (its model catalogs and release notes). An older Codex
+# refuses the newer ids with "requires a newer version of Codex", which
+# the driver relays. The list used to be gpt-4o and gpt-4.1, under a rule
+# that kept reasoning models out; that rule is retired (never reject a
+# model the user owns), and Codex serves no gpt-4 model.
 _KNOWN_CODEX_MODELS: list[str] = [
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4-turbo",
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
 ]
 
 

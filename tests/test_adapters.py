@@ -430,19 +430,25 @@ async def test_claude_adapter_list_models_returns_known_chat_models() -> None:
     models = await adapter.list_models()
     assert models  # non-empty
     assert all(m.startswith("claude-") for m in models)
-    assert "claude-opus-4-7" in models
+    # Current as of Claude Code 2.1.288's changelog (2026-10-02): the
+    # default Opus, Sonnet and Fable, and the Haiku that is still offered.
+    assert {"claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5"} <= set(
+        models
+    )
+    # Long gone from Claude Code's picker; suggesting them invites a 404.
+    assert not any(m.startswith("claude-3-") for m in models)
 
 
-async def test_codex_adapter_list_models_excludes_temperature_uncontrollable() -> None:
-    """Codex CLI hardcodes a list too; verify it deliberately excludes
-    o-series and gpt-5 family — Eugene Plexus's hemisphere policy
-    applies regardless of which adapter is delivering the model."""
+async def test_codex_adapter_list_models_suggests_what_codex_serves() -> None:
+    """Codex CLI hardcodes a list too. It used to be gpt-4o and gpt-4.1,
+    under a rule that excluded reasoning models (retired with the
+    consciousness era: never reject a model the user owns). What a ChatGPT
+    subscription answers through Codex 0.160 is its own catalog."""
     adapter = CodexCliEngine()
     models = await adapter.list_models()
     assert models
-    assert "gpt-4o" in models
-    for forbidden in ("o1", "o1-mini", "o3", "gpt-5", "gpt-5-mini"):
-        assert forbidden not in models
+    assert {"gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.5"} <= set(models)
+    assert not any(m.startswith("gpt-4") for m in models)
 
 
 # ---------------------------------------------------------------------------

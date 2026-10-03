@@ -71,20 +71,21 @@ _STOP_REASON_MAP = {
     "max_tokens": FinishReason.length,
 }
 
-# Hardcoded list of known-good Claude models supported by the Claude
-# Code CLI. The CLI doesn't expose a `--list-models` so we can't
-# discover this live the way openai_api can. Update by hand when
-# Anthropic ships new chat models. Extended-thinking variants are
-# excluded — Eugene Plexus IS the synthesis layer (see o-series
-# rejection in openai_api).
+# Suggestions for the Model field, nothing more: the CLI has no
+# `--list-models`, and `--model` takes any full name. Update by hand when
+# Anthropic ships new models. Checked 2026-10-03 against Claude Code
+# 2.1.288's changelog (Opus 5.5, Sonnet 5.5 and Fable 5.1 are each the
+# default of their family) and 2.1.283's binary, which knows every id
+# below but Sonnet 5.5 (added in 2.1.284 and accepted by name all the
+# same, as any full name is).
 _KNOWN_CLAUDE_MODELS: list[str] = [
-    "claude-opus-4-7",
-    "claude-sonnet-4-7",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
     "claude-haiku-4-5",
-    "claude-opus-4",
-    "claude-sonnet-4",
-    "claude-3-5-sonnet-latest",
-    "claude-3-5-haiku-latest",
 ]
 
 
