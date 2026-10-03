@@ -156,8 +156,11 @@ def _common_fields() -> list[ConfigField]:
                 "inference stays inside your trusted local installation. A local URL is "
                 "not proof: a proxy may forward to cloud. Unknown endpoints cannot serve "
                 "local-only keys. Supervised runtimes are classified local automatically; "
-                "cloud APIs and subscription CLIs always remain external. Restart applies "
-                "this setting to the active engine."
+                "cloud APIs and subscription CLIs always remain external. Ollama sends its "
+                "`:cloud` models to ollama.com, and this setting covers every model the "
+                "backend lists: before confirming an Ollama local, start it with "
+                "OLLAMA_NO_CLOUD=1 or pull no cloud models. Restart applies this setting to "
+                "the active engine."
             ),
             category="adapter",
             valueType=ConfigValueType.enum,

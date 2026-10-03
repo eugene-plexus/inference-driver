@@ -119,3 +119,16 @@ def test_engine_classification_is_captured_at_construction(provider, declared, m
     assert engine.routing_locality == expected
     config["backendLocality"] = "external"
     assert engine.routing_locality == expected
+
+
+def test_the_trust_setting_says_confirmed_local_does_not_cover_ollama_cloud_models():
+    """Ollama forwards a `:cloud` model to ollama.com, and the trust setting
+    is per backend, so "Confirmed local" on an Ollama would let a local-only
+    request reach one (upstream drift audit, 2026-10-03). Marking such a
+    model external needs a per-model field the contract does not have; until
+    then the setting says so and names Ollama's own switch."""
+    from eugene_plexus_inference_driver.config import FIELDS
+
+    text = next(f for f in FIELDS if f.key == "backendLocality").description
+    assert ":cloud" in text
+    assert "OLLAMA_NO_CLOUD=1" in text
