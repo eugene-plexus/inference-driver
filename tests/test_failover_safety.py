@@ -90,7 +90,8 @@ async def test_cli_side_effect_followed_by_failure_has_unknown_outcome(tmp_path)
         "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('acted'); sys.exit(2)"
     )
     engine = CodexCliEngine()
-    engine._build_argv = lambda prompt: [sys.executable, "-c", code, str(effect)]
+    # The transcript is on stdin since 2026-10-03, so argv takes no prompt.
+    engine._build_argv = lambda: [sys.executable, "-c", code, str(effect)]
     with pytest.raises(CliError) as caught:
         await engine.generate(GenerateRequest(messages=[]))
     assert effect.read_text() == "acted"

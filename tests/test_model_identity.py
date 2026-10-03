@@ -252,7 +252,7 @@ def test_claude_cli_argv_carries_the_upstream_name() -> None:
         model_id="public-alias",
         upstream_model_id="claude-opus-4-7",
     )
-    argv = engine._build_argv(system_prompt="")
+    argv = engine._build_argv(system_prompt_file=None)
     model_flag = argv[argv.index("--model") + 1]
     assert model_flag == "claude-opus-4-7"
 
@@ -263,7 +263,7 @@ def test_codex_cli_argv_carries_the_upstream_name() -> None:
         model_id="public-alias",
         upstream_model_id="gpt-5",
     )
-    argv = engine._build_argv("say PING")
+    argv = engine._build_argv()
     model_flag = argv[argv.index("--model") + 1]
     assert model_flag == "gpt-5"
 
