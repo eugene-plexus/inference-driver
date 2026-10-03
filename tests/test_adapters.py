@@ -48,11 +48,16 @@ def _patch_run_cli(
     captured: dict[str, Any] = {"argv": None, "timeout": None, "stdin_input": None}
 
     async def _fake_run_cli(
-        argv: list[str], *, timeout_seconds: float, stdin_input: bytes | None = None
+        argv: list[str],
+        *,
+        timeout_seconds: float,
+        stdin_input: bytes | None = None,
+        drop_env: Any = (),
     ) -> CliResult:
         captured["argv"] = argv
         captured["timeout"] = timeout_seconds
         captured["stdin_input"] = stdin_input
+        captured["drop_env"] = drop_env
         result = fn(argv)
         if hasattr(result, "__await__"):
             return await result
@@ -118,13 +123,19 @@ async def test_claude_adapter_parses_success_envelope(
     # Reflects cache reads as part of prompt accounting.
     assert response.usage.promptTokens == 6 + 33349
 
-    # argv shape: claude --print --output-format json --model <id>
+    # argv shape: claude --print --output-format json <no tools> --model <id>
     # User prompt now goes via stdin (argv-newline issue on Windows).
     assert captured["argv"] == [
         "claude",
         "--print",
         "--output-format",
         "json",
+        "--tools",
+        "",
+        "--permission-mode",
+        "dontAsk",
+        "--strict-mcp-config",
+        "--no-session-persistence",
         "--model",
         "claude-opus-4-7",
     ]

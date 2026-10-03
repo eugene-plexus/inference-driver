@@ -4,6 +4,10 @@ Invocation pattern, verified by hand against `claude` v2.1.138:
 
     claude --print --output-format json [--model <id>] "<prompt>"
 
+and since 2026-10-03 always with `_NO_TOOLS` (no tools, `dontAsk`, no MCP
+servers, no saved session) and without the routing variables in
+`_ROUTING_ENV`: it is a text backend, never an agent on the driver host.
+
 The CLI emits a single JSON envelope on stdout:
 
     {
@@ -79,6 +83,70 @@ _KNOWN_CLAUDE_MODELS: list[str] = [
     "claude-3-5-sonnet-latest",
     "claude-3-5-haiku-latest",
 ]
+
+
+#: **A text backend runs no tools.** Claude Code here answers prompts that
+#: any client key can send, on the driver's host, as the driver's account.
+#: Before 2026-10-03 it was given its default tools and no permission
+#: mode, and Claude Code 2.1.285 starts `-p` in auto mode "on third-party
+#: providers, or with telemetry off" -- so a prompt could have run Bash or
+#: Edit here, approved by a classifier rather than a person. Each flag is
+#: accepted by 2.1.283 and 2.1.288 (help, changelog and the binary):
+#:
+#: * `--tools ""` -- no built-in tool at all ("Use "" to disable all
+#:   tools"). Bash, Edit, WebFetch and the rest are not offered.
+#: * `--permission-mode dontAsk` -- anything not pre-approved is denied
+#:   without asking, and auto mode is never chosen for us.
+#: * `--strict-mcp-config` with no `--mcp-config` -- no MCP server from the
+#:   operator's own configuration, whose tools `--tools` does not cover.
+#: * `--no-session-persistence` -- a client's conversation is not saved as
+#:   a resumable session on the driver host.
+#:
+#: The cost is the "uses a tool" progress the stream used to report: there
+#: is no tool left to report.
+_NO_TOOLS: tuple[str, ...] = (
+    "--tools",
+    "",
+    "--permission-mode",
+    "dontAsk",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+)
+
+#: **Where Claude Code is told to send its requests, as opposed to who it
+#: is.** Stripped from the child's environment, because these are exactly
+#: what Eugene's own Claude Code recipe writes (`ANTHROPIC_BASE_URL`,
+#: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, and the two
+#: `CLAUDE_CODE_MAX_*_TOKENS` sized for a local model), and a driver host
+#: that is also somebody's workstation has them set: the backend would loop
+#: back into Eugene, with a client's key, instead of reaching Anthropic.
+#: The model is the driver's to choose (`modelId` / `upstreamModelId`, sent
+#: as `--model`), and output size is the gateway's (it owns every
+#: output-affecting setting).
+#:
+#: **Kept, deliberately:** the CLI's own credentials -- `ANTHROPIC_API_KEY`,
+#: `CLAUDE_CODE_OAUTH_TOKEN` and the keychain the CLI reads for a
+#: subscription -- and the Bedrock/Vertex/Foundry variables, which name the
+#: operator's own provider rather than Eugene.
+_ROUTING_ENV = frozenset(
+    {
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "ANTHROPIC_UNIX_SOCKET",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    }
+)
 
 
 class ClaudeCodeCliEngine:
@@ -202,6 +270,7 @@ class ClaudeCodeCliEngine:
             argv,
             timeout_seconds=self._timeout_seconds,
             stdin_input=user_prompt.encode("utf-8"),
+            drop_env=_ROUTING_ENV,
         )
 
         if log.isEnabledFor(logging.DEBUG):
@@ -303,6 +372,7 @@ class ClaudeCodeCliEngine:
             argv,
             timeout_seconds=self._timeout_seconds,
             stdin_input=user_prompt.encode("utf-8"),
+            drop_env=_ROUTING_ENV,
         ):
             if not line:
                 continue
@@ -431,6 +501,7 @@ class ClaudeCodeCliEngine:
             "--print",
             "--output-format",
             "stream-json" if stream else "json",
+            *_NO_TOOLS,
         ]
         if stream:
             # `--verbose` is required: Claude Code refuses stream-json

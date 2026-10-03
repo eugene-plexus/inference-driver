@@ -11,7 +11,7 @@ import contextlib
 import os
 import shutil
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from dataclasses import dataclass
 
 # Forced-UTF-8 environment for child processes. The smoke test on
@@ -31,12 +31,27 @@ _UTF8_ENV: dict[str, str] = {
 }
 
 
-def _utf8_subprocess_env() -> dict[str, str]:
-    """Keep backend credentials and UTF-8 hints, but no Plexus credentials."""
+#: Eugene credentials that do not carry the `EUGENE_PLEXUS_` prefix.
+#: `EUGENE_API_KEY` is the variable Eugene's own Codex recipe tells a user
+#: to export for their client key (`ui/src/lib/clientKeys.ts`), so on a
+#: machine that is both a client and a driver host it is in the driver's
+#: environment -- and a backend CLI has no use for a key to Eugene.
+_PLEXUS_CREDENTIALS = frozenset({"EUGENE_API_KEY"})
+
+
+def _utf8_subprocess_env(drop: Collection[str] = ()) -> dict[str, str]:
+    """Keep backend credentials and UTF-8 hints, but no Plexus credentials.
+
+    `drop` names further variables the calling engine's CLI must not see
+    -- each engine's own list of what would point its CLI somewhere other
+    than the provider it fronts. Matched case-insensitively, because
+    Windows environment names are.
+    """
+    dropped = {name.upper() for name in drop} | _PLEXUS_CREDENTIALS
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith("EUGENE_PLEXUS_")
+        if not key.upper().startswith("EUGENE_PLEXUS_") and key.upper() not in dropped
     }
     env.update(_UTF8_ENV)
     return env
@@ -120,6 +135,7 @@ async def stream_cli_lines(
     *,
     timeout_seconds: float,
     stdin_input: bytes | None = None,
+    drop_env: Collection[str] = (),
 ) -> AsyncIterator[str]:
     """Run argv and yield its stdout a line at a time, as it arrives.
 
@@ -158,7 +174,7 @@ async def stream_cli_lines(
         stdin=asyncio.subprocess.PIPE if stdin_input is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_utf8_subprocess_env(),
+        env=_utf8_subprocess_env(drop_env),
     )
     assert proc.stdout is not None
 
@@ -214,6 +230,7 @@ async def run_cli(
     *,
     timeout_seconds: float,
     stdin_input: bytes | None = None,
+    drop_env: Collection[str] = (),
 ) -> CliResult:
     """Run argv as a subprocess. Returns stdout/stderr/returncode + elapsed time.
 
@@ -242,7 +259,7 @@ async def run_cli(
         stdin=asyncio.subprocess.PIPE if stdin_input is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_utf8_subprocess_env(),
+        env=_utf8_subprocess_env(drop_env),
     )
     try:
         stdout, stderr = await asyncio.wait_for(

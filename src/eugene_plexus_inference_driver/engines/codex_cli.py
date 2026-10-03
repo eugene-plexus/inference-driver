@@ -5,6 +5,10 @@ Invocation pattern, verified by hand against `codex-cli` v0.130.0:
     codex exec --json --skip-git-repo-check --ephemeral
                --sandbox read-only [--model <id>] "<prompt>"
 
+and since 2026-10-03 with `_PINNED_CONFIG` (`-c` overrides that keep the
+built-in provider and the `never` approval policy whatever the user's
+config says) and without `_ROUTING_ENV`.
+
 The CLI emits a JSONL stream on stdout:
 
     {"type":"thread.started","thread_id":"..."}
@@ -82,6 +86,40 @@ _KNOWN_CODEX_MODELS: list[str] = [
     "gpt-4.1-mini",
     "gpt-4-turbo",
 ]
+
+
+#: **Pinned on every run, whatever `~/.codex/config.toml` says** (upstream
+#: drift audit, 2026-10-03). Each `-c` is a CLI override, which outranks the
+#: config file and its profiles. A bare word is not TOML, so Codex takes it
+#: as a literal string -- no quotes to survive a `.cmd` shim.
+#:
+#: * `model_provider=openai` -- Eugene's own Codex recipe writes
+#:   `model_provider = "eugene"` into that file, and a driver host that is
+#:   also somebody's workstation would loop this backend back into Eugene,
+#:   with a client's key. The subscription is Codex's built-in provider.
+#: * `approval_policy=never` and `approvals_reviewer=user` -- headless
+#:   `exec` already pins `never`, except that a config choosing the
+#:   automatic reviewer makes it fall back to the config's own policy
+#:   (`exec/src/lib.rs` `build_exec_config` at rust-v0.160.0), under which
+#:   a classifier could approve a command outside the read-only sandbox.
+#:
+#: The rest of the file stays in force on purpose: it also says where the
+#: subscription's credentials live (`cli_auth_credentials_store`), so
+#: `--ignore-user-config` would log a keyring user out.
+_PINNED_CONFIG: tuple[str, ...] = (
+    "-c",
+    "model_provider=openai",
+    "-c",
+    "approval_policy=never",
+    "-c",
+    "approvals_reviewer=user",
+)
+
+#: Environment the Codex child must not see. `OPENAI_BASE_URL` addressed
+#: the built-in provider in older Codex (0.160 reads `openai_base_url` from
+#: config instead) and is what a generic OpenAI recipe points at Eugene.
+#: `EUGENE_API_KEY` is stripped for every CLI (`_subprocess.py`).
+_ROUTING_ENV = frozenset({"OPENAI_BASE_URL"})
 
 
 class CodexCliEngine:
@@ -181,7 +219,7 @@ class CodexCliEngine:
                 flattened_prompt,
             )
 
-        result = await run_cli(argv, timeout_seconds=self._timeout_seconds)
+        result = await run_cli(argv, timeout_seconds=self._timeout_seconds, drop_env=_ROUTING_ENV)
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
@@ -299,7 +337,7 @@ class CodexCliEngine:
         report = bool(request.reportProgress)
         show_reasoning = self._thinking_mode != "off"
 
-        lines = stream_cli_lines(argv, timeout_seconds=self._timeout_seconds)
+        lines = stream_cli_lines(argv, timeout_seconds=self._timeout_seconds, drop_env=_ROUTING_ENV)
         try:
             async for raw_line in lines:
                 line = raw_line.strip()
@@ -412,6 +450,7 @@ class CodexCliEngine:
             "--ephemeral",
             "--sandbox",
             "read-only",
+            *_PINNED_CONFIG,
         ]
         if self._upstream_model_id:
             argv += ["--model", self._upstream_model_id]
