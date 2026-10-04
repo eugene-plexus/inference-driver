@@ -25,6 +25,7 @@ from .engines.openai_compat_http import (
     OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
 )
+from .engines.strata_http import StrataHttpEngine
 from .engines.systemone_http import SystemOneHttpEngine
 
 
@@ -134,6 +135,19 @@ _XAI_FIXED_TEMPERATURE_PATTERN: re.Pattern[str] | None = None
 # proper, then OpenAI-compatible third-party providers, then local
 # options, then the BYO escape hatch.
 PROVIDERS: dict[str, Provider] = {
+    "strata_local": Provider(
+        key="strata_local",
+        label="Strata (experimental)",
+        engine_class=StrataHttpEngine,
+        engine_kwargs={
+            "backend_kind": BackendKind.openai_compat_http,
+            "dialect": "compatible",
+            "auth_required": False,
+            "filter_models": False,
+            "fixed_temperature_pattern": None,
+        },
+        extra_field_specs=_custom_backend_fields(),
+    ),
     "claude_subscription": Provider(
         key="claude_subscription",
         label="Claude (Pro/Max subscription via Claude Code CLI)",

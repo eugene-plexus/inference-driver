@@ -3210,7 +3210,9 @@ class OpenAiCompatibleHttpEngine:
         if value is None:
             value = props.get("n_ctx")
         found = value if isinstance(value, int) and value > 0 else None
-        self._llama_cpp = found is not None
+        self._llama_cpp = found is not None and not str(
+            props.get("build_info", "")
+        ).lower().startswith("strata")
         return found
 
     async def _answers_as_llama_cpp(self) -> bool:
