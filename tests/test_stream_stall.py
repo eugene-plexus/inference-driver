@@ -267,10 +267,13 @@ async def test_llama_server_pings_do_not_hide_a_stall() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_a_hosted_services_keepalives_still_count() -> None:
-    """The pair: the same comments from a backend that is not llama-server."""
+    """The pair: the same comments from a backend that is not llama-server.
+
+    Pings 0.1 s apart against a 0.4 s window; the 0.6 s of pings still
+    outlasts it, so keepalives that did not count would fire."""
     _learn_what_it_is(llama_server=False)
     _mock_stream([(0.0, TOKEN), *PINGS, (0.0, FINISH), (0.0, DONE)])
-    engine = _engine(stall_seconds=0.25)
+    engine = _engine(stall_seconds=0.4)
     await engine.context_window()
     assert await _collect(engine) == "Hi"
 
@@ -279,11 +282,14 @@ async def test_a_hosted_services_keepalives_still_count() -> None:
 @respx.mock
 async def test_llama_server_tokens_between_pings_keep_it_alive() -> None:
     """Silence is counted from the last token, so a slow model that pings
-    between tokens is not cut off."""
+    between tokens is not cut off.
+
+    Tokens arrive 0.2 s apart against a 0.6 s window, so the test does not
+    depend on the machine's load (inference-driver #5). The stream lasts
+    1.0 s, longer than the window, so a clock that tokens did not reset
+    would still fire."""
     _learn_what_it_is(llama_server=True)
-    _mock_stream(
-        [(0.0, TOKEN), (0.1, PING), (0.1, TOKEN), (0.1, PING), (0.1, TOKEN), (0.0, FINISH)]
-    )
-    engine = _engine(stall_seconds=0.25)
+    _mock_stream([(0.0, TOKEN), *[(0.1, PING), (0.1, TOKEN)] * 5, (0.0, FINISH)])
+    engine = _engine(stall_seconds=0.6)
     await engine.context_window()
-    assert await _collect(engine) == "HiHiHi"
+    assert await _collect(engine) == "Hi" * 6
