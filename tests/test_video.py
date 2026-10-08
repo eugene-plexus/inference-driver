@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from eugene_plexus_inference_driver.app import create_app
 from eugene_plexus_inference_driver.engines._catalogue import shut_down
 from eugene_plexus_inference_driver.settings import Settings
+from eugene_plexus_inference_driver.videos_out import openrouter_prices
 
 OPENROUTER = "https://openrouter.ai/api"
 OPENAI = "https://api.openai.com"
@@ -63,6 +64,11 @@ VIDEOS = {
             "supported_sizes": ["854x480", "1280x720", "720x1280"],
             "supported_resolutions": ["480p", "720p"],
             "supported_frame_images": ["first_frame"],
+            "pricing_skus": {
+                "cents_per_image_input": "0.2",
+                "cents_per_video_output_second_480p": "5",
+                "cents_per_video_output_second_720p": "7",
+            },
         },
         {
             "id": FLUX_EDIT,
@@ -120,6 +126,25 @@ def test_the_video_listing_decides_the_surface_and_its_settings(tmp_path: Path) 
         "durations": [1, 2, 3, 4, 5],
         "sizes": ["854x480", "1280x720", "720x1280"],
         "firstFrame": True,
+        # Its price list, in dollars, each line bound to the sizes it prices
+        # (2026-10-08, Workbench's video confirmation).
+        "prices": [
+            {"sku": "cents_per_image_input", "per": "input_image", "usd": 0.002},
+            {
+                "sku": "cents_per_video_output_second_480p",
+                "per": "second",
+                "usd": 0.05,
+                "resolution": "480p",
+                "sizes": ["854x480"],
+            },
+            {
+                "sku": "cents_per_video_output_second_720p",
+                "per": "second",
+                "usd": 0.07,
+                "resolution": "720p",
+                "sizes": ["1280x720", "720x1280"],
+            },
+        ],
     }
     assert models[FLUX_EDIT]["capabilities"]["video"] == {"firstFrame": False}
 
@@ -132,6 +157,92 @@ def test_an_unreadable_video_listing_leaves_the_account_serving(tmp_path: Path) 
     assert models["mistralai/mistral-nemo"]["surfaces"] == ["chat"]
     assert models[GROK]["surfaces"] == ["video"]
     assert "video" not in models[GROK]["capabilities"]
+
+
+def _lines(skus: dict[str, str], sizes: list[str] | None = None) -> list[dict[str, Any]] | None:
+    found = openrouter_prices(skus, sizes)
+    return None if found is None else [p.model_dump(mode="json", exclude_none=True) for p in found]
+
+
+def test_a_price_list_keeps_only_lines_a_request_is_priced_by() -> None:
+    """`pricing_skus` as OpenRouter listed it on 2026-10-08, one model per unit."""
+    # Veo: dollars a second, with and without sound, per resolution class.
+    veo = _lines(
+        {
+            "duration_seconds_with_audio": "0.40",
+            "duration_seconds_with_audio_4k": "0.60",
+            "duration_seconds_without_audio": "0.20",
+        },
+        ["1280x720", "3840x2160", "2160x3840"],
+    )
+    assert veo == [
+        {"sku": "duration_seconds_with_audio", "per": "second", "usd": 0.4, "audio": True},
+        {
+            "sku": "duration_seconds_with_audio_4k",
+            "per": "second",
+            "usd": 0.6,
+            "resolution": "4K",
+            "sizes": ["3840x2160", "2160x3840"],
+            "audio": True,
+        },
+        {"sku": "duration_seconds_without_audio", "per": "second", "usd": 0.2, "audio": False},
+    ]
+    # Kling: text to video and image to video priced apart.
+    kling = _lines(
+        {
+            "text_to_video_duration_seconds_720p": "0.112",
+            "image_to_video_duration_seconds_720p": "0.15",
+        },
+        ["1280x720"],
+    )
+    assert [(k["sku"], k["firstFrame"], k["sizes"]) for k in kling or []] == [
+        ("text_to_video_duration_seconds_720p", False, ["1280x720"]),
+        ("image_to_video_duration_seconds_720p", True, ["1280x720"]),
+    ]
+    # Runway: cents a second, and a job's minimum.
+    assert _lines({"cents_per_second_output": "28", "minimum_cents_per_generation": "56"}) == [
+        {"sku": "cents_per_second_output", "per": "second", "usd": 0.28},
+        {"sku": "minimum_cents_per_generation", "per": "minimum", "usd": 0.56},
+    ]
+    # A resolution the model lists no sizes for keeps its class, with no sizes.
+    assert _lines({"cents_per_video_output_second_1080p": "25"}) == [
+        {
+            "sku": "cents_per_video_output_second_1080p",
+            "per": "second",
+            "usd": 0.25,
+            "resolution": "1080p",
+        }
+    ]
+
+
+def test_a_price_list_with_no_price_for_a_second_is_none() -> None:
+    # Seedance bills video tokens; nothing converts them to seconds.
+    assert _lines({"video_tokens": "0.000007", "video_tokens_4k": "0.000004"}) is None
+    # An input image's price alone is not a price for the video.
+    assert (
+        _lines({"cents_per_image_input": "1", "cents_per_megapixel_second_precise": "7.5"}) is None
+    )
+    # Lines priced against what no request here sends are left out.
+    assert _lines(
+        {
+            "duration_seconds_480p": "0.02",
+            "reference_duration_seconds_480p": "0.04",
+            "cents_per_second_video_continuation_720p": "41",
+        },
+        ["854x480"],
+    ) == [
+        {
+            "sku": "duration_seconds_480p",
+            "per": "second",
+            "usd": 0.02,
+            "resolution": "480p",
+            "sizes": ["854x480"],
+        }
+    ]
+    # Unreadable values and listings are no price, never zero.
+    assert _lines({"duration_seconds": "free"}) is None
+    assert openrouter_prices(None, None) is None
+    assert openrouter_prices({"duration_seconds": "-1"}, None) is None
 
 
 def test_a_model_past_its_shutdown_date_is_shut_down() -> None:

@@ -10,9 +10,16 @@ failed job's `error` is a string.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from ._generated.models import VideoCapabilities, VideoJob, VideoJobStatus
+from ._generated.models import (
+    VideoCapabilities,
+    VideoJob,
+    VideoJobStatus,
+    VideoPrice,
+    VideoPriceUnit,
+)
 
 
 class VideoRefusal(ValueError):
@@ -37,13 +44,97 @@ def openrouter_caps(entry: dict[str, Any]) -> VideoCapabilities:
     durations = entry.get("supported_durations")
     sizes = entry.get("supported_sizes")
     frames = entry.get("supported_frame_images")
+    listed_sizes = [s for s in sizes if isinstance(s, str)] if isinstance(sizes, list) else None
     return VideoCapabilities(
         durations=[d for d in durations if isinstance(d, int)]
         if isinstance(durations, list)
         else None,
-        sizes=[s for s in sizes if isinstance(s, str)] if isinstance(sizes, list) else None,
+        sizes=listed_sizes,
         firstFrame=isinstance(frames, list) and "first_frame" in frames,
+        prices=openrouter_prices(entry.get("pricing_skus"), listed_sizes),
     )
+
+
+# OpenRouter's `pricing_skus` (measured 2026-10-08, 30 models): a flat map of
+# its own line names to decimal strings, in at least four units. Lines named
+# `cents_...` are cents; the `duration_seconds` family is dollars a second
+# (Veo 3.1 lists 0.40 with audio, its published price). Video tokens,
+# megapixel-seconds, continuations and references price what no request
+# here sends, so they are left out.
+_CENTS_SECOND = re.compile(
+    r"cents_per_(?:video_output_second|second_output)(?:_(?P<res>\d+p|[24]k))?"
+)
+_DOLLARS_SECOND = re.compile(
+    r"(?:(?P<mode>text|image)_to_video_)?duration_seconds"
+    r"(?:_(?P<audio>with|without)_audio)?(?:_(?P<res>\d+p|[24]k))?"
+)
+#: A resolution class's shorter side, in pixels.
+_HEIGHTS = {"2K": 1440, "4K": 2160}
+
+
+def _resolution(raw: str | None) -> str | None:
+    return raw.upper() if raw and raw.endswith("k") else raw
+
+
+def _sizes_of(resolution: str, sizes: list[str] | None) -> list[str] | None:
+    """The listed sizes of one resolution class: those whose shorter side is
+    its height (`854x480` is 480p). None when the model lists no sizes."""
+    if sizes is None:
+        return None
+    height = _HEIGHTS.get(resolution) or int(resolution.removesuffix("p"))
+    found = []
+    for size in sizes:
+        w, _, h = size.partition("x")
+        if w.isdigit() and h.isdigit() and min(int(w), int(h)) == height:
+            found.append(size)
+    return found
+
+
+def _usd(raw: Any, *, cents: bool) -> float | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value != value:  # negative, or NaN
+        return None
+    return value / 100 if cents else value
+
+
+def openrouter_prices(skus: Any, sizes: list[str] | None) -> list[VideoPrice] | None:
+    """The lines of a `pricing_skus` map a request can be priced by. None
+    when no line prices a second of output: a list of only an input image's
+    price would read as a price for the video."""
+    if not isinstance(skus, dict):
+        return None
+    lines: list[VideoPrice] = []
+    for sku, raw in skus.items():
+        if not isinstance(sku, str):
+            continue
+        fields: dict[str, Any] = {}
+        if match := _CENTS_SECOND.fullmatch(sku):
+            per, usd = VideoPriceUnit.second, _usd(raw, cents=True)
+        elif match := _DOLLARS_SECOND.fullmatch(sku):
+            per, usd = VideoPriceUnit.second, _usd(raw, cents=False)
+            if match["audio"]:
+                fields["audio"] = match["audio"] == "with"
+            if match["mode"]:
+                fields["firstFrame"] = match["mode"] == "image"
+        elif sku == "cents_per_image_input":
+            match, per, usd = None, VideoPriceUnit.input_image, _usd(raw, cents=True)
+        elif sku == "minimum_cents_per_generation":
+            match, per, usd = None, VideoPriceUnit.minimum, _usd(raw, cents=True)
+        else:
+            continue
+        if usd is None:
+            continue
+        resolution = _resolution(match["res"]) if match else None
+        if resolution:
+            fields["resolution"] = resolution
+            fields["sizes"] = _sizes_of(resolution, sizes)
+        lines.append(VideoPrice(sku=sku, per=per, usd=usd, **fields))
+    if not any(line.per == VideoPriceUnit.second for line in lines):
+        return None
+    return lines
 
 
 def job_from(body: Any, *, model_id: str | None) -> VideoJob:
