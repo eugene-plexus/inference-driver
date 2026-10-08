@@ -24,6 +24,31 @@ MEDIA_TYPES: dict[SpeechFormat, str] = {
 #: Everything OpenAI's own API makes, and what a local OpenAI-shaped
 #: speech server is assumed to take until it refuses.
 ALL_FORMATS: tuple[SpeechFormat, ...] = tuple(SpeechFormat)
+
+#: The voices OpenAI's TTS models take, measured 2026-10-08 by sending each
+#: documented voice: `tts-1` and its dated and `-hd` kin refuse ballad,
+#: cedar, marin and verse (its 400 lists the nine); `gpt-4o-mini-tts` takes
+#: all thirteen. OpenAI's `/v1/models` says nothing per model, so a TTS id
+#: outside these families lists none, and its own 400 names what it takes.
+OPENAI_TTS_1_VOICES: tuple[str, ...] = (
+    "alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer",
+)  # fmt: skip
+OPENAI_GPT_TTS_VOICES: tuple[str, ...] = (
+    "alloy", "ash", "ballad", "cedar", "coral", "echo", "fable", "marin", "nova", "onyx",
+    "sage", "shimmer", "verse",
+)  # fmt: skip
+
+
+def openai_voices(model_id: str) -> list[str] | None:
+    """The voices an OpenAI TTS model takes, where measured; None otherwise."""
+    lowered = model_id.lower()
+    if lowered.startswith("tts-1"):
+        return list(OPENAI_TTS_1_VOICES)
+    if lowered.startswith("gpt-4o-mini-tts"):
+        return list(OPENAI_GPT_TTS_VOICES)
+    return None
+
+
 #: OpenRouter's speech route takes `mp3` and `pcm` only (measured: a Zod 400
 #: listing the two); `wav` is made here from `pcm`.
 OPENROUTER_FORMATS: tuple[SpeechFormat, ...] = (

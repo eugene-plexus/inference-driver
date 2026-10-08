@@ -48,7 +48,7 @@ import httpx
 from .._generated.models import Capabilities, DriverCatalogue, DriverModel
 from .._private_files import write_private_text
 from ..images_out import openai_caps, openrouter_caps
-from ..speech import ALL_FORMATS, OPENROUTER_FORMATS
+from ..speech import ALL_FORMATS, OPENROUTER_FORMATS, openai_voices
 from ..videos_out import openrouter_caps as openrouter_video_caps
 
 log = logging.getLogger(__name__)
@@ -417,8 +417,10 @@ def from_openai_list(
         model = _inherited(entry["id"], defaults, surfaces=surfaces)
         if "speech" in model.surfaces and model.capabilities is not None:
             # Only OpenAI's own list sorts a model into speech, and its API
-            # makes all six formats (P3a).
+            # makes all six formats (P3a), in the voices measured for its
+            # model's family (media screens, M10).
             model.capabilities.speechFormats = list(ALL_FORMATS)
+            model.voices = openai_voices(entry["id"])
         if "image" in model.surfaces and model.capabilities is not None:
             # Only OpenAI's own list sorts a model into image, and its API
             # checks its own image fields (P4).

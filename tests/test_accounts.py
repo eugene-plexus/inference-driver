@@ -621,6 +621,32 @@ def test_openais_own_list_is_sorted_by_surface_not_filtered() -> None:
     assert classify_openai_model("babbage-002") == []
 
 
+def test_openais_tts_models_list_the_voices_measured_for_their_family() -> None:
+    """Measured 2026-10-08 (media screens, M10): tts-1 refuses four of the
+    thirteen documented voices; gpt-4o-mini-tts takes all of them. An id
+    outside those families lists none, so its own API checks."""
+    from eugene_plexus_inference_driver.engines._catalogue import EngineDefaults, from_openai_list
+
+    ids = ["tts-1", "tts-1-hd-1106", "gpt-4o-mini-tts-2025-12-15", "gpt-9-tts", "gpt-4o"]
+    models = {
+        m.id: m
+        for m in from_openai_list(
+            {"data": [{"id": i} for i in ids]},
+            EngineDefaults(supported_settings=[], tool_calling=False, streaming=True),
+            classify=classify_openai_model,
+        )
+    }
+    assert models["tts-1"].voices == [
+        "alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer",
+    ]  # fmt: skip
+    assert models["tts-1-hd-1106"].voices == models["tts-1"].voices
+    assert models["gpt-4o-mini-tts-2025-12-15"].voices is not None
+    assert {"ballad", "cedar", "marin", "verse"} <= set(models["gpt-4o-mini-tts-2025-12-15"].voices)
+    assert len(models["gpt-4o-mini-tts-2025-12-15"].voices) == 13
+    assert models["gpt-9-tts"].voices is None, "not measured: its own API checks"
+    assert models["gpt-4o"].voices is None
+
+
 def test_one_malformed_row_does_not_cost_the_rest() -> None:
     models = from_openrouter({"data": [{"id": None}, "junk", {"id": "a/b"}]})
     assert [m.id for m in models] == ["a/b"]
