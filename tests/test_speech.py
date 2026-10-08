@@ -102,6 +102,8 @@ def speak(model: str, fmt: str | None = "mp3", **extra: Any) -> dict[str, Any]:
 def test_the_listing_says_a_model_speaks_in_which_voices_and_formats() -> None:
     kokoro, nemo = from_openrouter(LISTING)
     assert kokoro.surfaces == ["speech"] and kokoro.voices == ["af_heart", "af_bella"]
+    # OpenRouter names no voices: its ids are the names.
+    assert kokoro.voiceNames is None
     assert kokoro.capabilities is not None
     assert [f.value for f in kokoro.capabilities.speechFormats] == ["mp3", "pcm", "wav"]
     assert nemo.capabilities is not None and not nemo.capabilities.speechFormats
@@ -264,7 +266,26 @@ def test_an_elevenlabs_account_lists_its_speech_models_and_voices(tmp_path: Path
     assert [m["id"] for m in info["models"]] == ["eleven_flash_v2_5"]
     model = info["models"][0]
     assert model["surfaces"] == ["speech"] and model["voices"] == [VOICE]
+    # ElevenLabs' ids say nothing; its own name rides beside each one.
+    assert model["voiceNames"] == {VOICE: "Rachel"}
     assert model["capabilities"]["speechFormats"] == ["mp3", "opus", "pcm", "wav"]
+
+
+@respx.mock
+def test_an_elevenlabs_voice_without_a_name_is_listed_by_its_id_alone(tmp_path: Path) -> None:
+    listed = {
+        "voices": [
+            {"voice_id": VOICE, "name": " Rachel "},
+            {"voice_id": "cl0n3d", "name": ""},
+            {"voice_id": "n0name"},
+            {"name": "no id"},
+        ]
+    }
+    client, _ = _eleven(tmp_path, voices=httpx.Response(200, json=listed))
+    with client:
+        model = _ready(client)["models"][0]
+    assert model["voices"] == [VOICE, "cl0n3d", "n0name"]
+    assert model["voiceNames"] == {VOICE: "Rachel"}
 
 
 @respx.mock

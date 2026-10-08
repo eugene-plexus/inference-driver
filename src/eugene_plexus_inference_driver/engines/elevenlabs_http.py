@@ -282,7 +282,7 @@ class ElevenLabsHttpEngine:
             listed = response.json()
         except ValueError as e:
             raise CatalogueError("ElevenLabs' model list was not JSON") from e
-        voices = await self._voices()
+        voices, voice_names = await self._voices()
         models: list[DriverModel] = []
         for entry in listed if isinstance(listed, list) else []:
             if not isinstance(entry, dict) or not isinstance(entry.get("model_id"), str):
@@ -295,6 +295,7 @@ class ElevenLabsHttpEngine:
                     name=entry.get("name") if isinstance(entry.get("name"), str) else None,
                     surfaces=["speech"],
                     voices=voices,
+                    voiceNames=voice_names or None,
                     capabilities=Capabilities(
                         supportedSettings=[],
                         speechFormats=list(ELEVENLABS_FORMATS),
@@ -371,16 +372,17 @@ class ElevenLabsHttpEngine:
         self._transcription_note = reason
         return []
 
-    async def _voices(self) -> list[str] | None:
-        """The account's voice ids, or None when the key cannot list them.
-        None is not "no voices": any id is passed through (P3-3)."""
+    async def _voices(self) -> tuple[list[str] | None, dict[str, str]]:
+        """The account's voice ids, or None when the key cannot list them,
+        and the name ElevenLabs gives each (its ids say nothing). None is
+        not "no voices": any id is passed through (P3-3)."""
         try:
             response = await self._client().get(
                 "/v1/voices", headers=self._headers(), timeout=_LIST_TIMEOUT
             )
         except httpx.HTTPError as e:
             log.info("ElevenLabs voices could not be read (%s); voices pass through", e)
-            return None
+            return None, {}
         if response.status_code >= 400:
             if not self._voices_note_logged:
                 self._voices_note_logged = True
@@ -390,12 +392,23 @@ class ElevenLabsHttpEngine:
                     response.status_code,
                     upstream_words(response),
                 )
-            return None
+            return None, {}
         try:
             listed = response.json().get("voices")
         except (ValueError, AttributeError):
-            return None
-        return [v["voice_id"] for v in listed or [] if isinstance(v, dict) and v.get("voice_id")]
+            return None, {}
+        ids: list[str] = []
+        names: dict[str, str] = {}
+        for voice in listed or []:
+            if not isinstance(voice, dict) or not isinstance(voice.get("voice_id"), str):
+                continue
+            if not voice["voice_id"]:
+                continue
+            ids.append(voice["voice_id"])
+            name = voice.get("name")
+            if isinstance(name, str) and name.strip():
+                names[voice["voice_id"]] = name.strip()
+        return ids, names
 
     async def list_models(self) -> list[str]:
         return [m.id for m in self.catalogue.exposed()]
