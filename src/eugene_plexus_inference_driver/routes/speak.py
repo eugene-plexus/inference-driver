@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -60,7 +60,9 @@ async def speak(request: Request, body: SpeakRequest) -> StreamingResponse:
             "speech-unsupported",
         )
     enforce(engine, body.localOnly)
-    fmt = body.format or SpeechFormat.mp3
+    fmt: SpeechFormat = body.format or cast(
+        SpeechFormat, getattr(engine, "default_speech_format", SpeechFormat.mp3)
+    )
     chunks = speaker(body)
     try:
         first = await serve_while_connected(request, anext(chunks), what="speech")

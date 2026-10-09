@@ -21,6 +21,8 @@ from ._generated.models import BackendKind, ConfigField
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
 from .engines.elevenlabs_http import ElevenLabsHttpEngine
+from .engines.gemini_api import DEFAULT_BASE_URL as GEMINI_BASE_URL
+from .engines.gemini_api import GeminiApiEngine
 from .engines.openai_compat_http import (
     OPENAI_FIXED_TEMPERATURE_PATTERN,
     OpenAiCompatibleHttpEngine,
@@ -291,6 +293,15 @@ PROVIDERS: dict[str, Provider] = {
         engine_class=ElevenLabsHttpEngine,
         engine_kwargs={
             "default_base_url": "https://api.elevenlabs.io",
+            "auth_required": True,
+        },
+    ),
+    "gemini": Provider(
+        key="gemini",
+        label="Google Gemini API",
+        engine_class=GeminiApiEngine,
+        engine_kwargs={
+            "default_base_url": GEMINI_BASE_URL,
             "auth_required": True,
         },
     ),

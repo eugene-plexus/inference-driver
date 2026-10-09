@@ -41,6 +41,7 @@ from .engines.base import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .engines.claude_code_cli import ClaudeCodeCliEngine
 from .engines.codex_cli import CodexCliEngine
 from .engines.elevenlabs_http import ElevenLabsHttpEngine
+from .engines.gemini_api import GeminiApiEngine
 from .engines.openai_compat_http import OpenAiCompatibleHttpEngine
 from .engines.systemone_http import SystemOneHttpEngine
 from .providers import PROVIDERS, collect_extra_field_specs, providers_using
@@ -280,6 +281,7 @@ def _build_fields() -> list[ConfigField]:
         OpenAiCompatibleHttpEngine,
         SystemOneHttpEngine,
         ElevenLabsHttpEngine,
+        GeminiApiEngine,
     ):
         if engine_cls in seen:
             continue
@@ -310,18 +312,28 @@ def _read_by() -> dict[str, list[str] | None]:
     and `apiKey` was hidden for TypeSafe, which refuses to run without one.
     `None` means every provider. A key not listed keeps its own condition.
     """
-    http = _providers(OpenAiCompatibleHttpEngine, ElevenLabsHttpEngine, SystemOneHttpEngine)
+    http = _providers(
+        OpenAiCompatibleHttpEngine, ElevenLabsHttpEngine, SystemOneHttpEngine, GeminiApiEngine
+    )
     follows_runtimes = _providers(OpenAiCompatibleHttpEngine, SystemOneHttpEngine)
     everything_but_speech = [p for p in PROVIDERS if p not in providers_using(ElevenLabsHttpEngine)]
+    no_upstream_name = [
+        p for p in everything_but_speech if p not in providers_using(GeminiApiEngine)
+    ]
     thinks = _providers(ClaudeCodeCliEngine, CodexCliEngine, OpenAiCompatibleHttpEngine)
     return {
         "baseUrl": http,
         "runtimeName": follows_runtimes,
         "apiKey": http,
-        "catalogueRefreshMinutes": _providers(OpenAiCompatibleHttpEngine, ElevenLabsHttpEngine),
+        "catalogueRefreshMinutes": _providers(
+            OpenAiCompatibleHttpEngine, ElevenLabsHttpEngine, GeminiApiEngine
+        ),
+        # Gemini reads the same stall clock for its streams.
+        "streamStallSeconds": _providers(OpenAiCompatibleHttpEngine, GeminiApiEngine),
         # ElevenLabs reads neither: it serves the voices its account lists.
         "modelId": everything_but_speech,
-        "upstreamModelId": everything_but_speech,
+        # Gemini serves a model by the id Google lists: there is no split.
+        "upstreamModelId": no_upstream_name,
         "thinkingMode": thinks,
         # Honoured only for a backend that could be either; every other
         # provider is external (or, fronting a runtime here, local) whatever
@@ -367,6 +379,7 @@ _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 _KEY_ENV: dict[Any, str] = {
     OpenAiCompatibleHttpEngine: "OPENAI_API_KEY",
     ElevenLabsHttpEngine: "ELEVENLABS_API_KEY",
+    GeminiApiEngine: "GEMINI_API_KEY",
 }
 #: Handed to a companion driver by the agent that declared it, naming the
 #: keys that agent rewrites (settings never lie, 2026-09-30).
