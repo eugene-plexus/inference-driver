@@ -846,7 +846,8 @@ class GeminiApiEngine:
                     f"seconds: Veo makes {', '.join(str(s) for s in allowed)} second videos, "
                     f"not {request.seconds}"
                 )
-            parameters["durationSeconds"] = str(request.seconds)
+            # A number: Google refuses a string (measured live, 2026-10-09).
+            parameters["durationSeconds"] = request.seconds
         if resolution in ("1080p", "4k") and request.seconds not in (None, 8):
             raise VideoRefusal(
                 f"seconds: Veo makes {resolution} only at 8 seconds, not {request.seconds}"

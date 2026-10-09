@@ -1205,7 +1205,7 @@ def test_a_video_job_runs_through_its_states(tmp_path: Path) -> None:
     assert sent["parameters"] == {
         "aspectRatio": "16:9",
         "resolution": "1080p",
-        "durationSeconds": "8",
+        "durationSeconds": 8,
     }
     assert running["status"] == "in_progress" and done["status"] == "completed"
     assert content.status_code == 200 and content.content == MP4
@@ -1376,8 +1376,11 @@ def test_speech_gemini_cannot_make_is_refused(
 @respx.mock
 def test_transcription_sends_the_audio_inline_with_an_instruction(tmp_path: Path) -> None:
     client = _start(tmp_path)
+    # The transcription model's own part, as Google sent it live (2026-10-09).
     route = respx.post(f"{BASE}/models/gemini-3.5-transcribe:generateContent").mock(
-        return_value=httpx.Response(200, json=_answer([{"text": " The quick brown fox. "}]))
+        return_value=httpx.Response(
+            200, json=_answer([{"audioTranscription": {"text": " The quick brown fox. "}}])
+        )
     )
     chat_route = respx.post(GENERATE).mock(
         return_value=httpx.Response(200, json=_answer([{"text": "hello"}]))

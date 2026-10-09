@@ -629,6 +629,12 @@ def read_parts(parts: Any, cache: SignatureCache, *, remember: bool = True) -> P
                     ),
                 )
             continue
+        # Gemini's transcription models answer in a part of their own, not
+        # `text` (measured live, gemini-3.5-transcribe, 2026-10-09).
+        heard = part.get("audioTranscription")
+        if isinstance(heard, dict) and isinstance(heard.get("text"), str):
+            out.text += heard["text"]
+            continue
         inline = part.get("inlineData")
         if isinstance(inline, dict) and inline.get("data"):
             mime = str(inline.get("mimeType") or "")
