@@ -209,6 +209,12 @@ _CONTEXT_PROBE_TIMEOUT = httpx.Timeout(_CONTEXT_PROBE_BUDGET_SECONDS, connect=2.
 # comment for a signal that only needs to say "still there".
 _KEEPALIVE_PROGRESS_SECONDS = 2.0
 
+# The fewest seconds between two `generating` progress frames. llama.cpp
+# puts its running count on every token's frame (`timings_per_token`);
+# forwarding each would double the stream for a number a person reads
+# twice a second at most.
+_GENERATING_PROGRESS_SECONDS = 0.5
+
 # The answers that mean "this server has no such endpoint", as opposed to
 # "not now". Only these settle that a backend is not `llama-server`.
 _NO_SUCH_PATH = frozenset({404, 405, 410, 501})
@@ -506,6 +512,31 @@ def _sse_data(line: str) -> str | None:
     if not line.startswith("data:"):
         return None
     return line[5:].strip()
+
+
+def _generating_progress(timings: Any) -> StreamProgress | None:
+    """llama.cpp's running count of tokens written, or None.
+
+    `timings_per_token: true` puts `timings` on every frame; measured on
+    b10948, `predicted_n` rises token by token and ends equal to the
+    usage's `completion_tokens`. A frame before the first token (0) says
+    nothing yet, and is not reported.
+    """
+    if not isinstance(timings, dict):
+        return None
+    written = timings.get("predicted_n")
+    if not isinstance(written, int) or isinstance(written, bool) or written <= 0:
+        return None
+    speed = timings.get("predicted_per_second")
+    return StreamProgress(
+        stage=Stage.generating,
+        generatedTokens=written,
+        tokensPerSecond=(
+            round(float(speed), 1)
+            if isinstance(speed, int | float) and not isinstance(speed, bool) and speed > 0
+            else None
+        ),
+    )
 
 
 def _prompt_progress(read: dict[str, Any]) -> StreamProgress | None:
@@ -1770,7 +1801,12 @@ class OpenAiCompatibleHttpEngine:
             # per batch it reads. Measured on b11215: without it, 21 s of
             # prompt reading on the processor produced no frame at all.
             payload["return_progress"] = True
+            # And its running count while it writes, so a caller can say
+            # how far a long reasoning has got (2026-10-10).
+            payload["timings_per_token"] = True
         last_keepalive = 0.0
+        last_generating = 0.0
+        generated = 0
 
         started = time.perf_counter()
         filtered = ThinkingFilter() if self._thinking_mode == "off" else None
@@ -1936,6 +1972,17 @@ class OpenAiCompatibleHttpEngine:
                                 yield Chunk(progress=progress)
                     else:
                         saw_first_data = True
+                        if report and isinstance(event, dict):
+                            writing = _generating_progress(event.get("timings"))
+                            now = time.perf_counter()
+                            if (
+                                writing is not None
+                                and (writing.generatedTokens or 0) > generated
+                                and now - last_generating >= _GENERATING_PROGRESS_SECONDS
+                            ):
+                                last_generating = now
+                                generated = writing.generatedTokens or 0
+                                yield Chunk(progress=writing)
                     served_model = self._public_model_id(event.get("model") or served_model, target)
                     if event.get("usage"):
                         usage_payload = event["usage"]

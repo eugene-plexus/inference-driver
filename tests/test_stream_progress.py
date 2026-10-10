@@ -56,6 +56,9 @@ from eugene_plexus_inference_driver.engines.openai_compat_http import OpenAiComp
 FIXTURES = Path(__file__).parent / "fixtures"
 BASE = "http://127.0.0.1:9181"
 LLAMA_SSE = "llamacpp_b11215_return_progress.sse"
+# The real llama-server b10948 with `timings_per_token` and `return_progress`
+# (Qwen3 1.7B, 40 tokens), its model path replaced (2026-10-10).
+LLAMA_TIMINGS_SSE = "llamacpp_b10948_timings_per_token.sse"
 CLAUDE_JSONL = "claude_code_2_1_stream_tool_use.jsonl"
 
 
@@ -160,7 +163,7 @@ async def test_unasked_the_flag_is_not_sent() -> None:
     props = _props_llama()
     chat = respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_SSE))
     await _drain(_engine(), _ask(report=False))
-    assert "return_progress" not in _sent(chat)
+    assert not {"return_progress", "timings_per_token"} & _sent(chat).keys()
     assert not props.called
 
 
@@ -177,7 +180,7 @@ async def test_a_hosted_api_is_never_sent_the_flag_but_still_says_it_has_the_req
     )
     chunks = await _drain(_engine(), _ask())
 
-    assert "return_progress" not in _sent(chat)
+    assert not {"return_progress", "timings_per_token"} & _sent(chat).keys()
     assert [p.stage for p in _progress(chunks)] == [Stage.working]
     assert chunks[0].progress is not None  # before anything else
 
@@ -189,6 +192,70 @@ async def test_a_backend_that_cannot_be_asked_is_not_sent_the_flag() -> None:
     chat = respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_SSE))
     await _drain(_engine(), _ask())
     assert "return_progress" not in _sent(chat)
+
+
+# --------------------------------------------------------------------------- #
+# llama.cpp: how far it has written, from the capture (2026-10-10)
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+async def test_llamacpp_is_asked_for_its_running_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every frame's count, unthrottled: it rises, and the last one is the
+    # usage's own count. Troy, 2026-10-10: Workbench said "Waiting for the
+    # model" through minutes of reasoning.
+    from eugene_plexus_inference_driver.engines import openai_compat_http
+
+    monkeypatch.setattr(openai_compat_http, "_GENERATING_PROGRESS_SECONDS", 0.0)
+    _props_llama()
+    chat = respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_TIMINGS_SSE))
+    chunks = await _drain(_engine(), _ask())
+
+    assert _sent(chat)["timings_per_token"] is True
+    writing = [p for p in _progress(chunks) if p.stage == Stage.generating]
+    counts = [p.generatedTokens for p in writing]
+    assert counts and counts == sorted(set(counts))
+    done = chunks[-1].result
+    assert done is not None and done.usage is not None
+    assert counts[-1] == done.usage.completionTokens == 40
+    assert writing[-1].tokensPerSecond is not None and writing[-1].tokensPerSecond > 0
+    # Writing comes after reading: no count before the prompt is read.
+    first_count = next(
+        i for i, c in enumerate(chunks) if c.progress and c.progress.stage == "generating"
+    )
+    last_read = max(i for i, c in enumerate(chunks) if c.progress and c.progress.stage == "prompt")
+    assert last_read < first_count
+
+
+@respx.mock
+async def test_the_running_count_is_said_at_most_twice_a_second() -> None:
+    # The capture arrives at once, so the throttle lets one count through.
+    _props_llama()
+    respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_TIMINGS_SSE))
+    chunks = await _drain(_engine(), _ask())
+    assert [p.generatedTokens for p in _progress(chunks) if p.stage == Stage.generating] == [1]
+
+
+@respx.mock
+async def test_the_answer_is_the_same_with_or_without_the_running_count() -> None:
+    _props_llama()
+    respx.post(f"{BASE}/v1/chat/completions").mock(return_value=_sse(LLAMA_TIMINGS_SSE))
+    asked = await _drain(_engine(), _ask(report=True))
+    plain = await _drain(_engine(), _ask(report=False))
+    assert "".join(c.reasoning for c in asked) == "".join(c.reasoning for c in plain)
+    assert "".join(c.text for c in asked) == "".join(c.text for c in plain)
+    assert "".join(c.reasoning for c in asked)
+    assert _progress(plain) == []
+
+
+def test_a_frame_without_a_count_says_nothing() -> None:
+    from eugene_plexus_inference_driver.engines.openai_compat_http import _generating_progress
+
+    assert _generating_progress(None) is None
+    assert _generating_progress({"predicted_n": 0, "predicted_per_second": 0.0}) is None
+    assert _generating_progress({"predicted_n": True}) is None
+    said = _generating_progress({"predicted_n": 12, "predicted_per_second": 0.0})
+    assert said is not None and said.generatedTokens == 12 and said.tokensPerSecond is None
 
 
 @respx.mock
