@@ -106,6 +106,9 @@ async def info(request: Request, models: bool = True, model: str | None = None) 
         # Degraded: the configured intent, so a driver that failed to
         # resolve its runtime still says which one it was meant to front.
         runtime=runtime,
+        # And why it serves nothing, which the gateway shows as its error
+        # (2026-10-10: every Strata driver read only "no model reported").
+        degraded=getattr(request.app.state, "adapter_error", None) or "its engine was not built",
         version=__version__,
     )
 

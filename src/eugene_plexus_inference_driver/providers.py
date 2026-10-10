@@ -142,6 +142,11 @@ PROVIDERS: dict[str, Provider] = {
         label="Strata (experimental)",
         engine_class=StrataHttpEngine,
         engine_kwargs={
+            # No default: a Strata driver fronts the runtime it is named
+            # for (`runtimeName`), or a `baseUrl`. Missing, every Strata
+            # driver came up degraded and nothing reached Strata through
+            # the gateway (2026-10-10, Troy's live install).
+            "default_base_url": None,
             "backend_kind": BackendKind.openai_compat_http,
             "dialect": "compatible",
             "auth_required": False,

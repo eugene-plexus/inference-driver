@@ -76,3 +76,23 @@ def test_optional_probes_cannot_block_local_policy_confirmation(
         assert recovered["capabilities"]["imageInput"] is True
         assert recovered["capabilities"]["maxContextTokens"] == 16384
         assert recovered["surfaces"] == ["embeddings"]
+
+
+def test_a_degraded_driver_says_why_it_serves_nothing(tmp_path) -> None:
+    """2026-10-10: every Strata driver came up degraded and the gateway,
+    reading only `/v1/info`, showed "no model reported" with no reason."""
+    from eugene_plexus_inference_driver.app import create_app
+    from eugene_plexus_inference_driver.settings import Settings
+
+    config = tmp_path / "config.yaml"
+    config.write_text("provider: openai_compat_custom\n", encoding="utf-8")
+    with TestClient(create_app(settings=Settings(config_file=config))) as degraded:
+        body = degraded.get("/v1/info").json()
+        health = degraded.get("/healthz").json()
+    assert body["models"] == []
+    assert "has no backend" in body["degraded"]
+    assert body["degraded"] == health["details"]["adapter_error"]
+
+
+def test_a_working_driver_is_not_degraded(client: TestClient) -> None:
+    assert "degraded" not in client.get("/v1/info").json()
