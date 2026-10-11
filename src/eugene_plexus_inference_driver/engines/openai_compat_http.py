@@ -219,6 +219,19 @@ _GENERATING_PROGRESS_SECONDS = 0.5
 # "not now". Only these settle that a backend is not `llama-server`.
 _NO_SUCH_PATH = frozenset({404, 405, 410, 501})
 
+# How long the "do you rerank" probe may take. A rerank of one short passage is
+# milliseconds on a server that does it, and a server that does not answers at
+# once, so this is for a backend that is up and slow, not one that is working.
+_RERANK_PROBE_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+
+# The answers that mean "not now", which say nothing about what the backend
+# can do. `llama-server` answers 503 ("Loading model") until its model is in
+# memory, and the agent starts a runtime's driver beside the engine and not
+# after it, so the driver's first look at the backend usually lands in that
+# window: measured 2026-10-11 (MR3), an embedding model that took a few
+# seconds to load was listed as chat for the driver's whole life.
+_NOT_NOW = frozenset({408, 425, 429, 502, 503, 504})
+
 
 def _only_or_named(
     entries: list[dict[str, Any]], model_id: str, *, keys: tuple[str, ...]
@@ -792,6 +805,10 @@ class OpenAiCompatibleHttpEngine:
         #: lifetime: it cannot change without the backend restarting,
         #: and the engine is rebuilt on every config change.
         self._embeddings: bool | None = None
+        #: Whether the backend reranks. Determined by trying, once, like
+        #: the above; asked first, because asking a reranker to embed is
+        #: not safe (see `probe_rerank`).
+        self._rerank: bool | None = None
         #: Whether the backend answered as `llama-server`, the one backend
         #: that says how far it has read a prompt. Learned from `/props`
         #: by the context probe (or on the first stream that asks), and
@@ -3066,6 +3083,55 @@ class OpenAiCompatibleHttpEngine:
             raise CliError("openai_compat_http /tokenize returned no tokens")
         return len(tokens)
 
+    async def probe_rerank(self) -> bool | None:
+        """Whether this backend reranks, determined by asking it to.
+
+        True when a one-passage rerank is answered with scores; False when
+        the backend refuses (no such endpoint, `llama-server`'s 501 "start
+        it with `--reranking`"): a definite no, kept for the engine's life;
+        None when it cannot say yet (a model still loading, a transport
+        failure), which is not kept.
+
+        **Asked before `probe_embeddings` asks anything, because that
+        question is not safe to put to a reranker.** `llama-server` started
+        with `--reranking` answers `/v1/embeddings` with numbers it never
+        computed, and has died answering it, on the first request it was
+        sent (MR3, measured 2026-10-11: an access violation, 3 starts in 30
+        on b11429, 1 in 30 on b11552, none in 30 on b10948). The embeddings
+        probe is repeated at every poll until it has an answer, and a
+        reranker's never was one, so a reranker the driver kept probing
+        died within minutes. The same question is the cheap one to ask a
+        server that does not rerank: `llama-server` refuses it at once,
+        before any compute.
+        """
+        if self._rerank is not None:
+            return self._rerank
+        try:
+            target = self.resolve_model(None)
+            response = await self._client().post(
+                "/v1/rerank",
+                headers=self._headers(),
+                json={"model": target.upstream, "query": "1", "documents": ["1"]},
+                timeout=_RERANK_PROBE_TIMEOUT,
+            )
+        except (httpx.HTTPError, ModelNotServed, ModelRequired) as e:
+            log.debug("rerank probe inconclusive: %s", e)
+            return None
+        if response.status_code in _NOT_NOW:
+            log.debug("rerank probe inconclusive (HTTP %s, not now)", response.status_code)
+            return None
+        answer = False
+        if response.status_code == 200:
+            try:
+                results = response.json().get("results")
+            except (ValueError, AttributeError):
+                results = None
+            answer = isinstance(results, list) and bool(results)
+        if answer:
+            log.info("backend at %s reranks", self._base_url)
+        self._rerank = answer
+        return answer
+
     async def probe_embeddings(self) -> bool:
         """Whether this backend will embed, determined by asking it to.
 
@@ -3086,16 +3152,29 @@ class OpenAiCompatibleHttpEngine:
         Cached for the engine's lifetime once there is a definite
         answer. A transport failure is **not** a definite answer and is
         not cached, or a backend that happened to be down at startup
-        would be recorded as incapable forever.
+        would be recorded as incapable forever. **Nor is "not now"**
+        (`_NOT_NOW`: a model still loading answers 503): it is asked
+        again at the next poll, once the engine can say.
         """
         if self._embeddings is not None:
             return self._embeddings
+        reranks = await self.probe_rerank()
+        if reranks is None:
+            # Not known yet, and the next question is not safe to ask until it is.
+            return False
+        if reranks:
+            log.info("backend at %s reranks, so it is not asked to embed", self._base_url)
+            self._embeddings = False
+            return False
         try:
             await self.embed(["1"])
         except CliError as e:
             status = getattr(e, "upstream_status", None)
             if status is None:
                 log.debug("embeddings probe inconclusive (transport): %s", e)
+                return False
+            if status in _NOT_NOW:
+                log.debug("embeddings probe inconclusive (HTTP %s, not now): %s", status, e)
                 return False
             # A definite "no" from the backend. 4xx and 5xx both count:
             # a server that errors on a one-character embed is not one

@@ -52,6 +52,33 @@ def _envelope(vectors: list[list[float]], *, indices: list[int] | None = None) -
     }
 
 
+def _no_rerank() -> respx.Route:
+    """What `llama-server` started without `--reranking` answers, verbatim: at once, 501."""
+    return respx.post(f"{BASE}/v1/rerank").mock(
+        return_value=httpx.Response(
+            501,
+            json={
+                "error": {
+                    "code": 501,
+                    "message": "This server does not support reranking. "
+                    "Start it with `--reranking`",
+                    "type": "not_supported_error",
+                }
+            },
+        )
+    )
+
+
+def _rerank_scores() -> dict:
+    """What `llama-server --reranking` answers a one-passage rerank."""
+    return {
+        "model": "m",
+        "object": "list",
+        "usage": {"prompt_tokens": 83, "total_tokens": 83},
+        "results": [{"index": 0, "relevance_score": 0.46}],
+    }
+
+
 # --------------------------------------------------------------------- #
 # embedding
 # --------------------------------------------------------------------- #
@@ -139,6 +166,7 @@ async def test_a_base64_answer_to_a_float_request_is_refused() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_a_backend_that_embeds_is_detected_by_trying() -> None:
+    _no_rerank()
     route = respx.post(f"{BASE}/v1/embeddings").mock(
         return_value=httpx.Response(200, json=_envelope([[0.5] * 4]))
     )
@@ -154,6 +182,7 @@ async def test_a_backend_that_embeds_is_detected_by_trying() -> None:
 async def test_a_chat_only_backend_says_no() -> None:
     """Ollama's real refusal, verbatim: the runner was started for chat,
     so the very model it is serving cannot be embedded."""
+    _no_rerank()
     respx.post(f"{BASE}/v1/embeddings").mock(
         return_value=httpx.Response(
             400,
@@ -176,12 +205,169 @@ async def test_a_backend_that_is_down_is_not_recorded_as_incapable() -> None:
     """A transport failure is not a definite answer. Caching it would
     mark a backend that happened to be restarting as permanently unable
     to embed, for the life of the driver process."""
+    _no_rerank()
     route = respx.post(f"{BASE}/v1/embeddings").mock(side_effect=httpx.ConnectError("refused"))
     engine = _engine()
 
     assert await engine.probe_embeddings() is False
     route.mock(return_value=httpx.Response(200, json=_envelope([[0.5] * 4])))
     assert await engine.probe_embeddings() is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("status", [503, 429, 502, 504, 408])
+async def test_a_backend_that_says_not_now_is_not_recorded_as_incapable(status: int) -> None:
+    """`llama-server` answers 503 ("Loading model") until its model is in
+    memory, and the agent starts a runtime's driver beside the engine, so
+    the first probe lands in that window (MR3, measured 2026-10-11: an
+    embedding model that took a few seconds to load was listed as chat for
+    the driver's whole life). A "not now" says nothing of what the backend
+    can do, so it is asked again, and the answer once it can say is the one
+    that is kept."""
+    _no_rerank()
+    route = respx.post(f"{BASE}/v1/embeddings").mock(
+        return_value=httpx.Response(
+            status,
+            json={
+                "error": {"code": status, "message": "Loading model", "type": "unavailable_error"}
+            },
+        )
+    )
+    engine = _engine()
+
+    assert await engine.probe_embeddings() is False
+    assert await engine.probe_embeddings() is False
+    route.mock(return_value=httpx.Response(200, json=_envelope([[0.5] * 4])))
+    assert await engine.probe_embeddings() is True
+    assert await engine.probe_embeddings() is True
+    assert route.call_count == 3, "asked while it could not answer, then once it could"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_llama_servers_own_refusal_is_a_definite_no_and_stays_cached() -> None:
+    """A model started without `--embeddings` answers 501 and always will:
+    the answer the cache exists for. `not now` must not have loosened it."""
+    _no_rerank()
+    route = respx.post(f"{BASE}/v1/embeddings").mock(
+        return_value=httpx.Response(
+            501,
+            json={
+                "error": {
+                    "code": 501,
+                    "message": "This server does not support embeddings. "
+                    "Start it with `--embeddings`",
+                    "type": "not_supported_error",
+                }
+            },
+        )
+    )
+    engine = _engine()
+
+    assert await engine.probe_embeddings() is False
+    route.mock(return_value=httpx.Response(200, json=_envelope([[0.5] * 4])))
+    assert await engine.probe_embeddings() is False
+    assert route.call_count == 1, "a definite no is cached"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_reranker_is_never_asked_to_embed() -> None:
+    """`llama-server --reranking` answers `/v1/embeddings` with numbers it never
+    computed and has died answering it, on the first request it was sent (MR3,
+    measured 2026-10-11: an access violation, 3 starts in 30 on b11429, 1 in 30
+    on b11552). The embeddings probe is repeated at every poll until it has an
+    answer, so a reranker has to be recognised before it is asked."""
+    rerank = respx.post(f"{BASE}/v1/rerank").mock(
+        return_value=httpx.Response(200, json=_rerank_scores())
+    )
+    embed = respx.post(f"{BASE}/v1/embeddings").mock(
+        return_value=httpx.Response(200, json=_envelope([[0.0] * 4]))
+    )
+    engine = _engine()
+
+    assert await engine.probe_embeddings() is False
+    assert await engine.probe_embeddings() is False
+    assert embed.call_count == 0, "nothing was sent to a reranker that it could die of"
+    assert rerank.call_count == 1, "and it was asked once, not at every poll"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_backend_that_cannot_say_whether_it_reranks_is_not_asked_to_embed_yet() -> None:
+    """Loading (503) is not an answer to "do you rerank", and the next question
+    is not safe to ask until there is one."""
+    rerank = respx.post(f"{BASE}/v1/rerank").mock(
+        return_value=httpx.Response(
+            503,
+            json={"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}},
+        )
+    )
+    embed = respx.post(f"{BASE}/v1/embeddings").mock(
+        return_value=httpx.Response(200, json=_envelope([[0.5] * 4]))
+    )
+    engine = _engine()
+
+    assert await engine.probe_embeddings() is False
+    assert await engine.probe_embeddings() is False
+    assert embed.call_count == 0
+    assert rerank.call_count == 2, "asked again at each poll until it can say"
+
+    _no_rerank()
+    assert await engine.probe_embeddings() is True
+    assert embed.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_backend_that_is_down_is_not_asked_to_embed_either() -> None:
+    respx.post(f"{BASE}/v1/rerank").mock(side_effect=httpx.ConnectError("refused"))
+    embed = respx.post(f"{BASE}/v1/embeddings").mock(
+        return_value=httpx.Response(200, json=_envelope([[0.5] * 4]))
+    )
+    engine = _engine()
+
+    assert await engine.probe_rerank() is None
+    assert await engine.probe_embeddings() is False
+    assert embed.call_count == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_refusal_to_rerank_is_a_definite_no_and_is_kept() -> None:
+    route = _no_rerank()
+    engine = _engine()
+
+    assert await engine.probe_rerank() is False
+    route.mock(return_value=httpx.Response(200, json=_rerank_scores()))
+    assert await engine.probe_rerank() is False
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("answer", [{"detail": "ok"}, {"results": []}, ["not", "an", "object"]])
+async def test_a_rerank_answered_without_scores_is_not_a_reranker(answer: object) -> None:
+    """A server that says 200 to anything is not told apart from one that reranks by
+    its status; the scores are what say it does."""
+    respx.post(f"{BASE}/v1/rerank").mock(return_value=httpx.Response(200, json=answer))
+
+    assert await _engine().probe_rerank() is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_backend_with_no_such_endpoint_goes_on_to_the_embeddings_probe() -> None:
+    """Ollama and the hosted APIs have no `/v1/rerank`: a definite no, and the
+    embeddings probe is asked as it always was."""
+    respx.post(f"{BASE}/v1/rerank").mock(return_value=httpx.Response(404, json={"error": "no"}))
+    embed = respx.post(f"{BASE}/v1/embeddings").mock(
+        return_value=httpx.Response(200, json=_envelope([[0.5] * 4]))
+    )
+
+    assert await _engine().probe_embeddings() is True
+    assert embed.call_count == 1
 
 
 @pytest.mark.asyncio
