@@ -7,7 +7,14 @@ Strata v0.1.39 (`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint;
 two at once, streamed, and the round trip with the tool's result) and answers
 `response_format` natively. What it does not do is read `tool_choice`: `none`
 still called the tool, `required` answered "Hello!", and a named function called
-another one. And `response_format` together with tools is its own 400.
+another one. Nor `parallel_tool_calls: false`: with a question that wants two
+calls, the field absent, `true` and `false` all answered both (measured again on
+2026-10-12, six runs). And `response_format` together with tools is its own 400.
+
+What it does not honour is **sent anyway and named**, not refused: Codex sends
+`parallel_tool_calls: false` on every request, so a refusal made Strata unusable
+from it. Named twice, on purpose: `capabilities.settingsNotHonoured` (static, so
+the gateway can name it before a stream opens) and the per-request header.
 
 The backend here is `respx`, answering in the shapes Strata sent, trimmed to
 the fields the driver reads. Each test fails against the driver as it was:
@@ -16,6 +23,8 @@ every one of them was a 400 from the driver before any HTTP went out.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -24,6 +33,7 @@ import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from eugene_plexus_inference_driver._generated.models import (
     FinishReason,
@@ -39,6 +49,7 @@ from eugene_plexus_inference_driver.app import create_app
 from eugene_plexus_inference_driver.engines._subprocess import CliError
 from eugene_plexus_inference_driver.engines.strata_http import StrataHttpEngine
 from eugene_plexus_inference_driver.settings import Settings
+from tests.test_attachments import audio_part, file_part
 from tests.test_generate_route import _events
 
 BASE = "http://strata.local"
@@ -217,9 +228,29 @@ def test_strata_reports_tools_and_offers_the_settings_that_carry_them() -> None:
     engine = _engine()
     assert engine.supports_tool_calling is True
     offered = set(engine.supported_settings)
-    assert {"tools", "toolChoice", "responseFormat"} <= offered
+    # `parallelToolCalls` is offered although Strata ignores `false`: a measured gap is named,
+    # not refused, so the gateway does not route Codex (which sends it on every request) away.
+    assert {"tools", "toolChoice", "parallelToolCalls", "responseFormat"} <= offered
     # Not claimed: nothing has shown Strata honours them, so an explicit one is refused (A2).
-    assert not {"parallelToolCalls", "seed", "logprobs"} & offered
+    assert not {"seed", "logprobs"} & offered
+
+
+#: What the contract says Strata is sent and does not honour (specs 6178255): `toolChoice` with
+#: `required` and `function` (it honours `auto`; `none` is given as no tools), and
+#: `parallelToolCalls` with `false`.
+STRATA_GAPS = [
+    {"setting": "toolChoice", "values": ["required", "function"]},
+    {"setting": "parallelToolCalls", "values": [False]},
+]
+
+
+def test_strata_names_what_it_does_not_honour_by_value() -> None:
+    engine = _engine()
+    gaps = [g.model_dump(mode="json") for g in engine.settings_not_honoured()]
+    assert gaps == STRATA_GAPS
+    # A fresh list each time, so whoever holds one cannot change what the next is told.
+    engine.settings_not_honoured()[0].values.append("auto")
+    assert [g.model_dump(mode="json") for g in engine.settings_not_honoured()] == STRATA_GAPS
 
 
 @respx.mock
@@ -236,8 +267,12 @@ def test_info_says_toolcalling_true_for_a_strata_driver(tmp_path: Path) -> None:
     assert model["surfaces"] == ["chat"]
     caps = model["capabilities"]
     assert caps["toolCalling"] is True
-    assert {"tools", "toolChoice", "responseFormat"} <= set(caps["supportedSettings"])
+    assert {"tools", "toolChoice", "parallelToolCalls", "responseFormat"} <= set(
+        caps["supportedSettings"]
+    )
     assert caps["maxContextTokens"] == 131072
+    # Static, per backend: what the gateway names on its own header before a stream opens.
+    assert caps["settingsNotHonoured"] == STRATA_GAPS
 
 
 # --------------------------------------------------------------------------- #
@@ -375,7 +410,9 @@ async def test_the_round_trip_sends_the_result_back_and_gets_the_answer() -> Non
 @pytest.mark.anyio
 @pytest.mark.parametrize("stream", [False, True])
 async def test_tool_choice_none_sends_no_tools_and_no_tool_choice(stream: bool) -> None:
-    """Strata ignores `none` (measured: it called the tool), so nothing is left to ignore."""
+    """Strata ignores `none` (measured: it called the tool), so nothing is left to ignore.
+    What rides with the tools goes with them: `parallel_tool_calls: false` beside no tools
+    would be a setting sent for nothing, and named as ignored for nothing."""
     route = respx.post(CHAT).mock(
         return_value=httpx.Response(
             200,
@@ -385,7 +422,12 @@ async def test_tool_choice_none_sends_no_tools_and_no_tool_choice(stream: bool) 
         if stream
         else httpx.Response(200, json=_text_reply("Paris is rainy."))
     )
-    request = _ask(tools=[WEATHER], toolChoice="none", callerSettings=["tools", "toolChoice"])
+    request = _ask(
+        tools=[WEATHER],
+        toolChoice="none",
+        parallelToolCalls=False,
+        callerSettings=["tools", "toolChoice", "parallelToolCalls"],
+    )
     engine = _engine()
     try:
         if stream:
@@ -396,7 +438,7 @@ async def test_tool_choice_none_sends_no_tools_and_no_tool_choice(stream: bool) 
         await engine.aclose()
 
     sent = _sent(route)
-    assert "tools" not in sent and "tool_choice" not in sent
+    assert "tools" not in sent and "tool_choice" not in sent and "parallel_tool_calls" not in sent
     assert engine.ignored_settings(request) == [], "it was honoured, so there is nothing to name"
 
 
@@ -436,22 +478,47 @@ async def test_required_and_a_named_function_are_sent_as_strata_takes_them(
 
 
 @pytest.mark.parametrize(
-    ("choice", "named"),
+    ("choice", "parallel", "named"),
     [
-        (None, []),
-        ("auto", []),
-        ("none", []),
-        ("required", ["toolChoice"]),
-        (NAMED, ["toolChoice"]),
+        (None, None, []),
+        ("auto", None, []),
+        ("none", None, []),
+        ("required", None, ["toolChoice"]),
+        (NAMED, None, ["toolChoice"]),
+        (None, True, []),
+        (None, False, ["parallelToolCalls"]),
+        ("auto", True, []),
+        ("auto", False, ["parallelToolCalls"]),
+        ("required", False, ["toolChoice", "parallelToolCalls"]),
+        (NAMED, False, ["toolChoice", "parallelToolCalls"]),
+        # `none` is honoured as no tools, and `false` went with them: nothing was ignored.
+        ("none", False, []),
     ],
-    ids=["absent", "auto", "none", "required", "named"],
+    ids=[
+        "absent",
+        "auto",
+        "none",
+        "required",
+        "named",
+        "parallel-true",
+        "parallel-false",
+        "auto-parallel-true",
+        "auto-parallel-false",
+        "required-parallel-false",
+        "named-parallel-false",
+        "none-parallel-false",
+    ],
 )
-def test_only_a_tool_choice_strata_ignores_is_named(choice: Any, named: list[str]) -> None:
+def test_only_what_strata_ignores_is_named(
+    choice: Any, parallel: bool | None, named: list[str]
+) -> None:
     fields: dict[str, Any] = {"tools": [WEATHER, TIME]}
     if choice is not None:
         fields["toolChoice"] = (
             NamedToolChoice.model_validate(choice) if isinstance(choice, dict) else choice
         )
+    if parallel is not None:
+        fields["parallelToolCalls"] = parallel
     assert _engine().ignored_settings(_ask(**fields)) == named
 
 
@@ -463,18 +530,34 @@ def test_only_a_tool_choice_strata_ignores_is_named(choice: Any, named: list[str
 @respx.mock
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
-    ("choice", "header"),
+    ("choice", "parallel", "header"),
     [
-        ("required", "toolChoice"),
-        (NAMED, "toolChoice"),
-        ("auto", None),
-        ("none", None),
-        (None, None),
+        ("required", None, "toolChoice"),
+        (NAMED, None, "toolChoice"),
+        ("auto", None, None),
+        ("none", None, None),
+        (None, None, None),
+        (None, True, None),
+        (None, False, "parallelToolCalls"),
+        ("auto", False, "parallelToolCalls"),
+        ("required", False, "toolChoice, parallelToolCalls"),
+        ("none", False, None),
     ],
-    ids=["required", "named", "auto", "none", "absent"],
+    ids=[
+        "required",
+        "named",
+        "auto",
+        "none",
+        "absent",
+        "parallel-true",
+        "parallel-false",
+        "auto-parallel-false",
+        "required-parallel-false",
+        "none-parallel-false",
+    ],
 )
-def test_the_header_names_toolchoice_on_generate_and_on_the_stream(
-    tmp_path: Path, stream: bool, choice: Any, header: str | None
+def test_the_header_names_what_strata_ignores_on_generate_and_on_the_stream(
+    tmp_path: Path, stream: bool, choice: Any, parallel: bool | None, header: str | None
 ) -> None:
     respx.post(CHAT).mock(
         return_value=httpx.Response(
@@ -486,6 +569,8 @@ def test_the_header_names_toolchoice_on_generate_and_on_the_stream(
     fields: dict[str, Any] = {"tools": _tool_json(WEATHER, TIME)}
     if choice is not None:
         fields["toolChoice"] = choice
+    if parallel is not None:
+        fields["parallelToolCalls"] = parallel
     with _client(tmp_path) as client:
         response = client.post(
             "/v1/generate/stream" if stream else "/v1/generate", json=_body(**fields)
@@ -495,6 +580,75 @@ def test_the_header_names_toolchoice_on_generate_and_on_the_stream(
     if stream:
         # Known before the first frame: it is on the response that carries them.
         assert [name for name, _ in _events(response.text)][-1] == "done"
+
+
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("value", [False, True])
+def test_parallel_tool_calls_is_sent_to_strata_whichever_way_it_is_set(
+    tmp_path: Path, stream: bool, value: bool
+) -> None:
+    """Both values go on the wire (Strata honours `true` and ignores `false`; the driver says
+    so and does not decide for it), and an explicit one is not the 400 it was."""
+    route = respx.post(CHAT).mock(
+        return_value=httpx.Response(
+            200, text=_streamed_call(), headers={"content-type": "text/event-stream"}
+        )
+        if stream
+        else httpx.Response(200, json=_call_reply(("get_weather", '{"city":"Paris"}')))
+    )
+    body = _body(
+        tools=_tool_json(WEATHER),
+        parallelToolCalls=value,
+        callerSettings=["tools", "parallelToolCalls"],
+    )
+    with _client(tmp_path) as client:
+        response = client.post("/v1/generate/stream" if stream else "/v1/generate", json=body)
+    assert response.status_code == 200, response.text
+    assert _sent(route)["parallel_tool_calls"] is value
+    assert response.headers.get(HEADER) == (None if value else "parallelToolCalls")
+
+
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_codex_shaped_request_is_served_with_the_gaps_named(tmp_path: Path, stream: bool) -> None:
+    """Codex sends `parallel_tool_calls: false` and `tool_choice: auto` on every request, tools
+    or not, all of it explicit (`callerSettings`). Refusing either made Strata unusable from it
+    (found by the first build round's review); both go through, and the gap is named."""
+    route = respx.post(CHAT).mock(
+        return_value=httpx.Response(
+            200, text=_streamed_call(), headers={"content-type": "text/event-stream"}
+        )
+        if stream
+        else httpx.Response(200, json=_call_reply(("get_weather", '{"city":"Paris"}')))
+    )
+    body = _body(
+        tools=_tool_json(WEATHER, TIME),
+        toolChoice="auto",
+        parallelToolCalls=False,
+        callerSettings=["tools", "toolChoice", "parallelToolCalls"],
+    )
+    with _client(tmp_path) as client:
+        response = client.post("/v1/generate/stream" if stream else "/v1/generate", json=body)
+    assert response.status_code == 200, response.text
+    sent = _sent(route)
+    assert sent["tool_choice"] == "auto" and sent["parallel_tool_calls"] is False
+    assert response.headers[HEADER] == "parallelToolCalls"
+    if not stream:
+        assert response.json()["toolCalls"][0]["function"]["name"] == "get_weather"
+
+
+@respx.mock
+def test_parallel_false_with_no_tools_is_sent_and_named_and_not_refused(tmp_path: Path) -> None:
+    """Codex sends it on a turn with no tools too. Strata answered that with a 200
+    (measured, 2026-10-12), so it is not for this driver to refuse."""
+    route = respx.post(CHAT).mock(return_value=httpx.Response(200, json=_text_reply("Hello!")))
+    body = _body(parallelToolCalls=False, callerSettings=["parallelToolCalls"])
+    with _client(tmp_path) as client:
+        response = client.post("/v1/generate", json=body)
+    assert response.status_code == 200, response.text
+    assert _sent(route)["parallel_tool_calls"] is False
+    assert response.headers[HEADER] == "parallelToolCalls"
 
 
 @respx.mock
@@ -622,11 +776,82 @@ async def test_a_named_choice_never_takes_the_forced_tool_route() -> None:
 
 @pytest.mark.anyio
 async def test_strata_still_refuses_what_it_does_not_take() -> None:
-    """The settings Strata has never carried are still refused when explicit."""
+    """The settings Strata has never carried are still refused when explicit. (A setting it is
+    measured to ignore, `parallel_tool_calls: false`, is sent and named instead: above.)"""
     engine = _engine()
-    for field, value in (("seed", 1), ("parallelToolCalls", False)):
+    for field, value in (("seed", 1), ("logprobs", True)):
         request = _ask(tools=[WEATHER], callerSettings=[field], **{field: value})
         with pytest.raises(CliError) as refused:
             engine._payload_for(request, engine.resolve_model(None))
         assert refused.value.upstream_status == 400
     await engine.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# what is not text is the route's to refuse, in words that name the cause
+# --------------------------------------------------------------------------- #
+
+
+def _png() -> str:
+    """A real PNG, so that what refuses it is Strata's lack of image input and not a malformed
+    attachment (each part below is valid for what it says it is)."""
+    data = io.BytesIO()
+    Image.new("RGB", (8, 8), "purple").save(data, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(data.getvalue()).decode()
+
+
+@respx.mock
+@pytest.mark.parametrize("path", ["/v1/generate", "/v1/generate/stream"])
+@pytest.mark.parametrize(
+    ("part", "title"),
+    [
+        ({"type": "image_url", "image_url": {"url": _png()}}, "Image input not supported"),
+        (audio_part(), "Audio input not supported"),
+        (file_part(), "File input not supported"),
+    ],
+    ids=["image", "audio", "file"],
+)
+def test_a_part_that_is_not_text_is_refused_before_strata_is_asked(
+    tmp_path: Path, path: str, part: dict[str, Any], title: str
+) -> None:
+    """The check that used to sit in `StrataHttpEngine._payload_for` ("text messages only") was
+    dead code: a message's content there is a typed object, never a Python `list`, so it
+    never fired. The route is what refuses, and it does so for every engine whose backend has
+    not confirmed the input: a 400 that says what the backend lacks, before anything is sent."""
+    chat = respx.post(CHAT).mock(return_value=httpx.Response(200, json=_text_reply("Hello!")))
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "What is this?"}, part]}
+        ],
+    }
+    with _client(tmp_path) as client:
+        response = client.post(path, json=body)
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["title"] == title
+    assert "capabilities." in detail["detail"] and "must be true" in detail["detail"]
+    assert not chat.called, "nothing was sent to Strata"
+
+
+@respx.mock
+def test_text_only_parts_are_flattened_and_reach_strata_as_text(tmp_path: Path) -> None:
+    """The other half of the same question: a content array of text parts only is plain text
+    to the route (`validate_messages` flattens it), so Strata gets what it always could."""
+    route = respx.post(CHAT).mock(return_value=httpx.Response(200, json=_text_reply("Hello!")))
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is"},
+                    {"type": "text", "text": " the weather?"},
+                ],
+            }
+        ],
+    }
+    with _client(tmp_path) as client:
+        response = client.post("/v1/generate", json=body)
+    assert response.status_code == 200, response.text
+    sent = _sent(route)["messages"]
+    assert [m["role"] for m in sent] == ["user"]
+    assert isinstance(sent[0]["content"], str) and "weather" in sent[0]["content"]

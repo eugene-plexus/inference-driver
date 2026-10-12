@@ -8,14 +8,26 @@ llama.cpp semantics from Strata's compatibility /props or /slots endpoints.
 structured output because nobody had tried them. Measured on Strata v0.1.39
 (`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint), it calls tools correctly
 -- one call, two at once, streamed, and the round trip with the tool's result --
-and answers `response_format` natively (`json_schema` and `json_object`). Two
-things it does not do:
+and answers `response_format` natively (`json_schema` and `json_object`). Three
+things it does not do. The first two are sent anyway and named, never refused
+(`settings_not_honoured`, reported as `capabilities.settingsNotHonoured` and, per
+request, on `x-eugene-plexus-ignored-settings`):
 
 * **It ignores `tool_choice`**, all of it: `none` still called the tool,
   `required` answered "Hello!", and a named function called another one. So
   `none` is honoured here by sending no tools, and `required` or a named
-  function is sent as Strata takes it and named on
-  `x-eugene-plexus-ignored-settings` (`toolChoice`), not refused.
+  function is sent as Strata takes it and named (`toolChoice`).
+* **It ignores `parallel_tool_calls: false`.** Measured 2026-10-12 on Troy's
+  running Strata (`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint, directly),
+  with a question that wants two calls ("the weather in Paris and in Tokyo", one
+  tool, temperature 0), the field absent, `true` and `false`, two runs each:
+  every one of the six answered both calls (Paris and Tokyo, `finish_reason`
+  `tool_calls`, HTTP 200), in 484 to 502 ms (1202 ms for the first, cold).
+  `false` with no tools at all is a 200 too (a plain answer, 3016 ms), not a 400.
+  So `true` is what it does anyway, and `false` is accepted and not obeyed: sent,
+  and named (`parallelToolCalls`). **Refused is wrong for it**: Codex sends
+  `parallel_tool_calls: false` on every request, so a refusal made Strata unusable
+  from Codex, which is what it was until this round.
 * **`response_format` together with tools is its own 400**
   ("structured response_format with tools/MCP is not supported"), which this
   engine does not second-guess: the request goes through and the caller gets
@@ -32,18 +44,19 @@ from .._generated.models import (
     GenerateRequest,
     RerankPassagesRequest,
     RerankPassagesResponse,
+    SettingNotHonoured,
     Tool,
-    ToolChoice,
 )
-from ._subprocess import CliError
 from .base import RerankUnsupported
-from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target
+from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target, unread_tool_settings
 
 #: What Strata's endpoint can carry, of the request's settings. `tools`,
-#: `toolChoice` and `responseFormat` are here since 2026-10-12; the rest is
-#: what it always took. `parallelToolCalls`, `seed` and the logprob family are
+#: `toolChoice`, `parallelToolCalls` and `responseFormat` are here since
+#: 2026-10-12; the rest is what it always took. `seed` and the logprob family are
 #: not: nothing has shown Strata honours them, and an explicit one is refused
-#: rather than dropped (A2).
+#: rather than dropped (A2). (`toolChoice` and `parallelToolCalls` are listed AND
+#: partly ignored: a setting Strata is measured not to obey is sent and named,
+#: not left out, because a refusal is for what cannot be sent at all.)
 _SUPPORTED = frozenset(
     {
         "maxTokens",
@@ -55,6 +68,7 @@ _SUPPORTED = frozenset(
         "reasoningEffort",
         "tools",
         "toolChoice",
+        "parallelToolCalls",
         "responseFormat",
     }
 )
@@ -73,17 +87,12 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
 
         return super()._unsupported_settings(target) | (_ALL_ENGINE_SETTINGS - _SUPPORTED)
 
-    def ignored_settings(self, request: GenerateRequest) -> list[str]:
-        """`toolChoice`, when it is a value Strata ignores (measured 2026-10-12).
-
-        `auto` is what it does anyway, and `none` is honoured by sending no
-        tools (`_payload_for`); `required` and a named function are sent, and
-        Strata answers as if they were `auto`.
-        """
-        choice = request.toolChoice
-        if choice is None or choice in (ToolChoice.none, ToolChoice.auto):
-            return []
-        return ["toolChoice"]
+    def settings_not_honoured(self) -> list[SettingNotHonoured]:
+        """What Strata is sent and does not honour (measured 2026-10-12):
+        `toolChoice` `required` and a named function, and `parallelToolCalls`
+        `false`. Everything else it reads: `auto` and `true` are what it does
+        anyway, and `none` is honoured by sending no tools (`_payload_for`)."""
+        return unread_tool_settings()
 
     async def _forced_tool(self, request: GenerateRequest) -> Tool | None:
         """Never: a named `tool_choice` is sent to Strata as it is.
@@ -99,22 +108,6 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
         of `/props`.
         """
         return None
-
-    def _payload_for(
-        self, request: GenerateRequest, target: _Target, forced: Tool | None = None
-    ) -> dict[str, Any]:
-        if any(
-            isinstance(m.content, list)
-            and any(getattr(p, "type", None) != "text" for p in m.content)
-            for m in request.messages
-        ):
-            raise CliError("Experimental Strata supports text messages only.", upstream_status=400)
-        if request.toolChoice == ToolChoice.none:
-            # Honoured as Strata can: it ignores `tool_choice: none` (measured, it
-            # called the tool), so the tools are not sent at all. Nothing is left
-            # on the request for it to ignore.
-            request = request.model_copy(update={"tools": None, "toolChoice": None})
-        return super()._payload_for(request, target, forced)
 
     async def _answers_as_llama_cpp(self) -> bool:
         return False

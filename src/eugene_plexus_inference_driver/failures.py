@@ -107,8 +107,9 @@ def input_too_long(text: str) -> bool:
 #:   malformed tool definition ("Failed to parse tools: ...") and for a
 #:   request with no `messages` ("'messages' is required") are not these.
 #:
-#: Ollama's "does not support tools" is named in the contract but is NOT here:
-#: no Ollama was available to measure on 2026-10-12.
+#: Ollama's "does not support tools" is NOT here, and stays out until it has been
+#: seen on the wire: no Ollama was available to measure on 2026-10-12. The
+#: contract (specs 6178255) names llama-server's wording alone.
 _TOOLS_REFUSALS: tuple[re.Pattern[str], ...] = (
     re.compile(r"tools param requires --jinja flag\.?"),
 )
@@ -121,6 +122,12 @@ def _backend_message(body: str) -> str | None:
     answer, measured), a bare `{"error": "..."}` or `{"message": ...}`, or a body
     that is plain text. Nothing else: a body this does not understand is not one
     whose words are matched.
+
+    **A body nested too deep to parse is one of those** (`RecursionError`, which
+    is not a `ValueError`: 4000 opening brackets raise it on CPython 3.12). It
+    arrives from the backend, so it is not ours to crash on, and this runs inside
+    the handling of a failed request: an exception here would replace the
+    backend's own refusal with a 500 of the driver's.
     """
     text = body.strip()
     if not text:
@@ -129,6 +136,8 @@ def _backend_message(body: str) -> str | None:
         parsed = json.loads(text)
     except ValueError:
         return text
+    except RecursionError:
+        return None
     if not isinstance(parsed, dict):
         return None
     error = parsed.get("error", parsed.get("message"))
@@ -148,6 +157,15 @@ def tools_refusal(body: str) -> str | None:
     if message is not None and any(p.fullmatch(message) for p in _TOOLS_REFUSALS):
         return message
     return None
+
+
+def every(seconds: float) -> str:
+    """An interval in a person's words, for what this driver says it does on a
+    timer: `10 minutes`, `1 minute`, `30 seconds`."""
+    if seconds >= 60:
+        minutes = seconds / 60
+        return f"{minutes:g} minute{'' if minutes == 1 else 's'}"
+    return f"{seconds:g} second{'' if seconds == 1 else 's'}"
 
 
 def capacity_refused(error: Exception) -> bool:
@@ -176,8 +194,10 @@ def disposition(error: Exception) -> str:
     if _TEMPLATE_REFUSAL.search(str(error)) or input_too_long(str(error)):
         return "terminal"
     # A refusal of the request's tools, whatever status the backend gave it
-    # (llama-server's is a 500): the same request fails the same way on every
-    # replica, and says nothing about the backend's health.
+    # (llama-server's is a 500). As that 500 it would be `indeterminate`: a 502
+    # the gateway does not replay, but counts against this backend's circuit,
+    # for a refusal that says nothing about the backend's health. The same
+    # request fails the same way on every replica, so it is the caller's.
     from .engines._subprocess import ToolsRefused  # the engines import this module
 
     if isinstance(error, ToolsRefused):

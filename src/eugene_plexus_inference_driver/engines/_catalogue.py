@@ -100,6 +100,12 @@ _OPENROUTER_SETTINGS: tuple[tuple[str, str], ...] = (
     ("web_search_options", "webSearchOptions"),
 )
 
+#: The settings that only mean something with tools. One list, read by this
+#: module (a chat model whose listing says nothing of its parameters is taken to
+#: carry them: `from_openrouter`) and by the engine (what a flip of `toolCalling`
+#: takes away, and what rides with `tools`).
+TOOL_SETTINGS = frozenset({"tools", "toolChoice", "parallelToolCalls"})
+
 
 class CatalogueError(Exception):
     """A catalogue read that produced no list, with the reason in words."""
@@ -197,11 +203,24 @@ def from_openrouter(body: Any) -> list[DriverModel]:
         arch: dict[str, Any] = raw_arch if isinstance(raw_arch, dict) else {}
         inputs = [m for m in (arch.get("input_modalities") or []) if isinstance(m, str)]
         output = [m for m in (arch.get("output_modalities") or []) if isinstance(m, str)]
-        params = {p for p in (entry.get("supported_parameters") or []) if isinstance(p, str)}
+        raw_params = entry.get("supported_parameters")
+        # **A listing that says nothing is not a no** (Troy, 2026-10-12,
+        # `docs/design/tools-assumed.md`). An entry with no `supported_parameters`
+        # list at all (the key absent, or null) has said nothing of tools, so a chat
+        # model there is taken to carry them, and the settings that carry them are
+        # offered with it: a `toolCalling: true` that this driver then refused an
+        # explicit `tools` against would be no better than the `false` it replaces.
+        # An entry that HAS the list and does not name `tools` is OpenRouter saying
+        # the model takes none, and stays false.
+        names = raw_params if isinstance(raw_params, list) else None
+        listed = names is not None
+        params = {p for p in names or [] if isinstance(p, str)}
         settings = [ours for theirs, ours in _OPENROUTER_SETTINGS if theirs in params]
         if "structured_outputs" in params and "responseFormat" not in settings:
             settings.append("responseFormat")
         surfaces = surfaces_from_output(output, inputs)
+        if not listed and "chat" in surfaces:
+            settings = [ours for _, ours in _OPENROUTER_SETTINGS if ours in TOOL_SETTINGS]
         context = entry.get("context_length")
         voices = entry.get("supported_voices")
         models.append(
@@ -227,7 +246,7 @@ def from_openrouter(body: Any) -> list[DriverModel]:
                     # P3a: OpenRouter's speech route makes mp3 and pcm, and
                     # the driver makes WAV from pcm (measured 2026-09-28).
                     speechFormats=list(OPENROUTER_FORMATS) if "speech" in surfaces else None,
-                    toolCalling="tools" in params,
+                    toolCalling="tools" in params if listed else "chat" in surfaces,
                     maxContextTokens=context if isinstance(context, int) and context > 0 else None,
                 ),
             )
@@ -377,7 +396,8 @@ def from_lmstudio(body: Any, defaults: EngineDefaults) -> list[DriverModel]:
 
     **Written from LM Studio's documentation, not measured** -- no LM Studio
     was available on 2026-09-27. A `capabilities` array naming `tool_use`
-    is read when present; otherwise tool calling is inherited.
+    is read when it names anything; an absent or empty one says nothing, and
+    tool calling is inherited.
     """
     data = body.get("data") if isinstance(body, dict) else None
     if not isinstance(data, list):
@@ -393,7 +413,10 @@ def from_lmstudio(body: Any, defaults: EngineDefaults) -> list[DriverModel]:
         model = _inherited(entry["id"], defaults)
         caps = entry.get("capabilities")
         assert model.capabilities is not None
-        if isinstance(caps, list):
+        # A list naming what the model can do. One with nothing in it says nothing,
+        # which is not a no (`from_openrouter`): the model keeps what the engine
+        # assumes for every chat model.
+        if isinstance(caps, list) and caps:
             model.capabilities.toolCalling = "tool_use" in caps
         if kind == "vlm":
             model.capabilities.imageInput = True
@@ -490,10 +513,12 @@ class Catalogue:
         self._fetch = fetch
         self._get = get
         self._path = path
-        #: How a model is SERVED, by whoever owns the account: the engine says
-        #: which of its models the backend has since refused tools for. Applied
-        #: where models are handed out (`exposed`, `find`) and never to what is
-        #: stored, so it is neither saved to disk nor lost on a refresh.
+        #: How a model is SERVED, by whoever owns the account: the engine lays over the
+        #: provider's listing what it knows of its backend, which is what the backend
+        #: does not honour and which of its models it has since refused tools for
+        #: (and not yet taken one again). Applied where models are handed out
+        #: (`exposed`, `find`) and never to what is stored, so it is neither saved
+        #: to disk nor lost on a refresh.
         self._view = view or (lambda model: model)
         self._models: list[DriverModel] = []
         self._by_id: dict[str, DriverModel] = {}

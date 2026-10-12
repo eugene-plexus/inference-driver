@@ -34,7 +34,7 @@ from ..engines.base import (
     resolve_single_model,
 )
 from ..engines.systemone_http import validate_questions
-from ..failures import capacity_refused, credential_refused, disposition, request_id
+from ..failures import capacity_refused, credential_refused, disposition, every, request_id
 from ..images import ImageRefusal, attachment_kinds, validate_messages
 from ..locality import enforce
 from ..raw_completion import CompletionRefusal
@@ -590,12 +590,14 @@ def _refuse_unsupported_tools(
     work, so a driver says False for an engine it has no way to carry tools to,
     for a provider's own word on a model, or because the backend refused a
     request's tools in its own words. In that last case the refusal says what the
-    backend said, which is the observed cause, not a guess at one.
+    backend said, which is the observed cause, not a guess at one. **A model that
+    says nothing of tools is not one that says no**: only an explicit `false`
+    refuses here (a list saved by an older driver has no `toolCalling`).
     """
     if not body.tools:
         return
     if entry is not None:
-        if entry.capabilities is not None and entry.capabilities.toolCalling:
+        if entry.capabilities is None or entry.capabilities.toolCalling is not False:
             return
     elif getattr(engine, "supports_tool_calling", False):
         return
@@ -603,10 +605,18 @@ def _refuse_unsupported_tools(
     words_of = getattr(engine, "tools_refused_words", None)
     words = words_of(body.model) if words_of is not None else None
     if words is not None:
+        asked = getattr(engine, "tools_reask_seconds", None)
+        again = (
+            f"This driver asks the backend again every {every(asked)}, with a one-token "
+            "request that carries a tool, and turns tools back on the first time it answers "
+            "one. "
+            if isinstance(asked, int | float)
+            else ""
+        )
         why = (
             f"This driver's backend ({kind_label}) refused a request for its tools earlier, "
-            f"in its own words: {words!r}. Eugene treats tools as off for it until this "
-            "driver restarts, so the request was refused rather than answered without them. "
+            f"in its own words: {words!r}. Eugene treats tools as off for it, so this request "
+            f"was refused rather than answered without them. {again}"
         )
     else:
         why = (

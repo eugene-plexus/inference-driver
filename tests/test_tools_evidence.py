@@ -4,8 +4,11 @@ Troy, 2026-10-12: "we should always assume in 2026 that a model & engine can use
 tools". So no engine is refused tools for being untested, and the one thing that
 turns them off is a backend that refused a request BECAUSE IT CARRIED TOOLS, in
 words this driver has measured (`failures.tools_refusal`). The engine then
-reports `toolCalling` false for its life, says so once at INFO, and the request
-is the caller's 400 with the backend's words.
+reports `toolCalling` false, says so once at INFO, and the request is the caller's
+400 with the backend's words. **Not for good**: the driver does not restart when
+its runtime does (the agent restarts an engine under a driver that goes on), so
+the backend is asked again every ten minutes and an answer turns tools back on
+(`test_tools_reask.py`).
 
 **The bytes below were measured on 2026-10-12**, llama-server b10948 on
 Qwen3-0.6B, CPU. Started with `--no-jinja` it answers every request with a
@@ -183,6 +186,12 @@ def test_the_measured_wording_is_found_in_every_shape_it_could_arrive_in(
             {"error": {"message": "registry.ollama.ai/library/gemma3:4b does not support tools"}}
         ),
         json.dumps({"detail": WORDS}),
+        # Nested past what `json.loads` can parse. It raises `RecursionError`, which is
+        # not a `ValueError`: 4000 brackets do it on CPython 3.12. A backend's body is
+        # not ours to crash on, here or anywhere a failed request is being handled.
+        "[" * 4000,
+        '{"error":' * 4000,
+        "[" * 100_000,
     ],
     ids=[
         "empty",
@@ -200,6 +209,9 @@ def test_the_measured_wording_is_found_in_every_shape_it_could_arrive_in(
         "tool-choice-sibling",
         "ollama-unmeasured",
         "other-key",
+        "deep-array",
+        "deep-object",
+        "very-deep-array",
     ],
 )
 def test_nothing_else_is_a_refusal_of_tools(body: str) -> None:
@@ -207,13 +219,13 @@ def test_nothing_else_is_a_refusal_of_tools(body: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# the engine learns, once, for its life
+# the engine learns it, and says so once
 # --------------------------------------------------------------------------- #
 
 
 @respx.mock
 @pytest.mark.anyio
-async def test_the_measured_refusal_turns_tools_off_for_the_engines_life() -> None:
+async def test_the_measured_refusal_turns_tools_off_until_the_backend_answers_again() -> None:
     respx.post(CHAT).mock(return_value=httpx.Response(500, json=NO_JINJA))
     engine = _engine()
     assert engine.supports_tool_calling is True
@@ -227,16 +239,21 @@ async def test_the_measured_refusal_turns_tools_off_for_the_engines_life() -> No
     error = refused.value
     assert error.upstream_status == 500
     assert error.words == WORDS
-    # The backend's own status and words, then what Eugene did about them.
+    # The backend's own status and words, then what Eugene did about them. Said plainly,
+    # and not as a claim that the driver restarts: it does not, with its runtime.
     assert "returned 500" in str(error) and WORDS in str(error)
-    assert "treats tools as off for 'qwen' until this driver restarts" in str(error)
+    assert "Eugene treats tools as off for 'qwen'" in str(error)
+    assert "asks the backend again every 10 minutes" in str(error)
+    assert "until this driver restarts" not in str(error)
     assert engine.supports_tool_calling is False
-    assert not {"tools", "toolChoice", "parallelToolCalls"} & set(engine.supported_settings)
+    # `tools` is what the backend refused. What rides with it says nothing on a request
+    # that carries none, so it stays offered (`test_tools_reask.py`).
+    offered = set(engine.supported_settings)
+    assert "tools" not in offered and {"toolChoice", "parallelToolCalls"} <= offered
     assert engine.tools_refused_words() == WORDS
     assert engine.tools_refused_words("qwen") == WORDS
 
-    # A restart is a fresh start: tools are assumed again, which is how a backend
-    # that was fixed (started with --jinja) gets them back.
+    # A new engine starts by assuming tools again (a config change builds one).
     fresh = _engine()
     assert fresh.supports_tool_calling is True and fresh.tools_refused_words() is None
     await fresh.aclose()
@@ -285,8 +302,9 @@ async def test_it_is_said_once_at_info(caplog: pytest.LogCaptureFixture) -> None
 
 @pytest.mark.parametrize("status", [500, 400])
 def test_a_refusal_of_tools_is_the_callers_400_whatever_status_it_came_with(status: int) -> None:
-    """llama-server's is a 500, which as a 502 would be retried against every replica of a
-    healthy engine and counted against its circuit (the same as `Jinja Exception`)."""
+    """llama-server's is a 500, which as a 502 would be counted against the circuit of a
+    healthy engine (`indeterminate`: not replayed elsewhere, but counted), as `Jinja
+    Exception` was before it was made the caller's."""
     error = ToolsRefused(
         f"openai_compat_http returned {status}: {json.dumps(NO_JINJA)}. The backend refused it.",
         words=WORDS,
@@ -370,6 +388,8 @@ def test_through_the_app_the_first_request_is_a_400_and_info_then_says_false(
         (before,) = client.get("/v1/info").json()["models"]
         assert before["capabilities"]["toolCalling"] is True
         assert "tools" in before["capabilities"]["supportedSettings"]
+        # llama-server honours what it is sent: nothing to name (absent, not an empty list).
+        assert "settingsNotHonoured" not in before["capabilities"]
 
         first = client.post(path, json=_body())
         assert first.status_code == 400, first.text
@@ -380,9 +400,9 @@ def test_through_the_app_the_first_request_is_a_400_and_info_then_says_false(
 
         (after,) = client.get("/v1/info").json()["models"]
         assert after["capabilities"]["toolCalling"] is False
-        assert not {"tools", "toolChoice", "parallelToolCalls"} & set(
-            after["capabilities"]["supportedSettings"]
-        )
+        settings = set(after["capabilities"]["supportedSettings"])
+        assert "tools" not in settings
+        assert {"toolChoice", "parallelToolCalls"} <= settings, "they say nothing without tools"
 
         # Later requests are refused at the driver's door, in the backend's words,
         # without another trip to a backend that has already answered.
@@ -394,6 +414,10 @@ def test_through_the_app_the_first_request_is_a_400_and_info_then_says_false(
             WORDS in refusal["detail"]
             and "refused a request for its tools earlier" in refusal["detail"]
         )
+        # What the person is told: the driver's own report, the cadence of asking again, and
+        # no claim that a restart of the driver is what brings tools back.
+        assert "asks the backend again every 10 minutes" in refusal["detail"]
+        assert "restart" not in refusal["detail"]
         assert sum(1 for call in chat.calls if _carries_tools(call.request)) == 1
 
         # And chat without tools keeps working on the same engine.
@@ -422,6 +446,9 @@ NOT_EVIDENCE = [
         id="unmeasured",
     ),
     pytest.param(500, NO_JINJA, False, id="the-exact-words-to-a-request-with-no-tools"),
+    # A body `json.loads` cannot get to the bottom of (RecursionError, not ValueError). The
+    # backend's own refusal must still be what the caller gets, not a crash of the driver's.
+    pytest.param(500, "[" * 4000, True, id="a-body-nested-too-deep-to-parse"),
 ]
 
 
@@ -506,7 +533,7 @@ async def test_an_attachment_request_still_shows_the_backends_words_for_tools() 
 
 
 # --------------------------------------------------------------------------- #
-# an account: per model, in this life only
+# an account: per model, and never written into its saved list
 # --------------------------------------------------------------------------- #
 
 
@@ -530,7 +557,7 @@ def _refuses_tools_for_a(request: httpx.Request) -> httpx.Response:
 
 @respx.mock
 @pytest.mark.anyio
-async def test_an_account_turns_tools_off_for_the_one_model_and_not_beyond_this_life(
+async def test_an_account_turns_tools_off_for_the_one_model_and_never_saves_it_to_the_list(
     tmp_path: Path,
 ) -> None:
     respx.get(f"{BASE}/v1/models").mock(
@@ -552,6 +579,8 @@ async def test_an_account_turns_tools_off_for_the_one_model_and_not_beyond_this_
         caps = served()
         assert caps["a"] is not None and caps["a"].toolCalling is False
         assert "tools" not in (caps["a"].supportedSettings or [])
+        # The companions stay offered: they say nothing on a request without tools.
+        assert {"toolChoice", "parallelToolCalls"} <= set(caps["a"].supportedSettings or [])
         assert caps["b"] is not None and caps["b"].toolCalling is True
         assert "tools" in (caps["b"].supportedSettings or [])
         assert engine.tools_refused_words("a") == WORDS and engine.tools_refused_words("b") is None
@@ -577,13 +606,58 @@ async def test_an_account_turns_tools_off_for_the_one_model_and_not_beyond_this_
     finally:
         await engine.aclose()
 
-    # A new life, reading the same saved list, assumes tools again.
+    # A new engine (the driver started again), reading the same saved list, assumes tools again.
     fresh = _account(saved)
     assert fresh.catalogue is not None
     found = fresh.catalogue.find("a")
     assert found is not None and found.capabilities is not None
     assert found.capabilities.toolCalling is True
     await fresh.aclose()
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_what_an_ollama_account_learned_is_never_written_into_the_entry_it_stores(
+    tmp_path: Path,
+) -> None:
+    """An Ollama account builds each entry from `engine_defaults(<the model's name>)`, which
+    used to carry that name as the model's id, so a learned refusal for the model took `tools`
+    out of the entry it STORED (and saved) the next time the list was read. The stored entry is
+    the provider's word; what the engine learned is laid over it when it is served."""
+    ollama = "http://ollama.local"
+    respx.get(f"{ollama}/api/tags").mock(
+        return_value=httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+    )
+    respx.post(f"{ollama}/api/show").mock(
+        return_value=httpx.Response(200, json={"capabilities": ["completion", "tools"]})
+    )
+    saved = tmp_path / "models.json"
+    engine = OpenAiCompatibleHttpEngine(
+        base_url=ollama,
+        model_id=None,
+        backend_kind=BackendKind.openai_compat_http,
+        auth_required=False,
+        catalogue_source="ollama",
+        catalogue_path=saved,
+    )
+    assert engine.catalogue is not None
+    try:
+        await engine.catalogue.refresh()
+        engine._learn_tools_refused(engine.resolve_model("qwen3:8b"), WORDS, 500)
+        await engine.catalogue.refresh()  # the list is read again, as it is on its interval
+
+        stored = engine.catalogue._by_id["qwen3:8b"].capabilities
+        assert stored is not None and stored.toolCalling is True
+        assert "tools" in (stored.supportedSettings or [])
+        on_disk = json.loads(saved.read_text("utf-8"))["models"][0]["capabilities"]
+        assert "tools" in on_disk["supportedSettings"] and on_disk["toolCalling"] is True
+
+        served = engine.catalogue.find("qwen3:8b")
+        assert served is not None and served.capabilities is not None
+        assert served.capabilities.toolCalling is False
+        assert "tools" not in (served.capabilities.supportedSettings or [])
+    finally:
+        await engine.aclose()
 
 
 @respx.mock

@@ -170,6 +170,10 @@ async def _single_model(engine: Any) -> list[DriverModel]:
         if completion[0]:
             surfaces.append("completion")
     upstream = getattr(engine, "_upstream_model_id", None)
+    # What this backend is sent and does not honour (2026-10-12): static, so the
+    # gateway names it before a stream opens. Chat only; an absent hook is none.
+    gaps = getattr(engine, "settings_not_honoured", None)
+    not_honoured = gaps() if gaps is not None and "chat" in surfaces else []
     return [
         DriverModel(
             id=model_id,
@@ -177,6 +181,7 @@ async def _single_model(engine: Any) -> list[DriverModel]:
             surfaces=surfaces,
             capabilities=Capabilities(
                 supportedSettings=list(getattr(engine, "supported_settings", [])),
+                settingsNotHonoured=not_honoured or None,
                 imageInput=image_input,
                 audioInput=audio_input,
                 fillInMiddle=completion[1],

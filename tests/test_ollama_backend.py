@@ -6,10 +6,12 @@ Upstream drift audit, 2026-10-03, Ollama v0.35.1:
   `top_k`, `min_p` or `parallel_tool_calls`, so they are dropped without a
   word. A setting the caller asked for must be refused rather than
   dropped (A2), so `top_k` and `min_p` are not offered for an Ollama
-  backend at all, and `tool_choice` / `parallel_tool_calls` are refused for
-  every value Ollama would not honour by ignoring it (`auto` and `true` it
-  honours: that is what it does anyway, and Codex sends both on every
-  request).
+  backend at all. `tool_choice` and `parallel_tool_calls` are the other
+  kind (Troy, 2026-10-12, `docs/design/tools-assumed.md`): `auto` and `true`
+  are what Ollama does anyway, `none` is honoured by sending no tools, and
+  every other value is **sent and named** (`capabilities.settingsNotHonoured`,
+  `x-eugene-plexus-ignored-settings`), not refused. Codex sends both on every
+  request, and until round two of that work Ollama refused it.
 * It reads replayed reasoning only as `reasoning` (ollama#18534); we sent
   `reasoning_content`, which llama.cpp reads and Ollama drops.
 * It matches tool results to calls by position, not by id (ollama#18762),
@@ -23,15 +25,20 @@ custom backend, whose behaviour must not move.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import respx
+from fastapi.testclient import TestClient
 
 from eugene_plexus_inference_driver._generated.models import BackendKind, GenerateRequest
+from eugene_plexus_inference_driver.app import create_app
 from eugene_plexus_inference_driver.engines._subprocess import CliError
 from eugene_plexus_inference_driver.engines.openai_compat_http import OpenAiCompatibleHttpEngine
+from eugene_plexus_inference_driver.settings import Settings
+from tests.test_accounts import _wait_for_catalogue
 
 OLLAMA = "http://127.0.0.1:11434"
 LLAMA = "http://127.0.0.1:8081"
@@ -79,10 +86,23 @@ def _sent(route: respx.Route) -> dict[str, Any]:
 def test_ollama_is_not_offered_for_the_samplers_it_drops() -> None:
     settings = set(_engine("ollama").supported_settings)
     assert not settings & {"topK", "minP"}
-    # Listed, because `auto` and `true` are honoured; the other values are
-    # refused per request below.
+    # Listed, because `auto` and `true` are honoured and every other value is sent and
+    # named below (never refused: a refusal is for what cannot be sent at all).
     assert {"toolChoice", "parallelToolCalls", "tools"} <= settings
     assert {"topK", "minP"} <= set(_engine("openai").supported_settings)
+
+
+def test_ollama_names_what_it_ignores_by_value_and_llama_server_names_nothing() -> None:
+    """`capabilities.settingsNotHonoured`: static per backend, so the gateway can name it
+    before a stream opens. Ollama's OpenAI-compatible request has no field for `tool_choice`
+    or `parallel_tool_calls` (`openai/openai.go`, v0.35.1), so it reads neither; `auto` and
+    `true` are what it does anyway."""
+    gaps = [g.model_dump(mode="json") for g in _engine("ollama").settings_not_honoured()]
+    assert gaps == [
+        {"setting": "toolChoice", "values": ["required", "function"]},
+        {"setting": "parallelToolCalls", "values": [False]},
+    ]
+    assert _engine("openai").settings_not_honoured() == []
 
 
 @pytest.mark.parametrize(("field", "value"), [("topK", 20), ("minP", 0.05)])
@@ -105,34 +125,126 @@ async def test_an_inherited_sampler_is_left_out_for_ollama_and_sent_to_llama_ser
 
 
 @pytest.mark.parametrize(
-    "choice", ["required", "none", {"type": "function", "function": {"name": "a"}}]
+    "choice",
+    ["required", {"type": "function", "function": {"name": "a"}}],
+    ids=["required", "named"],
 )
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "inherited"])
 @respx.mock
-async def test_a_tool_choice_ollama_would_ignore_is_refused(choice: Any) -> None:
+async def test_a_tool_choice_ollama_ignores_is_sent_and_named_not_refused(
+    choice: Any, explicit: bool
+) -> None:
+    """Refused, an explicit one blocked every caller that sends it, and an inherited one was
+    left out without a word on the wire. A setting a backend is not read by is sent as it is
+    and said to be ignored (`x-eugene-plexus-ignored-settings`, `settingsNotHonoured`)."""
     route = _route(OLLAMA)
-    with pytest.raises(CliError) as refused:
-        await _engine("ollama").generate(_ask(tools=TOOLS, toolChoice=choice))
-    assert refused.value.upstream_status == 400
-    assert "tool_choice" in str(refused.value)
-    assert not route.called
+    engine = _engine("ollama")
+    request = _ask(explicit=explicit, tools=TOOLS, toolChoice=choice)
+    await engine.generate(request)
+    assert _sent(route)["tool_choice"] == choice
+    assert [t["function"]["name"] for t in _sent(route)["tools"]] == ["a", "b"]
+    assert engine.ignored_settings(request) == ["toolChoice"]
+
+
+@respx.mock
+async def test_tool_choice_none_is_honoured_for_ollama_by_sending_no_tools() -> None:
+    """Ollama does not read `tool_choice`, so `none` would be answered as `auto`: it is honoured
+    the way it can be, by not offering the tools at all (as for Strata)."""
+    route = _route(OLLAMA)
+    engine = _engine("ollama")
+    request = _ask(tools=TOOLS, toolChoice="none", parallelToolCalls=False)
+    await engine.generate(request)
+    sent = _sent(route)
+    assert "tools" not in sent and "tool_choice" not in sent and "parallel_tool_calls" not in sent
+    assert engine.ignored_settings(request) == [], "it was honoured, so nothing is named"
+
+
+@respx.mock
+async def test_tool_choice_none_still_reaches_llama_server_which_reads_it() -> None:
+    route = _route(LLAMA)
+    await _engine("openai").generate(_ask(tools=TOOLS, toolChoice="none"))
+    assert _sent(route)["tool_choice"] == "none"
+    assert len(_sent(route)["tools"]) == 2
 
 
 @respx.mock
 async def test_auto_and_parallel_true_are_what_ollama_does_and_still_work() -> None:
     route = _route(OLLAMA)
-    await _engine("ollama").generate(_ask(tools=TOOLS, toolChoice="auto", parallelToolCalls=True))
+    engine = _engine("ollama")
+    request = _ask(tools=TOOLS, toolChoice="auto", parallelToolCalls=True)
+    await engine.generate(request)
     assert _sent(route)["tool_choice"] == "auto"
+    assert _sent(route)["parallel_tool_calls"] is True
+    assert engine.ignored_settings(request) == []
 
 
 @respx.mock
-async def test_one_call_a_turn_is_refused_for_ollama_and_sent_to_llama_server() -> None:
+async def test_one_call_a_turn_is_sent_to_both_and_named_for_ollama_only() -> None:
     ollama, llama = _route(OLLAMA), _route(LLAMA)
-    with pytest.raises(CliError) as refused:
-        await _engine("ollama").generate(_ask(tools=TOOLS, parallelToolCalls=False))
-    assert "parallel_tool_calls" in str(refused.value)
-    assert not ollama.called
-    await _engine("openai").generate(_ask(tools=TOOLS, parallelToolCalls=False))
+    request = _ask(tools=TOOLS, parallelToolCalls=False)
+    ollama_engine, llama_engine = _engine("ollama"), _engine("openai")
+    await ollama_engine.generate(request)
+    await llama_engine.generate(request)
+    assert _sent(ollama)["parallel_tool_calls"] is False
     assert _sent(llama)["parallel_tool_calls"] is False
+    assert ollama_engine.ignored_settings(request) == ["parallelToolCalls"]
+    assert llama_engine.ignored_settings(request) == []
+
+
+@respx.mock
+async def test_a_codex_shaped_request_is_served_by_ollama_with_its_gaps_named() -> None:
+    """`tool_choice: auto` and `parallel_tool_calls: false` on every request, all explicit."""
+    route = _route(OLLAMA)
+    engine = _engine("ollama")
+    request = _ask(tools=TOOLS, toolChoice="auto", parallelToolCalls=False)
+    await engine.generate(request)
+    assert route.called
+    assert engine.ignored_settings(request) == ["parallelToolCalls"]
+
+
+@respx.mock
+def test_through_the_app_an_ollama_account_reports_and_names_what_it_ignores(
+    tmp_path: Path,
+) -> None:
+    """The driver the agent runs for an Ollama runtime: `/v1/info` carries the static list on
+    every chat model, and a request that trips one is answered with the header, not a 400."""
+    respx.get(f"{OLLAMA}/api/tags").mock(
+        return_value=httpx.Response(
+            200, json={"models": [{"name": "qwen3-coder:30b"}, {"name": "nomic-embed-text:latest"}]}
+        )
+    )
+    shows = {"qwen3-coder:30b": ["completion", "tools"], "nomic-embed-text:latest": ["embedding"]}
+    respx.post(f"{OLLAMA}/api/show").mock(
+        side_effect=lambda r: httpx.Response(
+            200, json={"capabilities": shows[json.loads(r.content)["model"]]}
+        )
+    )
+    chat = _route(OLLAMA)
+    config = tmp_path / "ollama.yaml"
+    config.write_text(json.dumps({"provider": "ollama_local"}), "utf-8")
+    with TestClient(create_app(settings=Settings(config_file=config))) as client:
+        info = _wait_for_catalogue(client)
+        by_id = {m["id"]: m["capabilities"] for m in info["models"]}
+        assert by_id["qwen3-coder:30b"]["settingsNotHonoured"] == [
+            {"setting": "toolChoice", "values": ["required", "function"]},
+            {"setting": "parallelToolCalls", "values": [False]},
+        ]
+        assert "settingsNotHonoured" not in by_id["nomic-embed-text:latest"], "it does not chat"
+        response = client.post(
+            "/v1/generate",
+            json={
+                "model": "qwen3-coder:30b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": TOOLS,
+                "toolChoice": "required",
+                "parallelToolCalls": False,
+                "callerSettings": ["tools", "toolChoice", "parallelToolCalls"],
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-eugene-plexus-ignored-settings"] == "toolChoice, parallelToolCalls"
+    assert _sent(chat)["tool_choice"] == "required"
+    assert _sent(chat)["parallel_tool_calls"] is False
 
 
 @respx.mock

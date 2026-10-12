@@ -68,6 +68,7 @@ from .._generated.models import (
     RerankPassagesResponse,
     RerankScale,
     Role,
+    SettingNotHonoured,
     SpeakRequest,
     SpeechFormat,
     Stage,
@@ -75,6 +76,7 @@ from .._generated.models import (
     Tool,
     ToolCall,
     ToolCallDelta,
+    ToolChoice,
     TranscribeRequest,
     TranscribeResponse,
     Usage,
@@ -83,7 +85,7 @@ from .._generated.models import (
 )
 from .._http import client_for
 from ..audio_out import AudioAssembly
-from ..failures import input_too_long, request_id, retry_after, tools_refusal
+from ..failures import every, input_too_long, request_id, retry_after, tools_refusal
 from ..images import attachment_kinds, content_wire
 from ..images_out import ImageRefusal as ImageOutRefusal
 from ..images_out import (
@@ -124,6 +126,7 @@ from ._catalogue import (
     _LIST_TIMEOUT,
     _SHOW_CONCURRENCY,
     _SHOW_TIMEOUT,
+    TOOL_SETTINGS,
     Catalogue,
     CatalogueError,
     EngineDefaults,
@@ -296,7 +299,70 @@ _RESPONSES_ONLY_TOOLS: re.Pattern[str] = re.compile(
 )
 
 # The settings that only mean something with tools.
-_CHAT_TOOL_SETTINGS = frozenset({"tools", "toolChoice", "parallelToolCalls"})
+_CHAT_TOOL_SETTINGS = TOOL_SETTINGS
+
+# The two that ride with tools. A request that carries no tools has nothing to
+# choose among and nothing to run in parallel, so these say nothing on it.
+_TOOL_COMPANIONS = TOOL_SETTINGS - {"tools"}
+
+
+def unread_tool_settings() -> list[SettingNotHonoured]:
+    """What a backend that never reads `tool_choice` or `parallel_tool_calls` is
+    sent and does not honour, by value: `capabilities.settingsNotHonoured`
+    (2026-10-12, `docs/design/tools-assumed.md`).
+
+    **Measured on Strata v0.1.39** (`qwen3.8-flash-next-iq2_xs`, its own OpenAI
+    endpoint): `tool_choice` `required` answered "Hello!" to a question that
+    needed no tool, a named function called another one, and `none` called the
+    tool; `parallel_tool_calls: false` is accepted (HTTP 200) and answered with
+    both of two calls, as `true` and an absent field are (the numbers are in
+    `strata_http`). **Ollama's** is read from its source and not measured: its
+    OpenAI-compatible request has no field for either (`openai/openai.go`,
+    v0.35.1), so they are dropped without a word.
+
+    `auto` and `true` are what such a backend does anyway, so they are not
+    listed. `none` is not listed either, because it IS honoured, by sending no
+    tools (`OpenAiCompatibleHttpEngine._payload_for`). A fresh list per call:
+    the models are mutable.
+    """
+    return [
+        SettingNotHonoured(setting="toolChoice", values=["required", "function"]),
+        SettingNotHonoured(setting="parallelToolCalls", values=[False]),
+    ]
+
+
+def _contract_value(request: GenerateRequest, setting: str) -> str | bool | None:
+    """The value of one of this request's settings as `SettingNotHonoured` spells
+    it: a `toolChoice` is its mode (`function` for a named one), a boolean is itself."""
+    value = getattr(request, setting, None)
+    if setting == "toolChoice":
+        if isinstance(value, NamedToolChoice):
+            return "function"
+        return str(value.value) if isinstance(value, ToolChoice) else None
+    return value if isinstance(value, bool | str) else None
+
+
+@dataclass(frozen=True)
+class _ToolsOff:
+    """A model whose tools the backend refused, in its own words (`_learn_tools_refused`)."""
+
+    #: The backend's message on its own, without the JSON around it.
+    words: str
+    #: What the backend is asked for, to ask it again (`_tools_answered`).
+    upstream: str
+
+
+# How often a backend that refused tools is asked again. Ten minutes: a backend
+# fixed in place (llama-server restarted by the agent with `--jinja`) gets its
+# tools back inside one, and a request carrying a tool costs a one-token
+# generation, so a backend that is still refusing is not hammered.
+TOOLS_REASK_SECONDS = 600.0
+
+# How long that question may take. Longer than a probe's, because it is a real
+# (one token) generation that may queue behind a busy slot, and shorter than a
+# request's: nobody is waiting on it, and a backend that has not answered by
+# then is asked again at the next interval.
+_TOOLS_ASK_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 
 # OpenAI's `/v1/models` returns every model on the account — embeddings,
 # image, audio, moderation, retired completion-only models, etc. — and
@@ -393,7 +459,8 @@ _LOCAL_ENGINE_SETTINGS = frozenset({"topK", "minP"})
 # dropped without a word, so an explicit one must be refused instead (A2).
 # `tool_choice` and `parallel_tool_calls` are NOT here: Ollama ignoring them
 # is the same as honouring `auto` and `true`, which Codex sends on every
-# request, so they are refused per value in `_payload_for`.
+# request. Any other value is sent and named, not refused, as for Strata
+# (2026-10-12): `unread_tool_settings`, and `none` as no tools.
 _OLLAMA_DROPPED_SETTINGS = frozenset({"topK", "minP"})
 
 # P2c (2026-09-28): settings only a hosted API is known to take -- OpenAI's
@@ -708,8 +775,9 @@ class OpenAiCompatibleHttpEngine:
     #: `docs/design/tools-assumed.md`): a chat model on any engine takes tools.
     #: An engine instance sets it False for one reason only here -- the
     #: backend refused a request's tools in words this driver has measured
-    #: (`_learn_tools_refused`) -- or because the endpoint is known to serve
-    #: a model without them (`_chat_tools_unavailable`).
+    #: (`_learn_tools_refused`; asked again every ten minutes, and cleared by an
+    #: answer) -- or because the endpoint is known to serve a model without
+    #: them (`_chat_tools_unavailable`).
     supports_tool_calling = True
     #: Set from `probe_embeddings()` at first ask, not declared --
     #: the backend is the only thing that knows, and it only knows
@@ -786,18 +854,27 @@ class OpenAiCompatibleHttpEngine:
                 "use its own default. Everything else works normally.",
                 model_id,
             )
-        #: The models this backend has refused tools for, in its own words,
-        #: since THIS engine was built: model id -> the words
-        #: (`_learn_tools_refused`). Kept for the engine's life and no longer --
-        #: a restart is a fresh start, which is how a backend that was fixed
-        #: gets its tools back.
-        self._tools_refused: dict[str, str] = {}
+        #: The models whose tools this backend has refused, in its own words:
+        #: model id -> what it said (`_learn_tools_refused`). **Not for the
+        #: engine's life**: the backend is asked again every
+        #: `_tools_reask_seconds` while a model is in here, and an answer takes
+        #: it out (`_ask_tools_again`). The driver does not restart with its
+        #: runtime -- the agent restarts an engine under a driver that goes on --
+        #: so a backend fixed in place (llama-server started again with
+        #: `--jinja`) gets its tools back by being asked, not by this being
+        #: rebuilt. A rebuild (a config change) starts empty, as it does for
+        #: everything an engine learns.
+        self._tools_refused: dict[str, _ToolsOff] = {}
+        #: How long between those questions; an attribute so a test need not
+        #: wait ten minutes.
+        self._tools_reask_seconds = TOOLS_REASK_SECONDS
+        #: The one task asking, while any model's tools are off. Started by the
+        #: first refusal, ends when none are, and is cancelled by `aclose()`.
+        self._tools_watch: asyncio.Task[None] | None = None
         #: Per instance, shadowing the class's True: one model on OpenAI's
         #: own endpoint takes tools on Responses only (`_RESPONSES_ONLY_TOOLS`).
         #: An account says per model in its catalogue instead.
-        self.supports_tool_calling = not (
-            model_id is not None and self._chat_tools_unavailable(self._upstream_model_id)
-        )
+        self.supports_tool_calling = self._tool_calling_assumed()
         self.backend_kind = backend_kind
         self._thinking_mode = thinking_mode or "auto"
         self._filter_models = filter_models
@@ -819,7 +896,7 @@ class OpenAiCompatibleHttpEngine:
                 fetch=self._fetch_catalogue,
                 get=get or (lambda _key: None),
                 path=catalogue_path,
-                view=self._tools_view,
+                view=self._served_view,
             )
         #: The supervised runtime this engine follows, when `base_url` was
         #: resolved from one. Reported on `/v1/info` so the gateway and
@@ -889,7 +966,14 @@ class OpenAiCompatibleHttpEngine:
         return self._http_client
 
     async def aclose(self) -> None:
-        """Release the connection pool. Idempotent."""
+        """Stop asking about tools, and release the connection pool. Idempotent."""
+        watch, self._tools_watch = self._tools_watch, None
+        if watch is not None and not watch.done():
+            watch.cancel()
+            # `wait`, not `await watch`: it does not re-raise how the task ended, and a
+            # cancellation of THIS coroutine still propagates instead of being swallowed
+            # with the watcher's own.
+            await asyncio.wait({watch})
         client, self._http_client = self._http_client, None
         if client is not None:
             await client.aclose()
@@ -1095,58 +1179,194 @@ class OpenAiCompatibleHttpEngine:
         """A model OpenAI's own Chat Completions serves without tools."""
         return self._dialect.openai_parameters and bool(_RESPONSES_ONLY_TOOLS.match(upstream))
 
+    def _tool_calling_assumed(self) -> bool:
+        """What `supports_tool_calling` is until a backend says otherwise: True, but
+        for the one model on OpenAI's own endpoint that takes tools on Responses only.
+        An account says per model in its catalogue instead."""
+        return not (
+            self._model_id is not None and self._chat_tools_unavailable(self._upstream_model_id)
+        )
+
     # -- tools: assumed, and off only on the backend's own word ---------------
 
+    @property
+    def tools_reask_seconds(self) -> float:
+        """How often a backend that refused tools is asked again."""
+        return self._tools_reask_seconds
+
     def tools_refused_words(self, model: str | None = None) -> str | None:
-        """The backend's own words, if it has refused tools for this model since
-        this engine was built; None while tools are still assumed.
+        """The backend's own words, if it has refused tools for this model and has
+        not answered a request carrying a tool since; None while tools are assumed.
 
         `model` is what the request named, or None for a single-model driver,
         which has one model whatever the request says. The route reads this to
         say WHY a later request is refused at the door instead of at the backend.
         """
-        return self._tools_refused.get(model or self._model_id or "")
+        off = self._tools_refused.get(model or self._model_id or "")
+        return off.words if off is not None else None
 
     def _learn_tools_refused(self, target: _Target, words: str, status: int) -> None:
         """Remember that the backend refused this model's tools, in its own words.
 
-        Said once at INFO, per model per engine: every later request carrying
-        tools is refused at the driver's door (`_refuse_unsupported_tools`)
-        without another trip to a backend that has already answered.
+        Said once at INFO, per model: every later request carrying tools is refused
+        at the driver's door (`_refuse_unsupported_tools`) without another trip to a
+        backend that has already answered, until the backend is asked again and
+        answers (`_ask_tools_again`).
         """
         if target.id in self._tools_refused:
             return
-        self._tools_refused[target.id] = words
+        self._tools_refused[target.id] = _ToolsOff(words=words, upstream=target.upstream)
         if target.entry is None:
             self.supports_tool_calling = False
         log.info(
             "%s answered HTTP %d to a request carrying tools: %r. Reporting toolCalling false "
-            "for %r until this driver restarts; said once.",
+            "for %r. This driver asks the backend again every %s, with a one-token request "
+            "that carries a tool, and reports tools again the first time it answers one; "
+            "said once.",
             self._base_url,
             status,
             words,
             target.id,
+            every(self._tools_reask_seconds),
+        )
+        self._watch_tools()
+
+    def _clear_tools_refused(self, model_id: str) -> None:
+        """The backend answered a request carrying a tool: tools are assumed again."""
+        if self._tools_refused.pop(model_id, None) is None:
+            return
+        if self.catalogue is None:
+            self.supports_tool_calling = self._tool_calling_assumed()
+        log.info(
+            "%s answered a request carrying a tool for %r. Reporting toolCalling true again.",
+            self._base_url,
+            model_id,
         )
 
-    def _tools_view(self, model: DriverModel) -> DriverModel:
-        """An account's model as it is served: tools off when its backend has
-        refused them since this engine was built.
+    def _watch_tools(self) -> None:
+        """Start asking the backend again, unless something already is.
 
-        A copy, never the stored entry: the list is saved to disk and refreshed
-        from the provider, and what a backend said in this engine's life must not
-        outlive it in either.
+        One task for the engine, however many of its models are off: it ends when
+        none are, a later refusal starts another, and `aclose()` cancels it. Nothing
+        starts without a running loop (a synchronous caller has no one to ask on).
         """
-        if model.id not in self._tools_refused:
+        if self._tools_watch is not None and not self._tools_watch.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._tools_watch = loop.create_task(self._ask_tools_again(), name="tools-again")
+
+    async def _ask_tools_again(self) -> None:
+        """Every `_tools_reask_seconds`, ask the backend about each model whose tools
+        are off, until none are.
+
+        **This is what stops a learned "no" outliving its cause.** The driver does not
+        restart when its runtime does (the agent restarts an engine under a driver
+        that goes on), so a llama-server started again with `--jinja` would otherwise
+        stay unable to take tools until someone rebuilt this engine.
+        """
+        while self._tools_refused:
+            await asyncio.sleep(self._tools_reask_seconds)
+            try:
+                await self._ask_tools_once()
+            except Exception:  # the one asker must outlive a surprise, tools still off
+                log.warning(
+                    "asking %s about tools again failed unexpectedly; will ask again",
+                    self._base_url,
+                    exc_info=True,
+                )
+
+    async def _ask_tools_once(self) -> None:
+        """One round of asking: each model whose tools are off, once. An answer clears
+        it; a refusal keeps it, and so does anything that says nothing of tools."""
+        for model_id, off in list(self._tools_refused.items()):
+            if self.catalogue is not None and self.catalogue.find(model_id) is None:
+                # This account no longer serves it (the list moved, or a filter now
+                # leaves it out): nothing is asking, and a later refusal learns it again.
+                self._tools_refused.pop(model_id, None)
+                continue
+            if await self._tools_answered(off.upstream) is True:
+                self._clear_tools_refused(model_id)
+
+    async def _tools_answered(self, upstream: str) -> bool | None:
+        """Ask the backend whether it takes tools now, with the smallest request that
+        carries one: a one-token generation, and a tool with no parameters.
+
+        True: it answered. False: it refused in the words that turned tools off, so
+        they stay off. None: it could not say (unreachable, still loading, any other
+        answer), which neither clears nor confirms, and is asked again at the next
+        interval. Only a refusal in the measured words is a "no", exactly as when it
+        was learned (`failures.tools_refusal`).
+        """
+        body = {
+            "model": upstream,
+            "messages": [{"role": "user", "content": "Hi"}],
+            self._dialect.max_tokens_field: 1,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "probe",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        }
+        try:
+            response = await self._client().post(
+                "/v1/chat/completions",
+                headers=self._headers(),
+                json=body,
+                timeout=_TOOLS_ASK_TIMEOUT,
+            )
+        except httpx.HTTPError as e:
+            log.debug("asking %s about tools again: could not say (%r)", self._base_url, e)
+            return None
+        if response.is_success:
+            return True
+        if tools_refusal(response.text[:4000]) is not None:
+            return False
+        log.debug(
+            "asking %s about tools again: HTTP %d, which says nothing of tools",
+            self._base_url,
+            response.status_code,
+        )
+        return None
+
+    def _served_view(self, model: DriverModel) -> DriverModel:
+        """An account's model as it is SERVED: what this engine knows about its
+        backend, laid over the provider's own listing.
+
+        * A chat model carries `settingsNotHonoured` where the backend has gaps
+          (`settings_not_honoured`), which are static and so not in the listing.
+        * A model whose tools the backend has refused says `toolCalling` false and
+          carries no `tools`. It keeps `toolChoice` and `parallelToolCalls`: they say
+          nothing on a request without tools, which is dropped of them rather than
+          refused (`_payload_for`), so a harness that sends them on every request
+          (Codex does) can still chat with it.
+
+        A copy, never the stored entry: the list is saved to disk and refreshed from
+        the provider, and what a backend said in this engine's life must not outlive
+        it in either.
+        """
+        caps = model.capabilities
+        if caps is None:
             return model
-        shown = model.model_copy(deep=True)
-        if shown.capabilities is not None:
-            shown.capabilities.toolCalling = False
-            shown.capabilities.supportedSettings = [
-                s
-                for s in (shown.capabilities.supportedSettings or [])
-                if s not in _CHAT_TOOL_SETTINGS
+        gaps = self.settings_not_honoured() if "chat" in model.surfaces else []
+        off = model.id in self._tools_refused
+        if not gaps and not off:
+            return model
+        update: dict[str, Any] = {}
+        if gaps:
+            update["settingsNotHonoured"] = gaps
+        if off:
+            update["toolCalling"] = False
+            update["supportedSettings"] = [
+                s for s in (caps.supportedSettings or []) if s != "tools"
             ]
-        return shown
+        return model.model_copy(update={"capabilities": caps.model_copy(update=update)})
 
     def _upstream_refusal(
         self,
@@ -1174,7 +1394,9 @@ class OpenAiCompatibleHttpEngine:
             return ToolsRefused(
                 f"openai_compat_http returned {status}: {_redact(text[:500])}. The backend "
                 f"refused this request because it carries tools, in its own words above, so "
-                f"Eugene treats tools as off for {target.id!r} until this driver restarts.",
+                f"Eugene treats tools as off for {target.id!r}. This driver asks the backend "
+                f"again every {every(self._tools_reask_seconds)}, with a one-token request "
+                f"that carries a tool, and turns tools back on the first time it answers one.",
                 words=words,
                 upstream_status=status,
                 retry_after_seconds=retry_after_seconds,
@@ -1186,18 +1408,43 @@ class OpenAiCompatibleHttpEngine:
             retry_after_seconds=retry_after_seconds,
         )
 
-    def ignored_settings(self, request: GenerateRequest) -> list[str]:
-        """The request's fields, in this contract's spelling (`toolChoice`), that
-        the backend is sent and is KNOWN not to honour.
+    def settings_not_honoured(self) -> list[SettingNotHonoured]:
+        """What this backend is sent and does not honour, by value.
 
-        Named on `x-eugene-plexus-ignored-settings` by `POST /v1/generate` and
-        its stream, before the first frame (2026-10-12). A setting a backend is
-        measured not to honour is sent anyway and named, not refused: a refusal
-        is for what cannot be sent at all. None here -- these backends honour what
-        they are sent, or refuse what they cannot take, in `_payload_for`. An
-        engine with a measured gap overrides this (Strata: `toolChoice`).
+        Reported as `capabilities.settingsNotHonoured` on every chat model it
+        serves, and the source of the per-request header (`ignored_settings`), so
+        the two cannot disagree. **Static for the backend**, which is why it is
+        reported: the gateway reads it before anything is sent, so a stream opens
+        as it always has instead of waiting for this driver's first frame.
+
+        Ollama's here (`unread_tool_settings`); Strata's is its own
+        (`StrataHttpEngine`). Every other backend this engine fronts honours what it
+        is sent, or refuses what it cannot take, in `_payload_for`.
         """
-        return []
+        return unread_tool_settings() if self._dialect.catalogue == "ollama" else []
+
+    def _reads_tool_choice(self) -> bool:
+        """Whether the backend reads `tool_choice` at all. One that does not is
+        listed for it in `settings_not_honoured`, and cannot be told `none`, so
+        `_payload_for` gives it no tools instead."""
+        return not any(gap.setting == "toolChoice" for gap in self.settings_not_honoured())
+
+    def ignored_settings(self, request: GenerateRequest) -> list[str]:
+        """The request's fields, in this contract's spelling (`toolChoice`), that the
+        backend is sent and is KNOWN not to honour: the values of
+        `settings_not_honoured` this request carries, in its order.
+
+        Named on `x-eugene-plexus-ignored-settings` by `POST /v1/generate` and its
+        stream, before the first frame (2026-10-12). A setting a backend is measured
+        not to honour is sent anyway and named, not refused: a refusal is for what
+        cannot be sent at all. Nothing is named for `tool_choice: none` to a backend
+        that does not read it: it is honoured, by sending no tools, and what rode with
+        them (`parallel_tool_calls`) went with them.
+        """
+        gaps = self.settings_not_honoured()
+        if not gaps or (request.toolChoice == ToolChoice.none and not self._reads_tool_choice()):
+            return []
+        return [gap.setting for gap in gaps if _contract_value(request, gap.setting) in gap.values]
 
     def resolve_model(self, requested: str | None) -> _Target:
         """The model a request is for, or `ModelNotServed` / `ModelRequired`.
@@ -1230,11 +1477,16 @@ class OpenAiCompatibleHttpEngine:
         )
 
     def engine_defaults(self, upstream: str = "") -> EngineDefaults:
-        """What a model inherits where its provider's listing says nothing."""
+        """What a model inherits where its provider's listing says nothing.
+
+        Built without an `id`, on purpose: what this engine has LEARNED about a model
+        (`_tools_refused`) is keyed by it, and a listing's own entry is the provider's
+        word, stored and saved as such. The learned part is laid over it when it is
+        served (`_served_view`), never written into it."""
         return EngineDefaults(
             supported_settings=self._supported_for(
                 _Target(
-                    id=upstream,
+                    id="",
                     upstream=upstream,
                     temperature_fixed=self._fixes_temperature(upstream),
                 )
@@ -1394,8 +1646,13 @@ class OpenAiCompatibleHttpEngine:
             unsupported |= _FIXED_SAMPLER_SETTINGS
         if self._dialect.openai_parameters:
             unsupported |= _LOCAL_ENGINE_SETTINGS
-        if self._chat_tools_unavailable(target.upstream) or target.id in self._tools_refused:
+        if self._chat_tools_unavailable(target.upstream):
             unsupported |= _CHAT_TOOL_SETTINGS
+        if target.id in self._tools_refused:
+            # `tools` alone: the backend refused those. What rides with them says
+            # nothing on a request that carries none, and is dropped there rather
+            # than refused (`_payload_for`), so it stays offered.
+            unsupported.add("tools")
         if self._dialect.catalogue == "ollama":
             unsupported |= _OLLAMA_DROPPED_SETTINGS
         caps = target.entry.capabilities if target.entry is not None else None
@@ -1420,6 +1677,13 @@ class OpenAiCompatibleHttpEngine:
         non-streamed one for the same request. `forced` is the tool a
         named `tool_choice` forces on llama-server (`_forced_tool`).
         """
+        if request.toolChoice == ToolChoice.none and not self._reads_tool_choice():
+            # Honoured as this backend can: it ignores `tool_choice: none` (Strata
+            # called the tool, measured), so the tools are not sent at all, nor what
+            # rides with them. Nothing is left on the request for it to ignore.
+            request = request.model_copy(
+                update={"tools": None, "toolChoice": None, "parallelToolCalls": None}
+            )
         unsupported = self._unsupported_settings(target)
         # **A fixed-sampler model takes logprobs only at reasoning effort
         # `none`** (OpenAI's "Using GPT-6", 2026-10-03), so whether it is
@@ -1439,10 +1703,12 @@ class OpenAiCompatibleHttpEngine:
             )
         if unsupported:
             refuse_unsupported_settings(request, unsupported=set(unsupported))
-        ollama = self._dialect.catalogue == "ollama"
-        # What Ollama ignores by value: `auto` and `true` are what it does
-        # anyway; anything else it would drop without a word.
-        held = self._ollama_ignores(request) if ollama else set()
+        # **Tools the backend refused** (`_learn_tools_refused`): a request that
+        # carries none is not refused for what rides with them (`tool_choice`,
+        # `parallel_tool_calls`; Codex sends both on every request, tools or not).
+        # They say nothing there, so they are dropped, and said once like any other
+        # setting a backend cannot take.
+        companions_dropped = target.id in self._tools_refused and not request.tools
         # Apply the operator's thinkingMode by mutating the system
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
@@ -1513,7 +1779,10 @@ class OpenAiCompatibleHttpEngine:
         ):
             if value is None:
                 continue
-            if field in unsupported or field in held:
+            if companions_dropped and field in _TOOL_COMPANIONS:
+                self._warn_companion_dropped(key, target)
+                continue
+            if field in unsupported:
                 self._warn_dropped(key, target)
                 continue
             payload[key] = value
@@ -1524,8 +1793,8 @@ class OpenAiCompatibleHttpEngine:
         # made one hop earlier.
         if request.tools:
             payload["tools"] = [t.model_dump(mode="json", exclude_none=True) for t in request.tools]
-        if request.toolChoice is not None and "toolChoice" in held:
-            self._warn_dropped("tool_choice", target)
+        if request.toolChoice is not None and companions_dropped:
+            self._warn_companion_dropped("tool_choice", target)
         elif request.toolChoice is not None:
             choice = request.toolChoice
             payload["tool_choice"] = (
@@ -1580,39 +1849,6 @@ class OpenAiCompatibleHttpEngine:
             _force_by_schema(payload, forced)
         return payload
 
-    def _ollama_ignores(self, request: GenerateRequest) -> set[str]:
-        """The tool settings this request sets to something Ollama ignores.
-
-        Ollama's OpenAI-compatible request has no `tool_choice` and no
-        `parallel_tool_calls` (`openai/openai.go`, v0.35.1): it always
-        answers as if `auto` and `true`. Those two values are honoured by
-        that, and Codex sends both on every request; any other value would
-        be dropped without a word, so an explicit one is refused here (A2)
-        and an inherited one is left out with the once-per-field warning.
-        """
-        held: set[str] = set()
-        explicit = set(request.callerSettings or [])
-        choice = request.toolChoice
-        if choice is not None and getattr(choice, "value", None) != "auto":
-            if "toolChoice" in explicit:
-                raise CliError(
-                    "tool_choice: Ollama ignores tool_choice and answers as if it were "
-                    "`auto`, so a required, none or named choice cannot be honoured here; "
-                    "send `auto`, or choose a backend that honours tool_choice.",
-                    upstream_status=400,
-                )
-            held.add("toolChoice")
-        if request.parallelToolCalls is False:
-            if "parallelToolCalls" in explicit:
-                raise CliError(
-                    "parallel_tool_calls: Ollama ignores it and may make several calls in "
-                    "one turn, so false cannot be honoured here; remove it, or choose a "
-                    "backend that honours parallel_tool_calls.",
-                    upstream_status=400,
-                )
-            held.add("parallelToolCalls")
-        return held
-
     async def _forced_tool(self, request: GenerateRequest) -> Tool | None:
         """The tool a named `tool_choice` forces, when the backend is llama-server.
 
@@ -1626,8 +1862,8 @@ class OpenAiCompatibleHttpEngine:
             return None
         if self._dialect.catalogue != "openai":
             # Ollama, LM Studio and OpenRouter are never llama-server, so
-            # there is nothing to ask `/props` (and Ollama refuses a named
-            # choice in `_payload_for` before anything is sent).
+            # there is nothing to ask `/props` (and Ollama is sent a named
+            # choice as it is, and named as ignored, `unread_tool_settings`).
             return None
         tool = next((t for t in request.tools if t.function.name == choice.function.name), None)
         if tool is None or not await self._answers_as_llama_cpp():
@@ -1660,23 +1896,49 @@ class OpenAiCompatibleHttpEngine:
             return target.id
         return str(reported or target.id)
 
-    def _warn_dropped(self, field: str, target: _Target) -> None:
+    def _warn_dropped(self, field: str, target: _Target, *, why: str | None = None) -> None:
         """Say it once per field per engine, not once per request.
 
         The contract promises a parameter we cannot carry is "dropped
         with a warning". A warning on every request would be a log line
         per token-generating call on a busy backend, which is how a
         real warning becomes something an operator filters out.
+
+        `why` is for a field that is left out for a reason other than "this model
+        does not take it": the cause, in words, so the line says what was observed.
         """
         if (target.id, field) in self._warned_dropped:
             return
         self._warned_dropped.add((target.id, field))
+        if why is not None:
+            log.warning(
+                "model %r: omitting `%s` from a request that carries no tools, because %s. "
+                "This is said once per parameter for the life of this engine.",
+                target.id,
+                field,
+                why,
+            )
+            return
         log.warning(
             "model %r does not accept `%s`; the driver is omitting it on every "
             "request and letting the model use its own default. This is said "
             "once per parameter for the life of this engine.",
             target.id,
             field,
+        )
+
+    def _warn_companion_dropped(self, field: str, target: _Target) -> None:
+        """`tool_choice` or `parallel_tool_calls` left out of a request with no tools,
+        while the backend's refusal of tools stands (`_payload_for`)."""
+        off = self._tools_refused.get(target.id)
+        words = f" ({off.words!r})" if off is not None else ""
+        self._warn_dropped(
+            field,
+            target,
+            why=(
+                f"this backend refused tools in its own words{words} and has not taken one "
+                "since, so there is nothing for it to choose among or to run in parallel"
+            ),
         )
 
     def _headers(self) -> dict[str, str]:

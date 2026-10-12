@@ -15,16 +15,22 @@ BASE = "http://127.0.0.1:8095"
 
 def test_supported_settings_exclude_unimplemented_features():
     """What Strata does not take is still not offered (an explicit one is refused, A2).
-    Tools, `tool_choice` and `response_format` are taken since 2026-10-12: measured, it
-    calls tools and answers a JSON schema (`test_strata_tools.py`)."""
+    Tools, `tool_choice`, `parallel_tool_calls` and `response_format` are taken since
+    2026-10-12: measured, it calls tools and answers a JSON schema (`test_strata_tools.py`).
+    `parallel_tool_calls` is offered although Strata ignores `false`: that is named, not
+    refused, because Codex sends it on every request."""
     engine = StrataHttpEngine(base_url=BASE, model_id="qwen", auth_required=False)
     assert engine.supports_tool_calling
-    assert {"temperature", "maxTokens", "topK", "tools", "toolChoice", "responseFormat"} <= set(
-        engine.supported_settings
-    )
-    assert not {"seed", "logprobs", "parallelToolCalls", "frequencyPenalty"} & set(
-        engine.supported_settings
-    )
+    assert {
+        "temperature",
+        "maxTokens",
+        "topK",
+        "tools",
+        "toolChoice",
+        "parallelToolCalls",
+        "responseFormat",
+    } <= set(engine.supported_settings)
+    assert not {"seed", "logprobs", "frequencyPenalty"} & set(engine.supported_settings)
 
 
 @pytest.mark.anyio

@@ -130,12 +130,12 @@ class ToolsRefused(CliError):
     in the routes keeps working, and what it adds is identity. The identity
     matters because of the status. llama-server answers this with a **500**
     (b10948, `--no-jinja`, measured 2026-10-12), which on its own reads as a
-    broken backend: a 502 that cascades, and that the gateway's circuit counts
-    against an engine that is perfectly healthy. It is the request's, and
-    another replica of the same engine would refuse it in the same words, so
-    `failures.disposition` calls it `terminal` and the caller gets a 400 with
-    the backend's own words, as it does for any other refusal a second backend
-    would repeat.
+    broken backend: an `indeterminate` 502, which the gateway does not replay
+    on another backend but does count against the circuit of an engine that is
+    perfectly healthy. It is the request's, and another replica of the same
+    engine would refuse it in the same words, so `failures.disposition` calls
+    it `terminal` and the caller gets a 400 with the backend's own words, as it
+    does for any other refusal a second backend would repeat.
 
     `words` is the backend's message on its own, without the JSON around it.
     """

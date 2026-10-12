@@ -127,7 +127,7 @@ def surfaces_of(model_id: str, methods: set[str]) -> list[str]:
 def _chat_capabilities(entry: dict[str, Any], model_id: str) -> Capabilities:
     gemma = model_id.lower().startswith("gemma")
     thinking = entry.get("thinking") is True
-    settings = [s for s in CHAT_SETTINGS if not (gemma and s in ("tools", "toolChoice"))]
+    settings = list(CHAT_SETTINGS)
     if thinking:
         settings.append("reasoningEffort")
     window = entry.get("inputTokenLimit")
@@ -138,7 +138,14 @@ def _chat_capabilities(entry: dict[str, Any], model_id: str) -> Capabilities:
         imageInput=not gemma,
         audioInput=not gemma,
         fileInput=not gemma,
-        toolCalling=not gemma,
+        # **Every chat model, Gemma included** (Troy, 2026-10-12,
+        # `docs/design/tools-assumed.md`). This was `not gemma`, a name prefix that
+        # nobody measured and that Google's own listing does not say, and it took
+        # `tools` and `toolChoice` out of Gemma's settings with it. Tools are
+        # assumed and turned off only on evidence; Google's listing carries none,
+        # so a model that cannot take them says so in its own words, which the
+        # caller then reads.
+        toolCalling=True,
         maxContextTokens=window if isinstance(window, int) and window > 0 else None,
     )
 

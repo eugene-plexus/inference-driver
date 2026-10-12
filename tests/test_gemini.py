@@ -193,7 +193,10 @@ def test_the_listing_is_paged_and_mapped_to_surfaces_and_capabilities(tmp_path: 
     lite = models["gemini-3.1-flash-lite"]["capabilities"]["supportedSettings"]
     assert "reasoningEffort" not in lite and "tools" in lite
     gemma = models["gemma-3-27b-it"]["capabilities"]
-    assert gemma["toolCalling"] is False and gemma["imageInput"] is False
+    # Tools are assumed for every chat model (Troy, 2026-10-12): this was `toolCalling` false for
+    # a name prefix nobody measured. What Gemma cannot read it still cannot read.
+    assert gemma["toolCalling"] is True and gemma["imageInput"] is False
+    assert {"tools", "toolChoice"} <= set(gemma["supportedSettings"])
     assert models["gemini-3.1-flash-image"]["surfaces"] == ["image"]
     speech = models["gemini-3.8-flash-tts"]
     assert speech["surfaces"] == ["speech"] and len(speech["voices"]) == 30
@@ -630,6 +633,45 @@ def test_a_tool_call_keeps_its_signature_and_gets_it_back_on_the_next_turn(
     assert turns[2]["parts"] == [
         {"functionResponse": {"name": "get_weather", "response": {"temp": 4}}}
     ]
+
+
+@respx.mock
+def test_gemma_is_sent_tools_like_every_chat_model_and_google_answers_for_itself(
+    tmp_path: Path,
+) -> None:
+    """`toolCalling` was `not gemma`, a name prefix nobody measured, and it took `tools` out of
+    Gemma's settings too, so an explicit `tools` was refused before Google was asked. Tools
+    are assumed (Troy, 2026-10-12): they are sent, and a model that cannot take them says so
+    in Google's words, which the caller reads."""
+    client = _start(tmp_path)
+    gemma = f"{BASE}/models/gemma-3-27b-it:generateContent"
+    route = respx.post(gemma).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=_answer([{"functionCall": {"name": "get_weather", "args": {"city": "Oslo"}}}]),
+            ),
+            # Stand-in words, not measured: the point is that whatever Google says is relayed.
+            _error(400, "INVALID_ARGUMENT", "Function calling is not enabled for this model"),
+        ]
+    )
+    asked = _chat(
+        model="gemma-3-27b-it",
+        tools=TOOLS,
+        toolChoice="auto",
+        callerSettings=["tools", "toolChoice"],
+    )
+    with client:
+        carried = client.post("/v1/generate", json=asked)
+        refused = client.post("/v1/generate", json=asked)
+        info = {m["id"]: m for m in client.get("/v1/info").json()["models"]}
+    assert carried.status_code == 200, carried.text
+    assert carried.json()["toolCalls"][0]["function"]["name"] == "get_weather"
+    assert _sent(route, 0)["tools"][0]["functionDeclarations"][0]["name"] == "get_weather"
+    assert refused.status_code == 400
+    assert "Function calling is not enabled for this model" in refused.text
+    # Google's refusal of one request is not evidence about the model, so nothing is turned off.
+    assert info["gemma-3-27b-it"]["capabilities"]["toolCalling"] is True
 
 
 @respx.mock
