@@ -83,7 +83,7 @@ from .._generated.models import (
 )
 from .._http import client_for
 from ..audio_out import AudioAssembly
-from ..failures import input_too_long, request_id, retry_after
+from ..failures import input_too_long, request_id, retry_after, tools_refusal
 from ..images import attachment_kinds, content_wire
 from ..images_out import ImageRefusal as ImageOutRefusal
 from ..images_out import (
@@ -135,7 +135,7 @@ from ._catalogue import (
     with_openrouter_images,
     with_openrouter_videos,
 )
-from ._subprocess import BackendTimeout, CliError
+from ._subprocess import BackendTimeout, CliError, ToolsRefused
 from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_blocks
 from .base import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -704,6 +704,12 @@ class OpenAiCompatibleHttpEngine:
     #: Upstream SSE delivers real per-token deltas, so `stream()`
     #: yields text as the model produces it.
     supports_streaming = True
+    #: **Assumed, and turned off only on evidence** (Troy, 2026-10-12,
+    #: `docs/design/tools-assumed.md`): a chat model on any engine takes tools.
+    #: An engine instance sets it False for one reason only here -- the
+    #: backend refused a request's tools in words this driver has measured
+    #: (`_learn_tools_refused`) -- or because the endpoint is known to serve
+    #: a model without them (`_chat_tools_unavailable`).
     supports_tool_calling = True
     #: Set from `probe_embeddings()` at first ask, not declared --
     #: the backend is the only thing that knows, and it only knows
@@ -780,6 +786,12 @@ class OpenAiCompatibleHttpEngine:
                 "use its own default. Everything else works normally.",
                 model_id,
             )
+        #: The models this backend has refused tools for, in its own words,
+        #: since THIS engine was built: model id -> the words
+        #: (`_learn_tools_refused`). Kept for the engine's life and no longer --
+        #: a restart is a fresh start, which is how a backend that was fixed
+        #: gets its tools back.
+        self._tools_refused: dict[str, str] = {}
         #: Per instance, shadowing the class's True: one model on OpenAI's
         #: own endpoint takes tools on Responses only (`_RESPONSES_ONLY_TOOLS`).
         #: An account says per model in its catalogue instead.
@@ -807,6 +819,7 @@ class OpenAiCompatibleHttpEngine:
                 fetch=self._fetch_catalogue,
                 get=get or (lambda _key: None),
                 path=catalogue_path,
+                view=self._tools_view,
             )
         #: The supervised runtime this engine follows, when `base_url` was
         #: resolved from one. Reported on `/v1/info` so the gateway and
@@ -1082,6 +1095,110 @@ class OpenAiCompatibleHttpEngine:
         """A model OpenAI's own Chat Completions serves without tools."""
         return self._dialect.openai_parameters and bool(_RESPONSES_ONLY_TOOLS.match(upstream))
 
+    # -- tools: assumed, and off only on the backend's own word ---------------
+
+    def tools_refused_words(self, model: str | None = None) -> str | None:
+        """The backend's own words, if it has refused tools for this model since
+        this engine was built; None while tools are still assumed.
+
+        `model` is what the request named, or None for a single-model driver,
+        which has one model whatever the request says. The route reads this to
+        say WHY a later request is refused at the door instead of at the backend.
+        """
+        return self._tools_refused.get(model or self._model_id or "")
+
+    def _learn_tools_refused(self, target: _Target, words: str, status: int) -> None:
+        """Remember that the backend refused this model's tools, in its own words.
+
+        Said once at INFO, per model per engine: every later request carrying
+        tools is refused at the driver's door (`_refuse_unsupported_tools`)
+        without another trip to a backend that has already answered.
+        """
+        if target.id in self._tools_refused:
+            return
+        self._tools_refused[target.id] = words
+        if target.entry is None:
+            self.supports_tool_calling = False
+        log.info(
+            "%s answered HTTP %d to a request carrying tools: %r. Reporting toolCalling false "
+            "for %r until this driver restarts; said once.",
+            self._base_url,
+            status,
+            words,
+            target.id,
+        )
+
+    def _tools_view(self, model: DriverModel) -> DriverModel:
+        """An account's model as it is served: tools off when its backend has
+        refused them since this engine was built.
+
+        A copy, never the stored entry: the list is saved to disk and refreshed
+        from the provider, and what a backend said in this engine's life must not
+        outlive it in either.
+        """
+        if model.id not in self._tools_refused:
+            return model
+        shown = model.model_copy(deep=True)
+        if shown.capabilities is not None:
+            shown.capabilities.toolCalling = False
+            shown.capabilities.supportedSettings = [
+                s
+                for s in (shown.capabilities.supportedSettings or [])
+                if s not in _CHAT_TOOL_SETTINGS
+            ]
+        return shown
+
+    def _upstream_refusal(
+        self,
+        text: str,
+        *,
+        status: int,
+        payload: dict[str, Any],
+        target: _Target,
+        hint: str | None,
+        retry_after_seconds: float | None,
+    ) -> CliError:
+        """The error for a chat request the backend answered with a failure.
+
+        The one place `generate` and `stream` agree on what a failure means, so
+        the two cannot drift. Almost always it is the backend's status and body,
+        as it always was. The exception is a request that carried tools and met
+        one of the wordings `failures.tools_refusal` has measured: that is the
+        backend saying it takes none, which is learned (`_learn_tools_refused`)
+        and raised as `ToolsRefused`, the caller's 400 whatever the status was.
+        A request that sent no tools cannot have been refused for them.
+        """
+        words = tools_refusal(text[:4000]) if payload.get("tools") else None
+        if words is not None:
+            self._learn_tools_refused(target, words, status)
+            return ToolsRefused(
+                f"openai_compat_http returned {status}: {_redact(text[:500])}. The backend "
+                f"refused this request because it carries tools, in its own words above, so "
+                f"Eugene treats tools as off for {target.id!r} until this driver restarts.",
+                words=words,
+                upstream_status=status,
+                retry_after_seconds=retry_after_seconds,
+            )
+        return CliError(
+            f"openai_compat_http returned {status}: "
+            f"{_redact(text[:500]) if hint is None else hint}",
+            upstream_status=status,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+    def ignored_settings(self, request: GenerateRequest) -> list[str]:
+        """The request's fields, in this contract's spelling (`toolChoice`), that
+        the backend is sent and is KNOWN not to honour.
+
+        Named on `x-eugene-plexus-ignored-settings` by `POST /v1/generate` and
+        its stream, before the first frame (2026-10-12). A setting a backend is
+        measured not to honour is sent anyway and named, not refused: a refusal
+        is for what cannot be sent at all. None here -- these backends honour what
+        they are sent, or refuse what they cannot take, in `_payload_for`. An
+        engine with a measured gap overrides this (Strata: `toolChoice`).
+        """
+        return []
+
     def resolve_model(self, requested: str | None) -> _Target:
         """The model a request is for, or `ModelNotServed` / `ModelRequired`.
 
@@ -1277,7 +1394,7 @@ class OpenAiCompatibleHttpEngine:
             unsupported |= _FIXED_SAMPLER_SETTINGS
         if self._dialect.openai_parameters:
             unsupported |= _LOCAL_ENGINE_SETTINGS
-        if self._chat_tools_unavailable(target.upstream):
+        if self._chat_tools_unavailable(target.upstream) or target.id in self._tools_refused:
             unsupported |= _CHAT_TOOL_SETTINGS
         if self._dialect.catalogue == "ollama":
             unsupported |= _OLLAMA_DROPPED_SETTINGS
@@ -1677,10 +1794,12 @@ class OpenAiCompatibleHttpEngine:
             # route needs the 4xx/5xx distinction to decide whether the
             # gateway should cascade past it. Flattening it here is what
             # made an exact refusal look like a broken backend.
-            raise CliError(
-                f"openai_compat_http returned {response.status_code}: "
-                f"{_redact(response.text[:500]) if hint is None else hint}",
-                upstream_status=response.status_code,
+            raise self._upstream_refusal(
+                response.text,
+                status=response.status_code,
+                payload=payload,
+                target=target,
+                hint=hint,
                 retry_after_seconds=retry_after(response.headers.get("Retry-After")),
             )
 
@@ -1899,12 +2018,12 @@ class OpenAiCompatibleHttpEngine:
                     # Nothing has been streamed yet, so this can
                     # still be a status code -- see the same raise in
                     # `generate`.
-                    detail = (
-                        hint if hint is not None else _redact(body.decode("utf-8", "replace")[:500])
-                    )
-                    raise CliError(
-                        f"openai_compat_http returned {response.status_code}: {detail}",
-                        upstream_status=response.status_code,
+                    raise self._upstream_refusal(
+                        body.decode("utf-8", "replace"),
+                        status=response.status_code,
+                        payload=payload,
+                        target=target,
+                        hint=hint,
                         retry_after_seconds=retry_after(response.headers.get("Retry-After")),
                     )
                 if report:

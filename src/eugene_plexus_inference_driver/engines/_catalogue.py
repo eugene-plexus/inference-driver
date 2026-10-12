@@ -481,6 +481,7 @@ class Catalogue:
         fetch: Callable[[], Awaitable[list[DriverModel]]],
         get: Callable[[str], Any],
         path: Path | None = None,
+        view: Callable[[DriverModel], DriverModel] | None = None,
     ) -> None:
         self.source = source
         #: Where the list came from -- the provider plus the address. A
@@ -489,6 +490,11 @@ class Catalogue:
         self._fetch = fetch
         self._get = get
         self._path = path
+        #: How a model is SERVED, by whoever owns the account: the engine says
+        #: which of its models the backend has since refused tools for. Applied
+        #: where models are handed out (`exposed`, `find`) and never to what is
+        #: stored, so it is neither saved to disk nor lost on a refresh.
+        self._view = view or (lambda model: model)
         self._models: list[DriverModel] = []
         self._by_id: dict[str, DriverModel] = {}
         self._refreshed_at: _dt.datetime | None = None
@@ -518,7 +524,7 @@ class Catalogue:
 
     def exposed(self) -> list[DriverModel]:
         include, exclude = self.patterns()
-        return [m for m in self._models if exposed_by(include, exclude, m.id)]
+        return [self._view(m) for m in self._models if exposed_by(include, exclude, m.id)]
 
     def find(self, model_id: str) -> DriverModel | None:
         """The model, if this account lists it AND its patterns keep it."""
@@ -526,7 +532,7 @@ class Catalogue:
         if model is None:
             return None
         include, exclude = self.patterns()
-        return model if exposed_by(include, exclude, model.id) else None
+        return self._view(model) if exposed_by(include, exclude, model.id) else None
 
     def summary(self) -> DriverCatalogue:
         include, exclude = self.patterns()

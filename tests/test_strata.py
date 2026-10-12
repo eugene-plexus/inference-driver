@@ -14,10 +14,15 @@ BASE = "http://127.0.0.1:8095"
 
 
 def test_supported_settings_exclude_unimplemented_features():
+    """What Strata does not take is still not offered (an explicit one is refused, A2).
+    Tools, `tool_choice` and `response_format` are taken since 2026-10-12: measured, it
+    calls tools and answers a JSON schema (`test_strata_tools.py`)."""
     engine = StrataHttpEngine(base_url=BASE, model_id="qwen", auth_required=False)
-    assert not engine.supports_tool_calling
-    assert {"temperature", "maxTokens", "topK"} <= set(engine.supported_settings)
-    assert not {"tools", "toolChoice", "responseFormat", "seed", "logprobs"} & set(
+    assert engine.supports_tool_calling
+    assert {"temperature", "maxTokens", "topK", "tools", "toolChoice", "responseFormat"} <= set(
+        engine.supported_settings
+    )
+    assert not {"seed", "logprobs", "parallelToolCalls", "frequencyPenalty"} & set(
         engine.supported_settings
     )
 

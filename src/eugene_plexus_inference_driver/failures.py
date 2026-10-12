@@ -1,5 +1,6 @@
 """Conservative execution outcomes; transport silence never proves no work."""
 
+import json
 import math
 import re
 from contextvars import ContextVar
@@ -88,6 +89,67 @@ def input_too_long(text: str) -> bool:
     return _INPUT_TOO_LONG.search(text) is not None
 
 
+#: The backend's whole message, for each backend that has been MEASURED
+#: refusing a request because it carries tools. Tools are assumed to work
+#: (`docs/design/tools-assumed.md`, Troy 2026-10-12), so this table is the
+#: only thing that turns them off for an engine, and it is deliberately
+#: short and exact: a pattern that matched an unrelated refusal would take
+#: tools away from a backend that serves them. **A wording goes in here only
+#: after it has been seen on the wire, never from reading the source.**
+#:
+#: * llama-server b10948 started with `--no-jinja` (its own `--help` says jinja
+#:   is on by default), measured 2026-10-12 on Qwen3-0.6B, CPU: every
+#:   request with a non-empty `tools` -- auto, `required`, `none` and
+#:   streamed alike -- is
+#:   `HTTP 500 {"error":{"code":500,"message":"tools param requires --jinja
+#:   flag","type":"server_error"}}`. **A 500, not a 4xx**, which is why this
+#:   keys on the words and not on the status. The same engine's words for a
+#:   malformed tool definition ("Failed to parse tools: ...") and for a
+#:   request with no `messages` ("'messages' is required") are not these.
+#:
+#: Ollama's "does not support tools" is named in the contract but is NOT here:
+#: no Ollama was available to measure on 2026-10-12.
+_TOOLS_REFUSALS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"tools param requires --jinja flag\.?"),
+)
+
+
+def _backend_message(body: str) -> str | None:
+    """The one message a backend's error body carries, or None.
+
+    OpenAI's shape (`{"error": {"message": ...}}`, which llama-server and Strata
+    answer, measured), a bare `{"error": "..."}` or `{"message": ...}`, or a body
+    that is plain text. Nothing else: a body this does not understand is not one
+    whose words are matched.
+    """
+    text = body.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(parsed, dict):
+        return None
+    error = parsed.get("error", parsed.get("message"))
+    if isinstance(error, dict):
+        error = error.get("message")
+    return error.strip() if isinstance(error, str) and error.strip() else None
+
+
+def tools_refusal(body: str) -> str | None:
+    """The backend's own words, when `body` is a measured refusal of tools.
+
+    The match is on the WHOLE message, not on a phrase somewhere in it, so an
+    unrelated error that merely mentions tools, quotes a request, or comes
+    from a proxy in front of the backend does not turn tools off.
+    """
+    message = _backend_message(body)
+    if message is not None and any(p.fullmatch(message) for p in _TOOLS_REFUSALS):
+        return message
+    return None
+
+
 def capacity_refused(error: Exception) -> bool:
     """True when the backend refused for want of room, not for a fault.
 
@@ -112,6 +174,13 @@ def disposition(error: Exception) -> str:
     if isinstance(status, int) and 400 <= status < 500 and status not in {408, 409, 425}:
         return "terminal"
     if _TEMPLATE_REFUSAL.search(str(error)) or input_too_long(str(error)):
+        return "terminal"
+    # A refusal of the request's tools, whatever status the backend gave it
+    # (llama-server's is a 500): the same request fails the same way on every
+    # replica, and says nothing about the backend's health.
+    from .engines._subprocess import ToolsRefused  # the engines import this module
+
+    if isinstance(error, ToolsRefused):
         return "terminal"
     return "indeterminate"
 

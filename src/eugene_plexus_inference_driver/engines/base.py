@@ -223,7 +223,16 @@ class BackendEngine(Protocol):
     rather than dropping the field. **Defaults to False so a new engine
     is honest by omission** -- the failure mode of the opposite default
     is a harness receiving a plain answer it cannot distinguish from the
-    model declining to call anything."""
+    model declining to call anything.
+
+    **What False means is narrow** (Troy, 2026-10-12,
+    `docs/design/tools-assumed.md`): this engine has no way to carry
+    tools to its backend (the subscription CLIs), or its backend has
+    refused them, in its own words (the HTTP engine, from
+    `failures.tools_refusal`). An engine that CAN carry tools says True
+    for every model and configuration, tested or not: "we have not tried
+    it" is not evidence. Until 2026-10-12 Strata shipped False for
+    exactly that reason and, measured, it calls tools correctly."""
 
     supports_streaming: bool
     """Whether `stream()` emits genuinely incremental tokens.

@@ -7,7 +7,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, cast
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -46,9 +46,29 @@ router = APIRouter(tags=["inference"])
 
 log = logging.getLogger(__name__)
 
+#: The request's fields, in this contract's spelling (`toolChoice`), that the
+#: backend was sent and is known not to honour (2026-10-12,
+#: `docs/design/tools-assumed.md`). Comma-separated, absent when there is none.
+IGNORED_SETTINGS_HEADER = "x-eugene-plexus-ignored-settings"
+
+
+def _ignored_settings_headers(engine: BackendEngine, body: GenerateRequest) -> dict[str, str]:
+    """The ignored-settings header for this request, or nothing.
+
+    The engine says (`ignored_settings`, an optional hook like
+    `probe_embeddings`): it alone knows which values of which settings its
+    backend has been measured not to honour. Known before anything is sent, so a
+    stream carries it on its first byte. A setting the backend is known to drop
+    is sent anyway and named here, rather than refused: a refusal is for what
+    cannot be sent at all.
+    """
+    named = getattr(engine, "ignored_settings", None)
+    fields = list(dict.fromkeys(named(body))) if named is not None else []
+    return {IGNORED_SETTINGS_HEADER: ", ".join(fields)} if fields else {}
+
 
 @router.post("/v1/generate", response_model=GenerateResponse)
-async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
+async def generate(request: Request, body: GenerateRequest, response: Response) -> GenerateResponse:
     engine: BackendEngine | None = request.app.state.adapter
     if engine is None:
         raise _not_configured(getattr(request.app.state, "adapter_error", None))
@@ -61,6 +81,7 @@ async def generate(request: Request, body: GenerateRequest) -> GenerateResponse:
     _refuse_unsupported_tools(engine, body, entry)
     _refuse_audio_output(engine, body, entry, formats=BATCH_FORMATS)
     await _validate_content(engine, body, entry)
+    response.headers.update(_ignored_settings_headers(engine, body))
     try:
         return await serve_while_connected(request, engine.generate(body), what="a generation")
     except ClientGone as e:
@@ -109,6 +130,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
     _refuse_unsupported_tools(engine, body, entry)
     _refuse_audio_output(engine, body, entry, formats=STREAM_FORMATS)
     await _validate_content(engine, body, entry)
+    headers = _ignored_settings_headers(engine, body)
 
     stream = engine.stream(body)
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
@@ -154,7 +176,7 @@ async def generate_stream(request: Request, body: GenerateRequest) -> StreamingR
             # collected.
             await stream.aclose()
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(events(), media_type="text/event-stream", headers=headers)
 
 
 @router.post("/v1/generate/count", response_model=TokenCount)
@@ -563,6 +585,12 @@ def _refuse_unsupported_tools(
 
     400 and not 502: nothing is wrong with the backend, the request is
     asking it for something it does not do.
+
+    **Only where there is a reason** (Troy, 2026-10-12): tools are assumed to
+    work, so a driver says False for an engine it has no way to carry tools to,
+    for a provider's own word on a model, or because the backend refused a
+    request's tools in its own words. In that last case the refusal says what the
+    backend said, which is the observed cause, not a guess at one.
     """
     if not body.tools:
         return
@@ -572,6 +600,19 @@ def _refuse_unsupported_tools(
     elif getattr(engine, "supports_tool_calling", False):
         return
     kind_label = getattr(engine.backend_kind, "value", str(engine.backend_kind))
+    words_of = getattr(engine, "tools_refused_words", None)
+    words = words_of(body.model) if words_of is not None else None
+    if words is not None:
+        why = (
+            f"This driver's backend ({kind_label}) refused a request for its tools earlier, "
+            f"in its own words: {words!r}. Eugene treats tools as off for it until this "
+            "driver restarts, so the request was refused rather than answered without them. "
+        )
+    else:
+        why = (
+            f"This driver's backend ({kind_label}) cannot carry tool definitions, "
+            "so the request was refused rather than answered without them. "
+        )
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=Problem(
@@ -579,9 +620,7 @@ def _refuse_unsupported_tools(
             title="Tools not supported by this backend",
             status=400,
             detail=(
-                f"This driver's backend ({kind_label}) cannot carry tool definitions, "
-                "so the request was refused rather than answered without them. "
-                "GET /v1/info reports capabilities.toolCalling; the gateway reports "
+                why + "GET /v1/info reports capabilities.toolCalling; the gateway reports "
                 "the same per model as x_eugene_plexus.tool_calling on GET /v1/models."
             ),
             component=f"inference-driver:{kind_label}",

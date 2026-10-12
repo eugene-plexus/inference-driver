@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -165,7 +165,7 @@ async def _drive(adapter: _HangingAdapter, call: Any) -> None:
 async def test_a_gateway_that_gave_up_cancels_the_generation() -> None:
     adapter = _HangingAdapter()
     body = GenerateRequest(messages=[{"role": "user", "content": "hi"}])
-    await _drive(adapter, lambda r: generate(r, body))
+    await _drive(adapter, lambda r: generate(r, body, Response()))
     assert adapter.cancelled, "the engine was left computing for nobody"
     assert not adapter.finished
 
@@ -208,7 +208,7 @@ async def test_a_caller_that_stays_gets_its_answer() -> None:
     app = _app(adapter)
     gone = asyncio.Event()  # never set
     body = GenerateRequest(messages=[{"role": "user", "content": "hi"}])
-    result = await asyncio.wait_for(generate(_request(app, gone), body), timeout=5)
+    result = await asyncio.wait_for(generate(_request(app, gone), body, Response()), timeout=5)
     assert result.content == "the answer"
 
 
