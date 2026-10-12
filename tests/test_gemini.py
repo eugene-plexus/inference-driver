@@ -854,7 +854,7 @@ def test_info_names_the_gap_on_every_chat_model_and_on_nothing_else(tmp_path: Pa
         models = {m["id"]: m["capabilities"] for m in client.get("/v1/info").json()["models"]}
     for model in CHAT_MODELS:
         assert models[model]["settingsNotHonoured"] == PARALLEL_GAP, model
-        # A measured gap is named, not refused, so it is offered too (the contract says so).
+        # A gap is named, not refused, so it is offered too (the contract says so).
         assert "parallelToolCalls" in models[model]["supportedSettings"], model
     for model in NOT_CHAT:
         assert "settingsNotHonoured" not in models[model], model
@@ -880,6 +880,60 @@ def test_the_gap_is_laid_over_the_listing_and_never_saved_into_it(tmp_path: Path
     served = {m["id"]: m["capabilities"] for m in info["models"]}
     assert served[CHAT]["settingsNotHonoured"] == PARALLEL_GAP
     assert "settingsNotHonoured" not in served["gemini-embedding-001"]
+
+
+@respx.mock
+def test_serving_a_model_never_changes_the_entry_the_driver_stores(tmp_path: Path) -> None:
+    """`_served_view` lays the gap over a COPY. The stored entries are Google's own word, saved to
+    disk and read again on every refresh; one that came to carry the gap would be saved with it
+    by the next write, and a list read from Google would then be said to carry what Google never
+    said. The saved file cannot show this (it is written when the list is read, before anything
+    is served), so this looks at the entries in memory after `/v1/info` has served every one.
+    A view that wrote its answer onto the entry it was handed (`caps.settingsNotHonoured = ...;
+    return model`) is the break it catches."""
+    client = _start(tmp_path)
+    with client:
+        info = client.get("/v1/info").json()
+        stored = list(client.app.state.adapter.catalogue._models)  # type: ignore[attr-defined]
+    served = {m["id"]: m["capabilities"] for m in info["models"]}
+    assert served[CHAT]["settingsNotHonoured"] == PARALLEL_GAP, "the served entry carries it"
+    assert {m.id for m in stored} == set(served), "every entry the driver stores was served"
+    assert any("chat" in m.surfaces for m in stored)
+    for entry in stored:
+        assert entry.capabilities is None or entry.capabilities.settingsNotHonoured is None, (
+            entry.id
+        )
+
+
+@respx.mock
+def test_a_count_in_a_refusal_builds_no_served_view(tmp_path: Path) -> None:
+    """A refusal that says how many models the account serves counts them
+    (`catalogue.summary().exposed`) and builds no view: `exposed()` makes one for every model,
+    and a request to one that is not served, or names no model, is the cheap path."""
+    from eugene_plexus_inference_driver.engines.base import ModelNotServed, ModelRequired
+
+    client = _start(tmp_path)
+    with client:
+        engine = client.app.state.adapter  # type: ignore[attr-defined]
+        built: list[str] = []
+        real = engine.catalogue._view
+
+        def counting(model: Any) -> Any:
+            built.append(model.id)
+            return real(model)
+
+        engine.catalogue._view = counting
+
+        with pytest.raises(ModelRequired) as required:
+            engine.resolve_model(None)
+        assert "serving 9 models" in str(required.value)
+        with pytest.raises(ModelNotServed) as missing:
+            engine.resolve_model("gemini-9")
+        assert missing.value.served == 9
+        assert built == [], "a count needs no view"
+
+        engine.resolve_model(CHAT)
+        assert built == [CHAT], "and a request builds the one it is for"
 
 
 @respx.mock

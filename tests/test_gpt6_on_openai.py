@@ -156,6 +156,37 @@ def test_responses_only_tool_models_are_not_tool_capable_on_chat(model: str) -> 
     assert not settings & {"tools", "toolChoice", "parallelToolCalls"}
 
 
+@respx.mock
+async def test_a_request_with_no_tools_to_a_responses_only_model_is_not_refused_for_tool_settings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One rule for any model whose tools are off, whether learned, listed or the endpoint's own
+    (round four). Codex sends `tool_choice` and `parallel_tool_calls` on every request, tools or
+    not, as explicit settings, and for this model both were a 400 (`this engine cannot honor this
+    explicit setting`) although they say nothing without tools. Dropped, once per field and with
+    the cause in words; a request that does carry tools is still refused."""
+    caplog.set_level("WARNING", logger="eugene_plexus_inference_driver.engines.openai_compat_http")
+    route = respx.post(f"{OPENAI}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=OK)
+    )
+    engine = _openai("gpt-6-astra")
+    try:
+        for _ in range(2):
+            await engine.generate(_ask("gpt-6-astra", toolChoice="auto", parallelToolCalls=False))
+        sent = json.loads(route.calls[-1].request.content)
+        assert not {"tools", "tool_choice", "parallel_tool_calls"} & sent.keys()
+        with pytest.raises(CliError) as refused:
+            await engine.generate(_ask("gpt-6-astra", tools=[TOOL]))
+        assert refused.value.upstream_status == 400
+        assert len(route.calls) == 2, "the request that carries tools was refused before HTTP"
+    finally:
+        await engine.aclose()
+    left_out = [r.getMessage() for r in caplog.records if "omitting `" in r.getMessage()]
+    assert sum("`tool_choice`" in m for m in left_out) == 1, left_out
+    assert sum("`parallel_tool_calls`" in m for m in left_out) == 1, left_out
+    assert all("Responses API only" in m and "carries no tools" in m for m in left_out)
+
+
 @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-4.1"])
 def test_the_other_gpt_models_keep_their_tools(model: str) -> None:
     engine = _openai(model)

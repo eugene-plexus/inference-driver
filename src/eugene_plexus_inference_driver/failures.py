@@ -89,11 +89,11 @@ def input_too_long(text: str) -> bool:
     return _INPUT_TOO_LONG.search(text) is not None
 
 
-#: llama-server's words while its model is not in memory yet, in the two forms
-#: this driver reports them: the whole JSON body of a chat or an embeddings
-#: request (`"message":"Loading model"`, whatever order the keys come in), and
-#: the bare message of a rerank (`...for a rerank: Loading model`, which the
-#: engine reduces to the backend's message). Measured 2026-10-12 on b10948,
+#: llama-server's words while its model is not in memory yet, as the whole of the
+#: backend's message: the error object's `message` of a chat or an embeddings body
+#: (`{"error":{"message":"Loading model",...}}`, whatever order the keys come in), and
+#: the bare message of a rerank (`...for a rerank: Loading model`, which the engine
+#: reduces to the backend's message). Measured 2026-10-12 on b10948,
 #: Qwen3-0.6B on the CPU, polling from the moment the port was bound: for the
 #: ~0.7 s the model took, **every path that needs it answered HTTP 503 with the
 #: same 75 bytes** -- chat (streamed or not, with tools or without), embeddings
@@ -104,8 +104,13 @@ def input_too_long(text: str) -> bool:
 #: loading is exactly the one a healthy sibling should be tried before
 #: (inference-driver#10). Only these words, as the whole message, and only with
 #: the 503 (`loading_refused`): a 502 or a 500 that merely mentions loading is
-#: not llama-server's refusal.
-_LOADING = re.compile(r'(?:"message"\s*:\s*"|: )Loading model(?:"|\.?\s*\Z)')
+#: not llama-server's refusal, and neither is a body that has the words somewhere
+#: else in it (echoed in another field, behind a proxy's own words, or as the message
+#: of an object nested in the error's own), which a search of the whole text took for it
+#: until round four. The match is on the message and not on the text, as
+#: `tools_refusal` matches a refusal of tools. A full stop after it is the one thing
+#: allowed, as there.
+_LOADING = re.compile(r"Loading model\.?")
 
 
 #: The backend's whole message, for each backend that has been MEASURED
@@ -202,6 +207,19 @@ def capacity_refused(error: Exception) -> bool:
     return bool(_POOL_FULL.search(str(error)))
 
 
+def _backend_body(error: Exception) -> str | None:
+    """What this driver's failure text says the backend answered, or None.
+
+    A failure here reads `<the driver's own words>: <the backend's body>`
+    (`openai_compat_http returned 503: {...}`, `... returned 503 for embeddings: {...}`,
+    `... returned 503 for a rerank: Loading model`, `... stream error: Loading model`), and the
+    driver's own words have no colon in them: the body is what follows the first one. A text
+    with no such split says nothing of what the backend answered.
+    """
+    _words, colon, body = str(error).partition(": ")
+    return body if colon else None
+
+
 def loading_refused(error: Exception) -> bool:
     """True when the backend refused because its model is not in memory yet.
 
@@ -211,8 +229,19 @@ def loading_refused(error: Exception) -> bool:
     something untrue of it. **Keyed on the 503 and the words together**: the words
     under another status are not llama-server's, and a 503 with other words is a
     backend that may be broken, which stays `indeterminate`.
+
+    **The words are the backend's whole message, not something its body mentions.** The
+    body is read as `tools_refusal` reads one (`_backend_message`): the error object's
+    `message`, a bare `error` or `message`, or plain text. A 503 whose body echoes the
+    words in another field, has a proxy's own words before them, or carries them in an
+    object nested in the error's own is not llama-server's loading engine, and is
+    `indeterminate` like any other 503 of unknown cause.
     """
-    return getattr(error, "upstream_status", None) == 503 and bool(_LOADING.search(str(error)))
+    if getattr(error, "upstream_status", None) != 503:
+        return False
+    body = _backend_body(error)
+    message = _backend_message(body) if body is not None else None
+    return message is not None and _LOADING.fullmatch(message) is not None
 
 
 def disposition(error: Exception) -> str:

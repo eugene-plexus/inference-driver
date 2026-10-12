@@ -12,7 +12,8 @@ once, streamed, and the round trip with the tool's result -- and answers
 `response_format` natively (`json_schema` and `json_object`). Three things it does
 not do. The first two are sent anyway and named, never refused
 (`settings_not_honoured`, reported as `capabilities.settingsNotHonoured` and, per
-request, on `x-eugene-plexus-ignored-settings`):
+request, on `x-eugene-plexus-ignored-settings`, which names only what the caller
+lists in `callerSettings`: a direct caller that lists none is named nothing):
 
 * **It ignores `tool_choice`**, all of it: `none` still called the tool,
   `required` answered "Hello!", and a named function called another one. So
@@ -53,11 +54,25 @@ from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target, unread_tool
 
 #: What Strata's endpoint can carry, of the request's settings. `tools`,
 #: `toolChoice`, `parallelToolCalls` and `responseFormat` are here since
-#: 2026-10-12; the rest is what it always took. `seed` and the logprob family are
-#: not: nothing has shown Strata honours them, and an explicit one is refused
-#: rather than dropped (A2). (`toolChoice` and `parallelToolCalls` are listed AND
-#: partly ignored: a setting Strata is measured not to obey is sent and named,
+#: 2026-10-12; **`seed`, `frequencyPenalty` and `presencePenalty` since round
+#: four**: Strata's own source reads all three per request (`sampling_keys` forwards
+#: `seed`, `frequency_penalty` and `presence_penalty` from the request's own fields;
+#: its documentation: "Temperature / top_p / top_k / min_p / seed are honored per
+#: request ... The penalties ... ride the same path"), and one measurement on Troy's
+#: running Strata answered a seed (below). The rest is what it always took. The
+#: logprob family is not: nothing has shown Strata returns it, and an explicit one is
+#: refused rather than dropped (A2). (`toolChoice` and `parallelToolCalls` are listed
+#: AND partly ignored: a setting Strata is measured not to obey is sent and named,
 #: not left out, because a refusal is for what cannot be sent at all.)
+#:
+#: **`seed`, measured once, 2026-10-12** (`qwen3.8-flash-next-iq2_xs`, its own OpenAI
+#: endpoint at 127.0.0.1:8092, directly; three requests with the same prompt,
+#: `temperature` 0.8, `max_tokens` 48, `reasoning_effort` none): `seed` 4242 twice
+#: answered the same sentence both times, and `seed` 4243 another. One run of three
+#: requests, so it shows that this Strata honoured a seed, not that it always will:
+#: its documentation says a sampled result is not reproducible run to run on its
+#: default adaptive expert tier. Its source forwards a positive seed only (`seed > 0`;
+#: read, not measured), so `seed` 0 is sent and Strata takes it as no seed.
 _SUPPORTED = frozenset(
     {
         "maxTokens",
@@ -66,6 +81,9 @@ _SUPPORTED = frozenset(
         "topK",
         "minP",
         "stop",
+        "seed",
+        "frequencyPenalty",
+        "presencePenalty",
         "reasoningEffort",
         "tools",
         "toolChoice",

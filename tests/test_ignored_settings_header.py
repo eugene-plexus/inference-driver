@@ -7,7 +7,9 @@ is optional), in the contract's spelling (`toolChoice`), and the route returns i
 as a comma-separated header on the 200 -- before the first frame of a stream --
 and not at all when there is nothing to name. Strata is the first engine to use it
 (`test_strata_tools.py`); these tests are the mechanism itself, with an engine that
-names whatever it is told to.
+names whatever it is told to. **What an engine names is only what the caller sent**: a
+direct caller gets the header only for the settings it lists in `callerSettings` (an engine's
+own tests: `test_strata_tools.py`, `test_openrouter_tool_gaps.py`).
 """
 
 from __future__ import annotations

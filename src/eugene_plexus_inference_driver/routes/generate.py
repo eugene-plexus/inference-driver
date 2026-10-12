@@ -60,8 +60,13 @@ def _ignored_settings_headers(engine: BackendEngine, body: GenerateRequest) -> d
     backend has been measured not to honour. Known before anything is sent, so a
     stream carries it on its first byte. A setting the backend is known to drop
     is sent anyway and named here, rather than refused: a refusal is for what
-    cannot be sent at all. **Only what the caller sent** (`callerSettings`) is
-    named, as the gateway names it on its own header, so the two never disagree.
+    cannot be sent at all. (One an OpenRouter model's listing leaves out is not
+    delivered while Eugene asks for `require_parameters`, and is named all the
+    same.) **Only what the caller sent** (`callerSettings`) is named, as the
+    gateway names it on its own header, so the two never disagree. **A direct
+    caller gets the header only for the settings it lists in `callerSettings`**:
+    a request that lists none, as one made without the gateway (which always
+    lists them) may, is named nothing, whatever it sent.
     """
     named = getattr(engine, "ignored_settings", None)
     fields = list(dict.fromkeys(named(body))) if named is not None else []

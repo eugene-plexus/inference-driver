@@ -116,8 +116,25 @@ def test_the_fixture_is_the_measured_75_bytes() -> None:
         'openai_compat_http returned 503: {"error": {"message": "Loading model"}}',
         "openai_compat_http returned 503: Loading model",
         "openai_compat_http returned 503 for a rerank: Loading model.",
+        # The other two shapes a backend's one message arrives in, read as `tools_refusal`
+        # reads them: a bare `error` string and a bare `message`.
+        'openai_compat_http returned 503: {"error":"Loading model"}',
+        'openai_compat_http returned 503: {"message":"Loading model"}',
+        # A frame in the stream's own words: the driver's words end at the first colon.
+        "openai_compat_http stream error: Loading model",
     ],
-    ids=["chat", "embeddings", "rerank", "code-first", "spaced", "plain-text", "full-stop"],
+    ids=[
+        "chat",
+        "embeddings",
+        "rerank",
+        "code-first",
+        "spaced",
+        "plain-text",
+        "full-stop",
+        "bare-error",
+        "bare-message",
+        "stream-frame",
+    ],
 )
 def test_a_503_that_says_loading_model_is_safe_to_send_again(text: str) -> None:
     error = CliError(text, upstream_status=503)
@@ -140,6 +157,25 @@ def test_a_503_that_says_loading_model_is_safe_to_send_again(text: str) -> None:
         (503, 'openai_compat_http returned 503: {"detail":"Loading model"}'),
         (503, "openai_compat_http returned 503: <p>Loading model</p>"),
         (503, "fixture"),
+        # The words are in the body, and the body is not llama-server's message. The match was
+        # a search of the whole text, so each of these counted as loading and became safe:
+        # echoed back inside a field of something else, behind a proxy's own words, and as the
+        # message of an object nested in the error's own. Only the error's own message, exactly,
+        # is the measured body (`_backend_message`, as `tools_refusal` reads one).
+        (
+            503,
+            'openai_compat_http returned 503: {"echo":{"messages":[{"role":"user","message":"Loading model"}]}}',
+        ),
+        (503, "openai_compat_http returned 503: Service Unavailable: Loading model"),
+        (
+            503,
+            'openai_compat_http returned 503: {"error":{"message":"upstream failed","request":{"message":"Loading model"}}}',
+        ),
+        (
+            503,
+            'openai_compat_http returned 503 for embeddings: {"error":{"message":"upstream failed","request":{"message":"Loading model"}}}',
+        ),
+        (503, "openai_compat_http returned 503 for a rerank: Service Unavailable: Loading model"),
         # The words under another status are not llama-server's.
         (500, 'openai_compat_http returned 500: {"error":{"message":"Loading model"}}'),
         (502, 'openai_compat_http returned 502: {"error":{"message":"Loading model"}}'),
@@ -155,6 +191,11 @@ def test_a_503_that_says_loading_model_is_safe_to_send_again(text: str) -> None:
         "other-key",
         "in-markup",
         "fixture",
+        "echoed-in-another-field",
+        "behind-a-proxys-words",
+        "nested-message",
+        "nested-message-embeddings",
+        "behind-a-proxys-words-rerank",
         "500",
         "502",
         "504",
@@ -209,6 +250,48 @@ async def test_a_loading_engine_is_safe_whichever_path_met_it(operation: str, bo
     assert detail["type"].endswith("#backend-error")
     assert "Loading model" in detail["detail"]
     assert "Outcome unknown" not in detail["detail"] and "work may have occurred" not in str(detail)
+
+
+#: Bodies that merely mention the words: echoed inside another field, behind a proxy's own
+#: words, and as the message of a nested object. Each was `safe` while the match searched the
+#: text of the whole failure.
+MENTIONS = {
+    "echoed": (
+        b'{"echo":{"messages":[{"role":"user","message":"Loading model"}]}}',
+        "application/json",
+    ),
+    "proxy": (b"Service Unavailable: Loading model", "text/plain"),
+    "nested": (
+        b'{"error":{"message":"upstream failed","request":{"message":"Loading model"}}}',
+        "application/json",
+    ),
+}
+
+
+@respx.mock
+@pytest.mark.anyio
+@pytest.mark.parametrize("mention", list(MENTIONS))
+@pytest.mark.parametrize("operation", ["generate", "stream", "embed", "rerank"])
+async def test_a_503_that_only_mentions_loading_is_outcome_unknown_whichever_path_met_it(
+    operation: str, mention: str
+) -> None:
+    body, content_type = MENTIONS[mention]
+    refusal = httpx.Response(503, content=body, headers={"Content-Type": content_type})
+    respx.post(f"{BASE}/v1/chat/completions").mock(return_value=refusal)
+    respx.post(f"{BASE}/v1/embeddings").mock(return_value=refusal)
+    respx.post(f"{BASE}/v1/rerank").mock(return_value=refusal)
+    engine = _engine()
+    try:
+        error = await _meet_a_loading_engine(engine, operation)
+    finally:
+        await engine.aclose()
+
+    assert error.upstream_status == 503
+    assert not loading_refused(error)
+    assert disposition(error) == "indeterminate"
+    detail: Any = _backend_error(error, "openai_compat_http").detail
+    assert detail["retryDisposition"] == "indeterminate"
+    assert "Outcome unknown" in detail["detail"]
 
 
 @respx.mock

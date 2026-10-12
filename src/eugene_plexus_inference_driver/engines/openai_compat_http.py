@@ -313,6 +313,38 @@ _UNREAD_TOOL_SETTINGS: tuple[tuple[str, tuple[str | bool, ...]], ...] = (
     ("parallelToolCalls", (False,)),
 )
 
+#: The same for a tool setting an OpenRouter model's listing leaves out
+#: (`unlisted_tool_settings`), with **`none` named as well**: for a backend that ignores
+#: `tool_choice` outright (Strata, Ollama) `none` is honoured by sending no tools, and here that
+#: is not done (`OpenAiCompatibleHttpEngine._none_is_given_as_no_tools`).
+_UNLISTED_TOOL_SETTINGS: tuple[tuple[str, tuple[str | bool, ...]], ...] = (
+    ("toolChoice", ("none", "required", "function")),
+    ("parallelToolCalls", (False,)),
+)
+
+#: Why a tool setting an OpenRouter model's listing leaves out is not sent, in the one set of
+#: words the log and the docstrings use. **A statement about the listing and about what Eugene
+#: asks of OpenRouter, and never about what a provider does with the field**: the listing is a
+#: union over providers that says what OpenRouter lists, not what any of them reads (OpenAI's and
+#: Mistral's providers take `parallel_tool_calls`, though none of the 99 `openai/*` models that
+#: name `tools` lists it, counted on OpenRouter's public list of 2026-10-12).
+NOT_DELIVERED = (
+    "not delivered: OpenRouter lists no provider of this model that takes it, and Eugene asks "
+    "OpenRouter only for providers that take every parameter it sends (require_parameters)"
+)
+
+
+def _gaps_in(
+    table: tuple[tuple[str, tuple[str | bool, ...]], ...], only: Collection[str] | None
+) -> list[SettingNotHonoured]:
+    """A fresh list of the gaps in `table`, for the settings in `only` (all when None): the
+    models are mutable, so nobody holding one can change what the next is told."""
+    return [
+        SettingNotHonoured(setting=setting, values=list(values))
+        for setting, values in table
+        if only is None or setting in only
+    ]
+
 
 def unread_tool_settings(only: Collection[str] | None = None) -> list[SettingNotHonoured]:
     """What a backend that never reads `tool_choice` or `parallel_tool_calls` does
@@ -335,35 +367,51 @@ def unread_tool_settings(only: Collection[str] | None = None) -> list[SettingNot
     tools (`OpenAiCompatibleHttpEngine._payload_for`). A fresh list per call:
     the models are mutable.
     """
-    return [
-        SettingNotHonoured(setting=setting, values=list(values))
-        for setting, values in _UNREAD_TOOL_SETTINGS
-        if only is None or setting in only
-    ]
+    return _gaps_in(_UNREAD_TOOL_SETTINGS, only)
 
 
 def unlisted_tool_settings(listed: Collection[str]) -> list[SettingNotHonoured]:
-    """What an OpenRouter model's own listing leaves unhonoured of its tool settings.
+    """What an OpenRouter model's own listing leaves out of its tool settings, named as
+    `capabilities.settingsNotHonoured` names a gap: **not delivered: OpenRouter lists no
+    provider of this model that takes it, and Eugene asks OpenRouter only for providers that
+    take every parameter it sends (`require_parameters`)**.
 
-    A model whose `supported_parameters` name `tools` and leave out `tool_choice`
-    or `parallel_tool_calls` is OpenRouter saying the provider takes no such
-    setting, which is `unread_tool_settings`' case for that setting alone: `auto`
-    and `true` are what the model does anyway, `none` is honoured by sending no
-    tools, and the rest is named. Measured on OpenRouter's public list,
-    2026-10-12 (659 models, 390 chat models naming `tools`): **377 of the 390 leave
-    out `parallel_tool_calls`**, and 8 leave out `tool_choice`. Refused, which is
-    what an explicit one was until now, a harness that sends `parallel_tool_calls:
-    false` on every request (Codex does) could use none of those 377.
+    A model whose `supported_parameters` name `tools` and leave out `tool_choice` or
+    `parallel_tool_calls` has no provider OpenRouter lists as taking that setting. With
+    `require_parameters`, which Eugene sets on a request that carries a setting the caller sent,
+    OpenRouter routes only to providers that support every parameter in the request (its
+    documented rule; no key was used here to try it), so the setting would leave the request no
+    provider to route to. It is not sent (`_withheld_settings`), and the caller is told.
+
+    **This is a statement about the listing, not about any provider.** The list is a union over
+    a model's providers that says what OpenRouter lists, and a provider may read a field it does
+    not list: OpenAI's and Mistral's take `parallel_tool_calls`, and none of the 99 `openai/*`
+    models that name `tools` lists it (nor do any of the 32 `mistralai/*` listings), counted
+    on OpenRouter's public list of 2026-10-12. So it holds only while Eugene asks for
+    `require_parameters`; with that off nothing is withheld and nothing is named
+    (`OpenAiCompatibleHttpEngine._served_view`), an unknown counting as yes.
+
+    Counted on that list (659 models, 390 chat models naming `tools`): **377 of the 390 leave
+    out `parallel_tool_calls`**, and 8 leave out `tool_choice` (`amazon/nova-*`,
+    `stepfun/step-5-preview`, `cohere/command-a-plus`, `thinkingmachines/inkling-*`). Refused,
+    which is what an explicit one was until round three, a harness that sends
+    `parallel_tool_calls: false` on every request (Codex does) could use none of those 377.
+
+    `auto` and `true` are what the model does anyway, so they are not listed. **`none` is
+    listed, unlike for Strata and Ollama**, where it is honoured by sending no tools: here that
+    would send a history that carries tool calls or results without the tool definitions, which
+    a strict upstream refuses (Bedrock's Converse, behind `amazon/nova-*`), so the tools stay,
+    `tool_choice` is not delivered, and the caller is told the model may still call one.
 
     Nothing for a model that names no `tools`: that is the provider's word on
     tools (`toolCalling` false), and what rides with them says nothing there. A
     listing that says nothing at all is offered every tool setting and has no gap
-    (`from_openrouter`).
+    (`from_openrouter`). A fresh list per call.
     """
     names = set(listed)
     if "tools" not in names:
         return []
-    return unread_tool_settings(only=_TOOL_COMPANIONS - names)
+    return _gaps_in(_UNLISTED_TOOL_SETTINGS, _TOOL_COMPANIONS - names)
 
 
 def _contract_value(request: GenerateRequest, setting: str) -> str | bool | None:
@@ -1378,10 +1426,14 @@ class OpenAiCompatibleHttpEngine:
           (`settings_not_honoured`), which are static and so not in the listing.
         * **On OpenRouter, where the listing says what each model takes**, a model that
           names `tools` and leaves out `tool_choice` or `parallel_tool_calls` has the
-          matching gap too (`unlisted_tool_settings`), and the setting is offered with
-          it: a measured gap is named, not refused, so it is in `supportedSettings`
-          as well. It is the entry the request resolves to (`resolve_model`), so
-          `_withheld_settings` and the per-request header read the same list.
+          setting offered (`supportedSettings`: an unknown counts as yes, and a gap is
+          named, not refused). **While Eugene asks OpenRouter only for providers that
+          take every parameter it sends (`require_parameters`)** it also has the matching
+          gap (`unlisted_tool_settings`): the setting is not delivered, and says so. With
+          `require_parameters` off nothing is named and nothing is withheld
+          (`_withheld_settings`). It is the entry the request resolves to
+          (`resolve_model`), so `_withheld_settings` and the per-request header read the
+          same list.
         * A model whose tools the backend has refused says `toolCalling` false and
           carries no `tools`. It keeps `toolChoice` and `parallelToolCalls`: they say
           nothing on a request without tools, which is dropped of them rather than
@@ -1402,9 +1454,10 @@ class OpenAiCompatibleHttpEngine:
             if chat and self._dialect.catalogue == "openrouter"
             else []
         )
-        gaps += [gap for gap in unlisted if all(gap.setting != named.setting for named in gaps)]
+        if self._require_parameters:
+            gaps += [gap for gap in unlisted if all(gap.setting != named.setting for named in gaps)]
         off = model.id in self._tools_refused
-        if not gaps and not off:
+        if not gaps and not off and not unlisted:
             return model
         update: dict[str, Any] = {}
         if gaps:
@@ -1469,9 +1522,9 @@ class OpenAiCompatibleHttpEngine:
 
         Ollama's here (`unread_tool_settings`); Strata's is its own
         (`StrataHttpEngine`). An OpenRouter model adds its own, from what its listing
-        leaves out (`_served_view`), so those are not here. Every other backend this
-        engine fronts honours what it is sent, or refuses what it cannot take, in
-        `_payload_for`.
+        leaves out while Eugene asks for `require_parameters` (`_served_view`), so those
+        are not here. Every other backend this engine fronts honours what it is sent, or
+        refuses what it cannot take, in `_payload_for`.
         """
         return unread_tool_settings() if self._dialect.catalogue == "ollama" else []
 
@@ -1488,27 +1541,44 @@ class OpenAiCompatibleHttpEngine:
         caps = target.entry.capabilities
         return list(caps.settingsNotHonoured or []) if caps is not None else []
 
-    def _reads_tool_choice(self, target: _Target) -> bool:
-        """Whether the backend reads `tool_choice` for this model at all. One that does
-        not is listed for it in the gaps, and cannot be told `none`, so `_payload_for`
-        gives it no tools instead."""
-        return not any(gap.setting == "toolChoice" for gap in self._gaps_for(target))
+    def _none_is_given_as_no_tools(self, target: _Target) -> bool:
+        """Whether `tool_choice: none` is honoured for this model by sending no tools.
+
+        It is for a backend that ignores `tool_choice` outright and whose gap does not name
+        `none` (Strata called the tool, measured; Ollama has no field for it): it cannot be
+        told `none`, so `_payload_for` gives it no tools instead. **Not where the gap names
+        `none`**: an OpenRouter model whose listing leaves `tool_choice` out
+        (`unlisted_tool_settings`) keeps its tools, because a history that carries tool calls
+        or results is refused by a strict upstream (Bedrock's Converse) without the tool
+        definitions. There `none` is not delivered, like `required`, and is named.
+        """
+        return any(
+            gap.setting == "toolChoice" and ToolChoice.none.value not in gap.values
+            for gap in self._gaps_for(target)
+        )
 
     def _withheld_settings(self, target: _Target) -> frozenset[str]:
         """The settings a request is NOT to carry to the provider for this model,
-        although it is not refused for them.
+        although it is not refused for them: **not delivered: OpenRouter lists no
+        provider of this model that takes it, and Eugene asks OpenRouter only for
+        providers that take every parameter it sends (`require_parameters`)**.
 
-        **OpenRouter only**, where the listing is the authority on what each model
-        takes: a setting it leaves out and the gaps name (`unlisted_tool_settings`) is
-        one no provider of the model reads (the list is a union over its providers).
-        Sent, it would be dropped without a word, or, with `require_parameters` (set
-        whenever the caller sent a setting), would by OpenRouter's documentation leave
-        it no provider to route to (not measured: no key was used). So it is left out
-        of the payload and named instead: "send what the provider takes". Everywhere
-        else the gaps are what a backend reads and ignores (Strata, Ollama), which is
-        sent.
+        **OpenRouter only, and only while this engine asks for `require_parameters`**
+        (every OpenRouter account does: `providers.py`). Then OpenRouter, by its
+        documentation, routes only to providers that support every parameter in the
+        request, so a setting the model's listing leaves out and the gaps name
+        (`unlisted_tool_settings`) would leave it no provider to route to (not tried: no
+        key was used). So it is left out of the payload and named instead. The listing
+        says what OpenRouter lists, not what a provider reads, so with
+        `require_parameters` off nothing is withheld: the setting is sent, an unknown
+        counting as yes, and nothing is named for it. Everywhere else the gaps are what a
+        backend reads and ignores (Strata, Ollama), which is sent.
         """
-        if self._dialect.catalogue != "openrouter" or target.entry is None:
+        if (
+            not self._require_parameters
+            or self._dialect.catalogue != "openrouter"
+            or target.entry is None
+        ):
             return frozenset()
         return frozenset(gap.setting for gap in self._gaps_for(target))
 
@@ -1520,15 +1590,20 @@ class OpenAiCompatibleHttpEngine:
         Named on `x-eugene-plexus-ignored-settings` by `POST /v1/generate` and its
         stream, before the first frame (2026-10-12). A setting a backend is measured
         not to honour is sent anyway and named, not refused: a refusal is for what
-        cannot be sent at all.
+        cannot be sent at all. A setting an OpenRouter model's listing leaves out is not
+        delivered (`_withheld_settings`) and is named all the same.
 
         **Only what the caller sent** (`callerSettings`, the caller's own list: never
         a profile's or the install's default), as the gateway names it
         (`ignored_settings.sent`), so the two cannot disagree about a request. A
-        setting that arrives filled in from a profile is still sent, and is not named:
-        the caller never asked for it. Nothing is named for `tool_choice: none` to a
-        backend that does not read it: it is honoured, by sending no tools, and what
-        rode with them (`parallel_tool_calls`) went with them.
+        setting that arrives filled in from a profile is still sent (or withheld), and is
+        not named: the caller never asked for it. **A direct caller gets the header only
+        for the settings it lists in `callerSettings`**: one that lists none, as a request
+        made without the gateway (which always lists them) may, is named nothing, whatever
+        it sent. Nothing is named for `tool_choice: none` to a backend that does not read
+        it and whose gap does not name it: it is honoured, by sending no tools, and what
+        rode with them (`parallel_tool_calls`) went with them
+        (`_none_is_given_as_no_tools`).
         """
         try:
             target = self.resolve_model(request.model)
@@ -1536,7 +1611,7 @@ class OpenAiCompatibleHttpEngine:
             return []  # the route refuses it before anything is sent: nothing is ignored
         gaps = self._gaps_for(target)
         if not gaps or (
-            request.toolChoice == ToolChoice.none and not self._reads_tool_choice(target)
+            request.toolChoice == ToolChoice.none and self._none_is_given_as_no_tools(target)
         ):
             return []
         sent = set(request.callerSettings or [])
@@ -1560,14 +1635,15 @@ class OpenAiCompatibleHttpEngine:
                 temperature_fixed=self._temperature_is_fixed,
             )
         if not requested:
+            # A count is `summary().exposed`: `exposed()` builds a served view of every model.
             raise ModelRequired(
                 "This driver is a provider account serving "
-                f"{len(self.catalogue.exposed())} models; a request must name one "
+                f"{self.catalogue.summary().exposed} models; a request must name one "
                 "in `model`."
             )
         entry = self.catalogue.find(requested)
         if entry is None:
-            raise ModelNotServed(requested, served=len(self.catalogue.exposed()))
+            raise ModelNotServed(requested, served=self.catalogue.summary().exposed)
         upstream = entry.upstreamId or entry.id
         return _Target(
             id=entry.id,
@@ -1777,10 +1853,13 @@ class OpenAiCompatibleHttpEngine:
         non-streamed one for the same request. `forced` is the tool a
         named `tool_choice` forces on llama-server (`_forced_tool`).
         """
-        if request.toolChoice == ToolChoice.none and not self._reads_tool_choice(target):
+        if request.toolChoice == ToolChoice.none and self._none_is_given_as_no_tools(target):
             # Honoured as this backend can: it ignores `tool_choice: none` (Strata
             # called the tool, measured), so the tools are not sent at all, nor what
-            # rides with them. Nothing is left on the request for it to ignore.
+            # rides with them. Nothing is left on the request for it to ignore. Not for
+            # an OpenRouter model whose listing leaves `tool_choice` out: its gap names
+            # `none`, the tools stay (a history that carries calls needs them), and
+            # `none` is not delivered, like any other value (`_withheld_settings`).
             request = request.model_copy(
                 update={"tools": None, "toolChoice": None, "parallelToolCalls": None}
             )
@@ -1802,14 +1881,22 @@ class OpenAiCompatibleHttpEngine:
                 "logprobs.",
                 upstream_status=400,
             )
-        if unsupported:
-            refuse_unsupported_settings(request, unsupported=set(unsupported))
-        # **Tools the backend refused** (`_learn_tools_refused`): a request that
-        # carries none is not refused for what rides with them (`tool_choice`,
-        # `parallel_tool_calls`; Codex sends both on every request, tools or not).
-        # They say nothing there, so they are dropped, and said once like any other
-        # setting a backend cannot take.
-        companions_dropped = target.id in self._tools_refused and not request.tools
+        # **A model whose tools are off** -- whether the backend refused them in its own
+        # words (`_learn_tools_refused`), its provider's listing names none, or its
+        # endpoint serves it without them (`_tools_off_because`) -- is not refused, on a
+        # request that carries none, for what rides with them (`tool_choice`,
+        # `parallel_tool_calls`; Codex sends both on every request, tools or not). They say
+        # nothing there, so they are dropped, and said once like any other setting a
+        # backend cannot take. One rule, whether the "no" was learned or listed.
+        # The cause, in words, while those are being dropped (None: they are not).
+        dropping_because = self._tools_off_because(target) if not request.tools else None
+        refusable = (
+            set(unsupported) - _TOOL_COMPANIONS
+            if dropping_because is not None
+            else set(unsupported)
+        )
+        if refusable:
+            refuse_unsupported_settings(request, unsupported=refusable)
         # Apply the operator's thinkingMode by mutating the system
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
@@ -1872,8 +1959,9 @@ class OpenAiCompatibleHttpEngine:
         # and said once -- the `temperature` rule, applied to its
         # neighbours. **The one exception** is a tool setting an OpenRouter
         # model's listing leaves out (`_withheld_settings`): it is not refused,
-        # because a measured gap is named and not refused (Troy, 2026-10-12), so
-        # the explicit one is left out as well, and named on the header.
+        # because a gap is named and not refused (Troy, 2026-10-12), so the
+        # explicit one is not delivered (it is left out, and said why once), and
+        # named on the header.
         for field, key, value in (
             ("topK", "top_k", request.topK),
             ("minP", "min_p", request.minP),
@@ -1883,11 +1971,14 @@ class OpenAiCompatibleHttpEngine:
         ):
             if value is None:
                 continue
-            if companions_dropped and field in _TOOL_COMPANIONS:
-                self._warn_companion_dropped(key, target)
+            if dropping_because is not None and field in _TOOL_COMPANIONS:
+                self._warn_companion_dropped(key, target, dropping_because)
                 continue
-            if field in unsupported or field in withheld:
+            if field in unsupported:
                 self._warn_dropped(key, target)
+                continue
+            if field in withheld:
+                self._warn_not_delivered(key, target)
                 continue
             payload[key] = value
         # Tools ride through untouched. We do not validate the JSON
@@ -1897,10 +1988,10 @@ class OpenAiCompatibleHttpEngine:
         # made one hop earlier.
         if request.tools:
             payload["tools"] = [t.model_dump(mode="json", exclude_none=True) for t in request.tools]
-        if request.toolChoice is not None and companions_dropped:
-            self._warn_companion_dropped("tool_choice", target)
+        if request.toolChoice is not None and dropping_because is not None:
+            self._warn_companion_dropped("tool_choice", target, dropping_because)
         elif request.toolChoice is not None and "toolChoice" in withheld:
-            self._warn_dropped("tool_choice", target)
+            self._warn_not_delivered("tool_choice", target)
         elif request.toolChoice is not None:
             choice = request.toolChoice
             payload["tool_choice"] = (
@@ -2033,18 +2124,61 @@ class OpenAiCompatibleHttpEngine:
             field,
         )
 
-    def _warn_companion_dropped(self, field: str, target: _Target) -> None:
-        """`tool_choice` or `parallel_tool_calls` left out of a request with no tools,
-        while the backend's refusal of tools stands (`_payload_for`)."""
+    def _warn_not_delivered(self, field: str, target: _Target) -> None:
+        """A tool setting an OpenRouter model's listing leaves out, left out of the request
+        (`_withheld_settings`): said once per field per engine, with why in the one set of
+        words (`NOT_DELIVERED`) and where the caller is told."""
+        if (target.id, field) in self._warned_dropped:
+            return
+        self._warned_dropped.add((target.id, field))
+        log.warning(
+            "model %r: `%s` is %s. It is left out of every request that carries it, and where "
+            "that matters the caller is told (`settingsNotHonoured`, "
+            "`x-eugene-plexus-ignored-settings`). This is said once per parameter for the "
+            "life of this engine.",
+            target.id,
+            field,
+            NOT_DELIVERED,
+        )
+
+    def _tools_off_because(self, target: _Target) -> str | None:
+        """The observed cause, in words, of this model's tools being off, or None while they
+        are assumed (`docs/design/tools-assumed.md`).
+
+        One rule for every kind of evidence, learned or listed: the backend refused them in its
+        own words and has not taken one since (`_learn_tools_refused`); OpenAI's own Chat
+        Completions serves the model without them (`_chat_tools_unavailable`); or the
+        provider's own listing for the model names no tools (OpenRouter's
+        `supported_parameters`, Ollama's capabilities), which is `toolCalling` false on its
+        entry.
+        """
         off = self._tools_refused.get(target.id)
-        words = f" ({off.words!r})" if off is not None else ""
+        if off is not None:
+            return (
+                f"this backend refused tools in its own words ({off.words!r}) and has not "
+                "taken one since"
+            )
+        if self._chat_tools_unavailable(target.upstream):
+            return (
+                "OpenAI's Chat Completions API serves this model without tools (it takes them "
+                "on its Responses API only)"
+            )
+        caps = target.entry.capabilities if target.entry is not None else None
+        if caps is None or caps.toolCalling is not False:
+            return None
+        if self._dialect.catalogue == "openrouter":
+            return "OpenRouter's own listing for this model names no tools"
+        if self._dialect.catalogue == "ollama":
+            return "Ollama's own capabilities for this model do not list tools"
+        return "this account's own listing for this model says it takes no tools"
+
+    def _warn_companion_dropped(self, field: str, target: _Target, cause: str) -> None:
+        """`tool_choice` or `parallel_tool_calls` left out of a request with no tools, while
+        the model's tools are off for `cause` (`_tools_off_because`): said once per field."""
         self._warn_dropped(
             field,
             target,
-            why=(
-                f"this backend refused tools in its own words{words} and has not taken one "
-                "since, so there is nothing for it to choose among or to run in parallel"
-            ),
+            why=f"{cause}, so there is nothing for it to choose among or to run in parallel",
         )
 
     def _headers(self) -> dict[str, str]:

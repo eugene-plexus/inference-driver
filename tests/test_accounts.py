@@ -22,12 +22,15 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from eugene_plexus_inference_driver._generated.models import DriverModel
 from eugene_plexus_inference_driver.app import create_app
 from eugene_plexus_inference_driver.engines._catalogue import (
+    Catalogue,
     exposed_by,
     from_openrouter,
     matches,
 )
+from eugene_plexus_inference_driver.engines.base import ModelNotServed, ModelRequired
 from eugene_plexus_inference_driver.engines.openai_compat_http import classify_openai_model
 from eugene_plexus_inference_driver.settings import Settings
 
@@ -148,8 +151,9 @@ def test_an_openrouter_account_lists_its_models_not_one(openrouter_config: Path)
         "tools",
         "toolChoice",
         "seed",
-        # Its listing names `tools` and leaves out `parallel_tool_calls`: a measured gap is
-        # named and not refused (Troy, 2026-10-12), so it is offered and listed below.
+        # Its listing names `tools` and leaves out `parallel_tool_calls`: a gap is named and
+        # not refused (Troy, 2026-10-12), so it is offered and listed below (not delivered:
+        # OpenRouter lists no provider of this model that takes it).
         "parallelToolCalls",
     }
     assert nemo["capabilities"]["settingsNotHonoured"] == [
@@ -713,3 +717,70 @@ def test_info_builds_a_served_view_only_for_the_models_it_answers(openrouter_con
         everything = client.get("/v1/info").json()
         assert sorted(built) == sorted(m["id"] for m in everything["models"])
         assert len(built) == 5, "once each, not once for the list and again for the count"
+
+
+@respx.mock
+def test_a_count_in_a_refusal_builds_no_served_view(openrouter_config: Path) -> None:
+    """A refusal that says how many models the account serves (no `model`, or one that is not
+    listed) counts them with `catalogue.summary().exposed`. `exposed()` builds a served view of
+    every model, and a view is a copy of the entry whenever something is laid over it (377 of
+    OpenRouter's 659 on 2026-10-12): built to be counted and thrown away."""
+    respx.get(f"{OPENROUTER}/v1/models/user").mock(
+        return_value=httpx.Response(200, json=OPENROUTER_LIST)
+    )
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
+        _wait_for_catalogue(client)
+        engine = client.app.state.adapter  # type: ignore[attr-defined]
+        built: list[str] = []
+        real = engine.catalogue._view
+
+        def counting(model: DriverModel) -> DriverModel:
+            built.append(model.id)
+            return real(model)  # type: ignore[no-any-return]
+
+        engine.catalogue._view = counting
+
+        with pytest.raises(ModelRequired) as required:
+            engine.resolve_model(None)
+        assert "serving 5 models" in str(required.value)
+        with pytest.raises(ModelNotServed) as missing:
+            engine.resolve_model("not/listed")
+        assert missing.value.served == 5
+        assert built == [], "a count needs no view"
+
+        engine.resolve_model("mistralai/mistral-nemo")
+        assert built == ["mistralai/mistral-nemo"], "and a request builds the one it is for"
+
+
+@pytest.mark.anyio
+async def test_a_refresh_logs_how_many_it_exposes_without_building_a_view(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The line a refresh logs counts what the account exposes
+    (`catalogue (%s): %d models listed, %d exposed`): a count, not a list of views."""
+    built: list[str] = []
+
+    async def fetch() -> list[DriverModel]:
+        return [DriverModel(id=name, surfaces=["chat"]) for name in ("a/one", "a/two", "b/three")]
+
+    def counting(model: DriverModel) -> DriverModel:
+        built.append(model.id)
+        return model
+
+    catalogue = Catalogue(
+        source="test",
+        origin="test",
+        fetch=fetch,
+        get=lambda key: ["a/*"] if key == "catalogueInclude" else None,
+        view=counting,
+    )
+    caplog.set_level("INFO", logger="eugene_plexus_inference_driver.engines._catalogue")
+    assert await catalogue.refresh()
+    assert built == [], "a count needs no view"
+    assert any("3 models listed, 2 exposed" in r.getMessage() for r in caplog.records)

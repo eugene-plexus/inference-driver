@@ -250,6 +250,56 @@ def test_through_the_app_an_ollama_account_reports_and_names_what_it_ignores(
 
 
 @respx.mock
+def test_through_the_app_an_ollama_model_without_tools_is_not_sent_what_rides_with_them(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One rule for any model whose tools are off, learned or listed (round four). `/api/show`
+    lists no `tools` among this model's capabilities, which is Ollama's own word and
+    `toolCalling` false. Codex sends `tool_choice` and `parallel_tool_calls` on every request,
+    tools or not; Ollama has no field for either (read from its source), so on a request that
+    carries no tools they were sent for nothing. They are left out now, once per field, with
+    the cause in words; a request that does carry tools is still the door's refusal."""
+    caplog.set_level("WARNING", logger="eugene_plexus_inference_driver.engines.openai_compat_http")
+    respx.get(f"{OLLAMA}/api/tags").mock(
+        return_value=httpx.Response(200, json={"models": [{"name": "gemma3:4b"}]})
+    )
+    respx.post(f"{OLLAMA}/api/show").mock(
+        return_value=httpx.Response(200, json={"capabilities": ["completion"]})
+    )
+    chat = _route(OLLAMA)
+    config = tmp_path / "ollama.yaml"
+    config.write_text(json.dumps({"provider": "ollama_local"}), "utf-8")
+    plain = {
+        "model": "gemma3:4b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "toolChoice": "auto",
+        "parallelToolCalls": False,
+        "callerSettings": ["toolChoice", "parallelToolCalls"],
+    }
+    with TestClient(create_app(settings=Settings(config_file=config))) as client:
+        info = _wait_for_catalogue(client)
+        (model,) = info["models"]
+        assert model["capabilities"]["toolCalling"] is False
+        for _ in range(2):
+            served = client.post("/v1/generate", json=plain)
+            assert served.status_code == 200, served.text
+        assert not {"tools", "tool_choice", "parallel_tool_calls"} & _sent(chat).keys()
+
+        calls = len(chat.calls)
+        refused = client.post(
+            "/v1/generate",
+            json={**plain, "tools": TOOLS, "callerSettings": ["tools", "toolChoice"]},
+        )
+        assert refused.status_code == 400
+        assert refused.json()["detail"]["type"].endswith("#tools-unsupported")
+        assert len(chat.calls) == calls, "and nothing was sent"
+    left_out = [r.getMessage() for r in caplog.records if "omitting `" in r.getMessage()]
+    assert sum("`tool_choice`" in m for m in left_out) == 1, left_out
+    assert sum("`parallel_tool_calls`" in m for m in left_out) == 1, left_out
+    assert all("Ollama's own capabilities" in m and "do not list tools" in m for m in left_out)
+
+
+@respx.mock
 async def test_a_required_tool_choice_still_reaches_llama_server() -> None:
     route = _route(LLAMA)
     await _engine("openai").generate(_ask(tools=TOOLS, toolChoice="required"))

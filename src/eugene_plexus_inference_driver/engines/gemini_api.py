@@ -366,7 +366,9 @@ class GeminiApiEngine:
         stream, before the first frame. **Only what the caller sent**
         (`callerSettings`), as the gateway names it, so the two cannot disagree; a
         `false` that arrives filled in from a profile is dropped like the explicit
-        one and not named.
+        one and not named. **A direct caller gets the header only for the settings it
+        lists in `callerSettings`**: one that lists none is named nothing, whatever it
+        sent.
         """
         try:
             target = self.resolve_model(request.model)
@@ -423,13 +425,14 @@ class GeminiApiEngine:
 
     def resolve_model(self, requested: str | None) -> _Resolved:
         if not requested:
+            # A count is `summary().exposed`: `exposed()` builds a served view of every model.
             raise ModelRequired(
                 "This driver is a Gemini account serving "
-                f"{len(self.catalogue.exposed())} models; a request must name one in `model`."
+                f"{self.catalogue.summary().exposed} models; a request must name one in `model`."
             )
         entry = self.catalogue.find(wire.bare_id(requested))
         if entry is None:
-            raise ModelNotServed(requested, served=len(self.catalogue.exposed()))
+            raise ModelNotServed(requested, served=self.catalogue.summary().exposed)
         return _Resolved(id=entry.id, upstream=entry.id, entry=entry)
 
     def _surface(self, target: _Resolved, surface: str, what: str) -> None:
@@ -463,8 +466,9 @@ class GeminiApiEngine:
         unsupported = self._unsupported(target)
         refuse_unsupported_settings(request, unsupported=unsupported)
         if request.parallelToolCalls is False:
-            # Nowhere to put it, and not refused: a measured gap is named
-            # (`settings_not_honoured`), and a refusal is Codex unable to use the model.
+            # Nowhere to put it (Gemini's native API has no field for it), and not
+            # refused: a gap is named (`settings_not_honoured`), and a refusal is Codex
+            # unable to use the model.
             self._warn_parallel_not_sent(target.id)
         for field, value in (
             ("minP", request.minP),

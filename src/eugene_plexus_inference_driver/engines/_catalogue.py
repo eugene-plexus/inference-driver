@@ -210,8 +210,9 @@ def from_openrouter(body: Any) -> list[DriverModel]:
         # model there is taken to carry them, and the settings that carry them are
         # offered with it: a `toolCalling: true` that this driver then refused an
         # explicit `tools` against would be no better than the `false` it replaces.
-        # An entry that HAS the list and does not name `tools` is OpenRouter saying
-        # the model takes none, and stays false.
+        # An entry that HAS the list and does not name `tools` is OpenRouter's own
+        # listing naming no tools for the model, the provider's word on tools
+        # (evidence of the second kind), and stays false.
         names = raw_params if isinstance(raw_params, list) else None
         listed = names is not None
         params = {p for p in names or [] if isinstance(p, str)}
@@ -596,7 +597,8 @@ class Catalogue:
                     "catalogue (%s): %d models listed, %d exposed",
                     self.source,
                     len(self._models),
-                    len(self.exposed()),
+                    # A count, not `exposed()`: that builds a served view of every model.
+                    self.summary().exposed,
                 )
                 return True
             log.warning(

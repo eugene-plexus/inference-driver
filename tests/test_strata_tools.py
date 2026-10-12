@@ -232,8 +232,10 @@ def test_strata_reports_tools_and_offers_the_settings_that_carry_them() -> None:
     # `parallelToolCalls` is offered although Strata ignores `false`: a measured gap is named,
     # not refused, so the gateway does not route Codex (which sends it on every request) away.
     assert {"tools", "toolChoice", "parallelToolCalls", "responseFormat"} <= offered
-    # Not claimed: nothing has shown Strata honours them, so an explicit one is refused (A2).
-    assert not {"seed", "logprobs"} & offered
+    # Carried since round four: Strata's own source reads them per request (`test_strata.py`).
+    assert {"seed", "frequencyPenalty", "presencePenalty"} <= offered
+    # Not claimed: nothing has shown Strata returns them, so an explicit one is refused (A2).
+    assert "logprobs" not in offered
 
 
 #: What the contract says Strata is sent and does not honour (specs 6178255): `toolChoice` with
@@ -538,7 +540,12 @@ def test_a_setting_the_caller_did_not_send_is_sent_but_not_named(
     never disagree about a request. A setting that rides on the request without the caller
     having sent it (a profile's or an install's default) is still sent to Strata, which still
     ignores it, and is not named: the caller never asked for it, and the gateway's own header
-    says nothing of it either."""
+    says nothing of it either.
+
+    **A direct caller gets the header only for the settings it lists in `callerSettings`.** One
+    that lists none, as a request made without the gateway often does, is sent exactly what it
+    asked for and is named nothing: the provenance is the caller's to give, and without it every
+    setting reads as one the caller never asked for."""
     fields: dict[str, Any] = {"tools": [WEATHER, TIME]}
     if choice is not None:
         fields["toolChoice"] = (
@@ -548,8 +555,15 @@ def test_a_setting_the_caller_did_not_send_is_sent_but_not_named(
         fields["parallelToolCalls"] = parallel
     engine = _engine()
     assert engine.ignored_settings(_ask(callerSettings=["tools"], **fields)) == []
-    assert engine.ignored_settings(_ask(**fields)) == [], "no provenance at all: nothing was sent"
+    # Not named, though sent: the settings are on the wire as the caller left them, so the
+    # reason there is nothing to name is the missing provenance, and not that nothing was sent.
+    assert engine.ignored_settings(_ask(**fields)) == [], "no callerSettings: sent, and not named"
     assert engine.ignored_settings(_ask(callerSettings=[], **fields)) == []
+    payload = engine._payload_for(_ask(**fields), engine.resolve_model(None))
+    if choice is not None:
+        assert "tool_choice" in payload, "sent: it is only the naming that has no provenance"
+    if parallel is not None:
+        assert payload["parallel_tool_calls"] is parallel
 
 
 # --------------------------------------------------------------------------- #
@@ -840,9 +854,11 @@ async def test_a_named_choice_never_takes_the_forced_tool_route() -> None:
 @pytest.mark.anyio
 async def test_strata_still_refuses_what_it_does_not_take() -> None:
     """The settings Strata has never carried are still refused when explicit. (A setting it is
-    measured to ignore, `parallel_tool_calls: false`, is sent and named instead: above.)"""
+    measured to ignore, `parallel_tool_calls: false`, is sent and named instead: above; and
+    `seed` and the penalties, which its source reads per request, are carried since round four:
+    `test_strata.py`.)"""
     engine = _engine()
-    for field, value in (("seed", 1), ("logprobs", True)):
+    for field, value in (("logprobs", True), ("logitBias", {"1": 2})):
         request = _ask(tools=[WEATHER], callerSettings=[field], **{field: value})
         with pytest.raises(CliError) as refused:
             engine._payload_for(request, engine.resolve_model(None))
