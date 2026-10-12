@@ -67,6 +67,27 @@ _TEMPLATE_REFUSAL = re.compile(r"Jinja Exception")
 _POOL_FULL = re.compile(r"Context size has been exceeded")
 
 
+#: llama-server's words for a reranker's input that is longer than it takes, in
+#: the two forms it answers (MR6, measured 2026-10-12 on b10948, Qwen3-Reranker
+#: and bge-reranker-v2-m3, `-c 4096 --parallel 4 -b 2048 -ub 2048`). Over a
+#: slot's context, 1024 tokens here, it is the 400 every over-long input gets:
+#: "input (1828 tokens) is larger than the max context size (1024 tokens).
+#: skipping". Over the physical batch, 2048, it is a **500**: "input (2994
+#: tokens) is too large to process. increase the physical batch size (current
+#: batch size: 2048)". An embedding model answers the 400 at every size (6001
+#: tokens tried), so only a reranker has the 500, and as a 502 it would be
+#: retried against every replica of a model that refuses it identically, with
+#: "outcome unknown" said of a request nothing computed.
+_INPUT_TOO_LONG = re.compile(
+    r"input \(\d+ tokens\) is (?:larger than the max context size|too large to process)"
+)
+
+
+def input_too_long(text: str) -> bool:
+    """Whether the backend's words are a refusal of input longer than it takes."""
+    return _INPUT_TOO_LONG.search(text) is not None
+
+
 def capacity_refused(error: Exception) -> bool:
     """True when the backend refused for want of room, not for a fault.
 
@@ -90,7 +111,7 @@ def disposition(error: Exception) -> str:
         return "safe"
     if isinstance(status, int) and 400 <= status < 500 and status not in {408, 409, 425}:
         return "terminal"
-    if _TEMPLATE_REFUSAL.search(str(error)):
+    if _TEMPLATE_REFUSAL.search(str(error)) or input_too_long(str(error)):
         return "terminal"
     return "indeterminate"
 

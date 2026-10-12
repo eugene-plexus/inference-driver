@@ -25,6 +25,7 @@ from .routes import health as health_routes
 from .routes import image as image_routes
 from .routes import info as info_routes
 from .routes import moderate as moderate_routes
+from .routes import rerank as rerank_routes
 from .routes import speak as speak_routes
 from .routes import transcribe as transcribe_routes
 from .routes import video as video_routes
@@ -296,6 +297,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(image_routes.router, dependencies=authorized)
     app.include_router(video_routes.router, dependencies=authorized)
     app.include_router(moderate_routes.router, dependencies=authorized)
+    app.include_router(rerank_routes.router, dependencies=authorized)
 
     # Operator-only surfaces: config edits and the restart trigger ride
     # on the UI's session token. Service tokens are rejected so a
@@ -316,6 +318,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/generate",
             "/v1/generate/stream",
             "/v1/embed",
+            "/v1/rerank",
             "/v1/decide",
             "/v1/speak",
             "/v1/moderate",

@@ -1048,6 +1048,21 @@ def test_embeddings_are_batched_in_order(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_a_gemini_account_does_not_sort_results(tmp_path: Path) -> None:
+    """MR6: no account sorts results yet, whatever its listing says, and a
+    model of Google's is refused in words rather than sent a Jina body."""
+    client = _start(tmp_path)
+    with client:
+        refused = client.post(
+            "/v1/rerank", json={"model": CHAT, "query": "q", "documents": ["a", "b"]}
+        )
+    assert refused.status_code == 400, refused.text
+    problem = refused.json()["detail"]
+    assert problem["type"].endswith("#rerank-unsupported")
+    assert "does not sort results" in problem["detail"]
+
+
+@respx.mock
 def test_embeddings_with_a_wrong_count_are_refused(tmp_path: Path) -> None:
     client = _start(tmp_path)
     respx.post(f"{BASE}/models/gemini-embedding-001:batchEmbedContents").mock(

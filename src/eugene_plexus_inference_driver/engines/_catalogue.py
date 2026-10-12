@@ -143,12 +143,24 @@ class EngineDefaults:
 # ---------------------------------------------------------------------------
 
 
+#: Surfaces no account serves, so none reports (MR6, 2026-10-12). `rerank` has a
+#: door now (`POST /v1/rerank`) and a single-model `llama-server` serves it, but
+#: no account engine sorts results yet, and an account that listed it would be
+#: routed to a refusal. A model an account lists only for it, as OpenRouter's
+#: `output_modalities` can say, serves nothing here, as it did before the door.
+#: Applied where the list is set (`Catalogue._set`), the one place every
+#: account's models pass through, a list kept on disk by an older driver included.
+_NOT_SERVED_BY_ACCOUNTS = frozenset({"rerank"})
+
+
 def surfaces_from_output(output: list[str], inputs: list[str]) -> list[str]:
     """What requests a model answers, from OpenRouter's output modalities.
 
     `text` output is chat, whatever else comes with it -- Lyria's music and
     Gemini's images both ride chat completions (measured 2026-09-27). An
     image-only model is `image`. The rest are named after the modality.
+    (`rerank` is named after it too, and then taken off where the list is set:
+    see `_NOT_SERVED_BY_ACCOUNTS`.)
     """
     out: list[str] = []
     if "text" in output:
@@ -581,6 +593,7 @@ class Catalogue:
     def _set(self, models: list[DriverModel], when: _dt.datetime | None) -> None:
         seen: dict[str, DriverModel] = {}
         for model in models:
+            model.surfaces = [s for s in model.surfaces if s not in _NOT_SERVED_BY_ACCOUNTS]
             seen.setdefault(model.id, model)
         self._models = sorted(seen.values(), key=lambda m: m.id)
         self._by_id = {m.id: m for m in self._models}

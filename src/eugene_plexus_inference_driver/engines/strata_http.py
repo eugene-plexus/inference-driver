@@ -10,8 +10,14 @@ from typing import Any
 
 import httpx
 
-from .._generated.models import GenerateRequest, Tool
+from .._generated.models import (
+    GenerateRequest,
+    RerankPassagesRequest,
+    RerankPassagesResponse,
+    Tool,
+)
 from ._subprocess import CliError
+from .base import RerankUnsupported
 from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target
 
 _SUPPORTED = frozenset(
@@ -75,6 +81,14 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
 
     async def probe_embeddings(self) -> bool:
         return False
+
+    async def probe_rerank(self) -> bool | None:
+        # Not asked: the inherited probe would send `/v1/rerank` to a subset
+        # that serves text chat only, and say nothing it could be believed on.
+        return False
+
+    async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse:
+        raise RerankUnsupported("Strata serves text chat only")
 
     async def probe_image_input(self) -> bool:
         return False

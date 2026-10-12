@@ -7,8 +7,21 @@ from eugene_plexus_inference_driver._generated.models import (
     EmbedResponse,
     FinishReason,
     GenerateResponse,
+    RerankPassagesResponse,
+    RerankScale,
 )
 from eugene_plexus_inference_driver.engines.base import Chunk
+
+PROTECTED_PATHS = ["/v1/generate", "/v1/generate/stream", "/v1/embed", "/v1/rerank"]
+
+
+def _protected_body(path: str) -> dict:
+    """A request to `path` whose content is the word `private`."""
+    if path == "/v1/embed":
+        return {"input": ["private"]}
+    if path == "/v1/rerank":
+        return {"query": "private", "documents": ["private"]}
+    return {"messages": [{"role": "user", "content": "private"}]}
 
 
 class CountingEngine:
@@ -34,34 +47,28 @@ class CountingEngine:
         self.calls.append(inputs)
         return EmbedResponse(embeddings=[[1.0]])
 
+    async def rerank(self, request):
+        self.calls.append(request)
+        return RerankPassagesResponse(results=[], scale=RerankScale.probability)
+
 
 @pytest.mark.parametrize("locality", ["external", "unknown", None])
-@pytest.mark.parametrize("path", ["/v1/generate", "/v1/generate/stream", "/v1/embed"])
+@pytest.mark.parametrize("path", PROTECTED_PATHS)
 def test_nonlocal_engine_never_receives_protected_content(client, locality, path):
     engine = CountingEngine(locality)
     client.app.state.adapter = engine
-    body = (
-        {"input": ["private"]}
-        if path.endswith("embed")
-        else {"messages": [{"role": "user", "content": "private"}]}
-    )
-    response = client.post(path, json={**body, "localOnly": True})
+    response = client.post(path, json={**_protected_body(path), "localOnly": True})
     assert response.status_code == 403, response.text
     assert engine.calls == []
     assert "local-only" in response.text
     assert "private" not in response.text
 
 
-@pytest.mark.parametrize("path", ["/v1/generate", "/v1/generate/stream", "/v1/embed"])
+@pytest.mark.parametrize("path", PROTECTED_PATHS)
 def test_local_engine_serves_protected_work(client, path):
     engine = CountingEngine("local")
     client.app.state.adapter = engine
-    body = (
-        {"input": ["private"]}
-        if path.endswith("embed")
-        else {"messages": [{"role": "user", "content": "private"}]}
-    )
-    response = client.post(path, json={**body, "localOnly": True})
+    response = client.post(path, json={**_protected_body(path), "localOnly": True})
     assert response.status_code == 200, response.text
     assert len(engine.calls) == 1
 

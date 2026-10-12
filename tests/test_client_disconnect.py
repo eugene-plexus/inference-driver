@@ -30,10 +30,12 @@ from eugene_plexus_inference_driver._generated.models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
+    RerankPassagesRequest,
 )
 from eugene_plexus_inference_driver.disconnect import _watch
 from eugene_plexus_inference_driver.engines.base import Chunk
 from eugene_plexus_inference_driver.routes.generate import embed, generate, generate_stream
+from eugene_plexus_inference_driver.routes.rerank import rerank
 
 
 class _HangingAdapter:
@@ -62,6 +64,10 @@ class _HangingAdapter:
         raise AssertionError("unreachable")
 
     async def embed(self, texts: list[str], *, model: str | None = None) -> Any:
+        await self._hang()
+        raise AssertionError("unreachable")
+
+    async def rerank(self, request: RerankPassagesRequest) -> Any:
         await self._hang()
         raise AssertionError("unreachable")
 
@@ -169,6 +175,15 @@ async def test_a_gateway_that_gave_up_cancels_the_embedding() -> None:
     adapter = _HangingAdapter()
     body = EmbedRequest(input=["hi"])
     await _drive(adapter, lambda r: embed(r, body))
+    assert adapter.cancelled
+    assert not adapter.finished
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_that_gave_up_cancels_the_rerank() -> None:
+    adapter = _HangingAdapter()
+    body = RerankPassagesRequest(query="a question", documents=["a passage"])
+    await _drive(adapter, lambda r: rerank(r, body))
     assert adapter.cancelled
     assert not adapter.finished
 

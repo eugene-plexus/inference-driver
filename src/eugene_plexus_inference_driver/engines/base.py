@@ -88,6 +88,18 @@ class TokenCountUnsupported(Exception):
     """
 
 
+class RerankUnsupported(Exception):
+    """This backend does not sort results (400).
+
+    Not a `CliError`, for `TokenCountUnsupported`'s reason: nothing failed.
+    The backend is healthy and has no rerank to give -- `llama-server` started
+    without `--reranking` answers 501 and says so, an Ollama or a hosted API
+    has no `/v1/rerank` at all -- and the same request would be refused
+    identically by every replica of it, so it must never cascade. The message
+    says what the backend itself answered, which is the observed cause.
+    """
+
+
 class ModelNotServed(Exception):
     """The request named a model this driver does not serve (404).
 

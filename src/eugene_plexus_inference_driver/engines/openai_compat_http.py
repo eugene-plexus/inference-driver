@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -62,6 +63,10 @@ from .._generated.models import (
     ModerationPartType,
     NamedToolChoice,
     ReasoningEffort,
+    RerankedPassage,
+    RerankPassagesRequest,
+    RerankPassagesResponse,
+    RerankScale,
     Role,
     SpeakRequest,
     SpeechFormat,
@@ -78,7 +83,7 @@ from .._generated.models import (
 )
 from .._http import client_for
 from ..audio_out import AudioAssembly
-from ..failures import request_id, retry_after
+from ..failures import input_too_long, request_id, retry_after
 from ..images import attachment_kinds, content_wire
 from ..images_out import ImageRefusal as ImageOutRefusal
 from ..images_out import (
@@ -138,6 +143,7 @@ from .base import (
     Chunk,
     ModelNotServed,
     ModelRequired,
+    RerankUnsupported,
     TokenCountUnsupported,
     refuse_unsupported_settings,
     resolve_single_model,
@@ -219,10 +225,22 @@ _GENERATING_PROGRESS_SECONDS = 0.5
 # "not now". Only these settle that a backend is not `llama-server`.
 _NO_SUCH_PATH = frozenset({404, 405, 410, 501})
 
-# How long the "do you rerank" probe may take. A rerank of one short passage is
-# milliseconds on a server that does it, and a server that does not answers at
-# once, so this is for a backend that is up and slow, not one that is working.
+# How long the "do you rerank" probe may take. A rerank of two short passages is
+# milliseconds on a server that does it (170 ms for Qwen3-Reranker-0.6B on a CPU,
+# the first one included, MR6), and a server that does not answers at once, so
+# this is for a backend that is up and slow, not one that is working.
 _RERANK_PROBE_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+
+# What the probe asks: a fixed question, and two passages, one that answers it
+# and one that does not. Two, not one, because a score on its own cannot say
+# what scale it is on: a logit model scores a passage that answers far above 1
+# (bge-reranker-v2-m3: 8.6) and one that does not far below 0 (-11.0), while a
+# probability model keeps both inside 0 to 1 (Qwen3-Reranker: 0.998 and 0.00002,
+# measured on b10948), so between the two at least one is out of range for a
+# logit model almost whatever it is. The unrelated passage is the far one on
+# purpose: the further its logit is below 0, the surer the call.
+_RERANK_PROBE_QUERY = "What is the capital of France?"
+_RERANK_PROBE_PASSAGES = ("Paris is the capital of France.", "Bananas are a yellow fruit.")
 
 # The answers that mean "not now", which say nothing about what the backend
 # can do. `llama-server` answers 503 ("Loading model") until its model is in
@@ -809,6 +827,13 @@ class OpenAiCompatibleHttpEngine:
         #: the above; asked first, because asking a reranker to embed is
         #: not safe (see `probe_rerank`).
         self._rerank: bool | None = None
+        #: What the backend's rerank scores are, learned with the answer above
+        #: (`probe_rerank`) and kept beside it. Only ever moves one way: a
+        #: backend taken for `probability` that answers outside 0 to 1 is
+        #: `logit` for the life of the engine (see `_scale_of`). None until
+        #: something has said, which a rerank that arrives first reads off its
+        #: own answer.
+        self._rerank_scale: RerankScale | None = None
         #: Whether the backend answered as `llama-server`, the one backend
         #: that says how far it has read a prompt. Learned from `/props`
         #: by the context probe (or on the first stream that asks), and
@@ -3008,6 +3033,152 @@ class OpenAiCompatibleHttpEngine:
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
 
+    async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse:
+        """`POST /v1/rerank` upstream (MR6): the passages scored against the
+        question, best first, every score on one scale.
+
+        **`llama-server --reranking` and vLLM take Jina's body**
+        (`{model, query, documents: [str], top_n}`) and answer
+        `results: [{index, relevance_score}]` with `usage`; measured on
+        b10948 and b11552. The backend sorts them, and this sorts them again:
+        `top_n` is the caller's to apply and ties are the contract's to break
+        (higher score, then the lower index), neither of which the backend
+        promises.
+
+        **The scale is the backend's to say and this reads it** (`_scale_of`).
+        A `probability` backend's number is the score; a `logit` backend's
+        goes through `1 / (1 + e^-x)`, which keeps its order and puts it
+        where a threshold means something. `rawScore` is the backend's own
+        number either way.
+
+        **A backend that does not rerank is refused, in words** (`RerankUnsupported`):
+        `llama-server` without `--reranking` answers 501, an Ollama or a hosted
+        API has no such path, and an account never serves it. Everything else a
+        backend can answer is `embed`'s: a 4xx is the request's, a 5xx or a
+        refusal worth retrying is not, and the one 500 that is the request's
+        (a passage longer than the physical batch) is told apart in
+        `failures.disposition`.
+        """
+        started = time.perf_counter()
+        target = self.resolve_model(request.model)
+        if target.entry is not None:
+            raise RerankUnsupported(
+                f"{target.id!r} is a model on an account, and no account sorts results yet"
+            )
+        passages = [document.root for document in request.documents]
+        payload: dict[str, Any] = {
+            "model": target.upstream,
+            "query": request.query,
+            "documents": passages,
+        }
+        if request.topN is not None:
+            payload["top_n"] = request.topN
+        try:
+            response = await self._client().post(
+                "/v1/rerank",
+                headers={
+                    **self._headers(),
+                    **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+                },
+                json=payload,
+            )
+        except httpx.ConnectTimeout as e:
+            raise CliError(f"openai_compat_http could not connect: {e!r}") from e
+        except httpx.TimeoutException as e:
+            raise _timed_out(e, self._timeout_seconds, "the rerank") from e
+        except httpx.HTTPError as e:
+            raise CliError(f"openai_compat_http rerank request failed: {e!r}") from e
+
+        if response.status_code >= 400:
+            raise self._rerank_failure(response)
+        try:
+            body = response.json()
+        except ValueError as e:
+            raise CliError(
+                f"openai_compat_http returned non-JSON for a rerank: {response.text[:200]!r}"
+            ) from e
+
+        # The backend applied `top_n` if it reads it, so that many is what it
+        # owes; more is fine (a backend that ignores it), fewer is a passage
+        # that went missing.
+        owed = len(passages) if request.topN is None else min(request.topN, len(passages))
+        scored = _rerank_scores(body, passages=len(passages), owed=owed)
+        scale = self._scale_of([raw for _, raw in scored])
+        rows = [
+            RerankedPassage(
+                index=index,
+                score=_logistic(raw) if scale is RerankScale.logit else raw,
+                rawScore=raw,
+            )
+            for index, raw in scored
+        ]
+        rows.sort(key=lambda row: (-row.score, row.index))
+        if request.topN is not None:
+            rows = rows[: request.topN]
+        return RerankPassagesResponse(
+            results=rows,
+            scale=scale,
+            modelId=self._public_model_id(body.get("model"), target),
+            backend=self.backend_kind,
+            usage=_rerank_usage(body.get("usage")),
+            latencyMs=int((time.perf_counter() - started) * 1000),
+            requestId=request.requestId,
+        )
+
+    def _rerank_failure(self, response: httpx.Response) -> Exception:
+        """What a backend's refusal of a rerank is: "this does not sort
+        results", or `embed`'s own failure with the status carried."""
+        status = response.status_code
+        words = _redact(upstream_words(response))
+        if status in _NO_SUCH_PATH:
+            # The backend itself says it does not rerank (`llama-server`: 501,
+            # "start it with `--reranking`"), which is the probe's definite no
+            # reached another way. It is kept, so `/v1/info` stops listing
+            # `rerank` for a backend that was restarted without it.
+            self._rerank = False
+            return RerankUnsupported(f"the backend answered {status}: {words}")
+        message = f"openai_compat_http returned {status} for a rerank: {words}"
+        if input_too_long(words):
+            message = (
+                "openai_compat_http refused a rerank: the question and one passage together "
+                f"are longer than the backend reads at once. It said: {words.rstrip('. ')}. "
+                "Send shorter passages."
+            )
+        return CliError(
+            message,
+            upstream_status=status,
+            retry_after_seconds=retry_after(response.headers.get("Retry-After")),
+        )
+
+    def _scale_of(self, scores: list[float]) -> RerankScale:
+        """The scale to read one answer's scores on, from what the backend is
+        known to answer and from the answer itself.
+
+        A score outside 0 to 1 is proof: a probability cannot make one, so the
+        backend answers logits, and it is `logit` from then on, whatever it was
+        taken for (said once, because it moves once). A backend taken for
+        `logit` stays it: a logit that lands inside 0 to 1 is still a logit,
+        and reading it as a probability would put it on the wrong scale
+        for no reason. Scores all inside 0 to 1 are what a probability answers,
+        and are no proof of it, so an engine nothing has yet told reads this
+        answer as one and does not keep the guess for the next.
+        """
+        known = self._rerank_scale
+        if known is RerankScale.logit:
+            return known
+        outside = next((s for s in scores if not 0.0 <= s <= 1.0), None)
+        if outside is None:
+            return RerankScale.probability
+        log.info(
+            "backend at %s answered a rerank score of %g, outside 0 to 1%s, so its scores are "
+            "logits: they are mapped through 1 / (1 + e^-x) from now on",
+            self._base_url,
+            outside,
+            " after being taken for probabilities" if known is not None else "",
+        )
+        self._rerank_scale = RerankScale.logit
+        return RerankScale.logit
+
     async def count_prompt_tokens(self, request: GenerateRequest) -> int:
         """The prompt this request would send, counted by the backend itself.
 
@@ -3084,13 +3255,22 @@ class OpenAiCompatibleHttpEngine:
         return len(tokens)
 
     async def probe_rerank(self) -> bool | None:
-        """Whether this backend reranks, determined by asking it to.
+        """Whether this backend reranks, and on what scale, determined by
+        asking it to.
 
-        True when a one-passage rerank is answered with scores; False when
+        True when a rerank of two short passages, one that answers a fixed
+        question and one that does not, is answered with scores; False when
         the backend refuses (no such endpoint, `llama-server`'s 501 "start
         it with `--reranking`"): a definite no, kept for the engine's life;
         None when it cannot say yet (a model still loading, a transport
         failure), which is not kept.
+
+        **The scale comes with the yes and is kept beside it.** A score
+        outside 0 to 1 means the backend answers logits (bge-reranker-v2-m3:
+        8.6 and -11.0), none means probabilities (Qwen3-Reranker: 0.998 and
+        0.00002), which is why there are two passages (`_RERANK_PROBE_PASSAGES`).
+        It is a first reading and not the last: `_scale_of` corrects it from a
+        real answer.
 
         **Asked before `probe_embeddings` asks anything, because that
         question is not safe to put to a reranker.** `llama-server` started
@@ -3111,7 +3291,11 @@ class OpenAiCompatibleHttpEngine:
             response = await self._client().post(
                 "/v1/rerank",
                 headers=self._headers(),
-                json={"model": target.upstream, "query": "1", "documents": ["1"]},
+                json={
+                    "model": target.upstream,
+                    "query": _RERANK_PROBE_QUERY,
+                    "documents": list(_RERANK_PROBE_PASSAGES),
+                },
                 timeout=_RERANK_PROBE_TIMEOUT,
             )
         except (httpx.HTTPError, ModelNotServed, ModelRequired) as e:
@@ -3120,15 +3304,29 @@ class OpenAiCompatibleHttpEngine:
         if response.status_code in _NOT_NOW:
             log.debug("rerank probe inconclusive (HTTP %s, not now)", response.status_code)
             return None
-        answer = False
+        scores: list[float] = []
         if response.status_code == 200:
             try:
-                results = response.json().get("results")
-            except (ValueError, AttributeError):
-                results = None
-            answer = isinstance(results, list) and bool(results)
+                scores = _probe_scores(response.json())
+            except ValueError:
+                scores = []
+        if self._rerank is not None:
+            # Settled while this was out: `/v1/info` asks twice at a cold start
+            # (it asks, and so does the embeddings probe), and the first answer
+            # to arrive is the one that stands.
+            return self._rerank
+        answer = bool(scores)
         if answer:
-            log.info("backend at %s reranks", self._base_url)
+            # Never back from `logit`: a real answer outside 0 to 1 got there
+            # first, and the probe's two passages cannot outweigh it.
+            outside = any(not 0.0 <= s <= 1.0 for s in scores)
+            scale = (
+                RerankScale.logit
+                if outside or self._rerank_scale is RerankScale.logit
+                else RerankScale.probability
+            )
+            self._rerank_scale = scale
+            log.info("backend at %s reranks, scale: %s", self._base_url, scale.value)
         self._rerank = answer
         return answer
 
@@ -3791,6 +3989,88 @@ def _vectors_from_envelope(body: Any, *, expected: int) -> list[list[float]]:
             "order and count are the only way a caller can match vectors to text"
         )
     return [v for _, v in rows]
+
+
+def _number(value: Any) -> float | None:
+    """A finite number, or None: a JSON `true` is not one, and a NaN or an
+    infinity could not be sent on as a score."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _probe_scores(body: Any) -> list[float]:
+    """The scores a probe's answer carries, and none for an answer that has
+    none: a server that says 200 to anything is not told from one that reranks
+    by its status, only by the scores."""
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list):
+        return []
+    scores = (_number(r.get("relevance_score")) for r in results if isinstance(r, dict))
+    return [s for s in scores if s is not None]
+
+
+def _rerank_scores(body: Any, *, passages: int, owed: int) -> list[tuple[int, float]]:
+    """`results[].index` and `.relevance_score`, each passage once.
+
+    **A passage is known by its index and nothing else**, so an answer that
+    cannot be matched up is refused rather than returned: an index outside the
+    request's passages, the same one twice, a score that is not a finite
+    number, and fewer scores than `owed` (a passage the backend dropped would
+    otherwise just not be there, and a caller would take that for a low score).
+    """
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list) or not results:
+        raise CliError(f"openai_compat_http returned no rerank results: {str(body)[:200]!r}")
+    scored: dict[int, float] = {}
+    for entry in results:
+        index = entry.get("index") if isinstance(entry, dict) else None
+        raw = _number(entry.get("relevance_score")) if isinstance(entry, dict) else None
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < passages
+            or index in scored
+            or raw is None
+        ):
+            raise CliError(
+                f"openai_compat_http returned a malformed rerank result for {passages} "
+                f"passages: {entry!r}"
+            )
+        scored[index] = raw
+    if len(scored) < owed:
+        raise CliError(
+            f"openai_compat_http returned {len(scored)} rerank scores for {owed} passages; a "
+            "passage is matched to its score by index alone, so none may be missing"
+        )
+    return list(scored.items())
+
+
+def _logistic(x: float) -> float:
+    """`1 / (1 + e^-x)`, written so that a large negative logit cannot overflow
+    `exp`: only a number at or below zero is ever exponentiated."""
+    if x >= 0.0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def _rerank_usage(usage: Any) -> Usage | None:
+    """`prompt_tokens` and `total_tokens`, the two a reranker reports (a
+    reranker generates nothing, so there is no completion count to carry);
+    absent when the backend says neither."""
+    if not isinstance(usage, dict):
+        return None
+    prompt = _count(usage.get("prompt_tokens"))
+    total = _count(usage.get("total_tokens"))
+    if prompt is None and total is None:
+        return None
+    return Usage(promptTokens=prompt, totalTokens=total)
+
+
+def _count(value: Any) -> int | None:
+    """A token count, or None for anything that is not a whole number of them."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _usage_from_envelope(usage: dict[str, Any]) -> Usage | None:

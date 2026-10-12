@@ -128,20 +128,35 @@ async def _single_model(engine: Any) -> list[DriverModel]:
     # their timeouts or let an embedding probe use the generation deadline.
     # Keep known engine policy available; unconfirmed capabilities stay
     # conservative, and cancelling a probe does not cache a false answer.
-    image_input, audio_input, context_window, embeddings, completion = await asyncio.gather(
+    (
+        image_input,
+        audio_input,
+        context_window,
+        embeddings,
+        completion,
+        reranks,
+    ) = await asyncio.gather(
         _bounded_probe(_image_input(engine), False),
         _bounded_probe(_modality_input(engine, "audio"), False),
         _bounded_probe(_context_window(engine), None),
         _bounded_probe(_embeddings(engine), None),
         _bounded_probe(_completion(engine), (False, False)),
+        _bounded_probe(_rerank(engine), None),
     )
     decision = _decision_capability(engine)
     # `surfaces` replaces `capabilities.embeddings` and `chatCapable`, with
     # the gateway's old reading of them kept exactly: a backend that embeds
     # is an embeddings backend, a decision engine answers decisions alone,
     # and everything else -- every driver that predates both -- is chat.
+    # A backend that reranks is a reranker (MR6). Until 2026-10-12 a real
+    # `llama-server --reranking` (b10948, Qwen3-Reranker) was listed as chat
+    # and, being local, completion: the embeddings probe, which says no to a
+    # reranker, was all the reading this had, and no is what chat is the
+    # fallback for.
     if decision is not None or not getattr(engine, "chat_capable", True):
         surfaces = ["decisions"]
+    elif reranks is True:
+        surfaces = ["rerank"]
     elif embeddings is True:
         surfaces = ["embeddings"]
     else:
@@ -225,6 +240,21 @@ async def _completion(engine: Any) -> tuple[bool, bool]:
     except Exception:  # see _embeddings: /v1/info must not fail over a capability
         log.debug("completion probe failed; reporting none", exc_info=True)
         return (False, False)
+
+
+async def _rerank(engine: Any) -> bool | None:
+    """Whether the backend reranks, and never an exception: `_embeddings`'
+    rule, for the same reason. An engine with no such probe says nothing, and
+    None is how a backend that cannot say yet (still loading) says it too."""
+    probe = getattr(engine, "probe_rerank", None)
+    if probe is None:
+        return None
+    try:
+        answer = await probe()
+    except Exception:  # see _embeddings: /v1/info must not fail over a capability
+        log.debug("rerank probe failed; reporting unknown", exc_info=True)
+        return None
+    return answer if isinstance(answer, bool) else None
 
 
 async def _embeddings(engine: Any) -> bool | None:
