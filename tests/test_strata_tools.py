@@ -1,15 +1,16 @@
 """Strata takes tools, tool results and structured output (Troy, 2026-10-12).
 
 Until that day the driver refused all three for Strata, because nobody had tried
-them, and the gateway listed every Strata model without tools. Measured on
-Strata v0.1.39 (`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint;
-`docs/design/tools-assumed.md` in specs): it calls tools correctly (one call,
-two at once, streamed, and the round trip with the tool's result) and answers
-`response_format` natively. What it does not do is read `tool_choice`: `none`
-still called the tool, `required` answered "Hello!", and a named function called
-another one. Nor `parallel_tool_calls: false`: with a question that wants two
-calls, the field absent, `true` and `false` all answered both (measured again on
-2026-10-12, six runs). And `response_format` together with tools is its own 400.
+them, and the gateway listed every Strata model without tools. Measured on Troy's
+running Strata, 2026-10-12 (`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint,
+whose `/health` names no version; `docs/design/tools-assumed.md` in specs): it calls
+tools correctly (one call, two at once, streamed, and the round trip with the tool's
+result) and answers `response_format` natively. What it does not do is read
+`tool_choice`: `none` still called the tool, `required` answered "Hello!", and a named
+function called another one. Nor `parallel_tool_calls: false`: with a question that
+wants two calls, the field absent, `true` and `false` all answered both (measured
+again on 2026-10-12, six runs). And `response_format` together with tools is its own
+400.
 
 What it does not honour is **sent anyway and named**, not refused: Codex sends
 `parallel_tool_calls: false` on every request, so a refusal made Strata unusable
@@ -513,13 +514,42 @@ def test_only_what_strata_ignores_is_named(
     choice: Any, parallel: bool | None, named: list[str]
 ) -> None:
     fields: dict[str, Any] = {"tools": [WEATHER, TIME]}
+    caller = ["tools"]
+    if choice is not None:
+        fields["toolChoice"] = (
+            NamedToolChoice.model_validate(choice) if isinstance(choice, dict) else choice
+        )
+        caller.append("toolChoice")
+    if parallel is not None:
+        fields["parallelToolCalls"] = parallel
+        caller.append("parallelToolCalls")
+    assert _engine().ignored_settings(_ask(callerSettings=caller, **fields)) == named
+
+
+@pytest.mark.parametrize(
+    ("choice", "parallel"),
+    [("required", None), (NAMED, None), (None, False), ("required", False)],
+    ids=["required", "named", "parallel-false", "required-parallel-false"],
+)
+def test_a_setting_the_caller_did_not_send_is_sent_but_not_named(
+    choice: Any, parallel: bool | None
+) -> None:
+    """The header names what the caller sent (`callerSettings`), as the gateway does, so the two
+    never disagree about a request. A setting that rides on the request without the caller
+    having sent it (a profile's or an install's default) is still sent to Strata, which still
+    ignores it, and is not named: the caller never asked for it, and the gateway's own header
+    says nothing of it either."""
+    fields: dict[str, Any] = {"tools": [WEATHER, TIME]}
     if choice is not None:
         fields["toolChoice"] = (
             NamedToolChoice.model_validate(choice) if isinstance(choice, dict) else choice
         )
     if parallel is not None:
         fields["parallelToolCalls"] = parallel
-    assert _engine().ignored_settings(_ask(**fields)) == named
+    engine = _engine()
+    assert engine.ignored_settings(_ask(callerSettings=["tools"], **fields)) == []
+    assert engine.ignored_settings(_ask(**fields)) == [], "no provenance at all: nothing was sent"
+    assert engine.ignored_settings(_ask(callerSettings=[], **fields)) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -567,19 +597,52 @@ def test_the_header_names_what_strata_ignores_on_generate_and_on_the_stream(
         else httpx.Response(200, json=_call_reply(("get_weather", '{"city":"Paris"}')))
     )
     fields: dict[str, Any] = {"tools": _tool_json(WEATHER, TIME)}
+    caller = ["tools"]
     if choice is not None:
         fields["toolChoice"] = choice
+        caller.append("toolChoice")
     if parallel is not None:
         fields["parallelToolCalls"] = parallel
+        caller.append("parallelToolCalls")
     with _client(tmp_path) as client:
         response = client.post(
-            "/v1/generate/stream" if stream else "/v1/generate", json=_body(**fields)
+            "/v1/generate/stream" if stream else "/v1/generate",
+            json=_body(callerSettings=caller, **fields),
         )
     assert response.status_code == 200, response.text
     assert response.headers.get(HEADER) == header
     if stream:
         # Known before the first frame: it is on the response that carries them.
         assert [name for name, _ in _events(response.text)][-1] == "done"
+
+
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_setting_that_is_not_the_callers_is_sent_to_strata_and_not_named(
+    tmp_path: Path, stream: bool
+) -> None:
+    """Through the app, on the wire and on the response: `callerSettings` lists only `tools`,
+    so the `parallel_tool_calls: false` and `tool_choice: required` that ride on the request
+    (a profile's, say) go to Strata as they always did, and neither is named."""
+    route = respx.post(CHAT).mock(
+        return_value=httpx.Response(
+            200, text=_streamed_call(), headers={"content-type": "text/event-stream"}
+        )
+        if stream
+        else httpx.Response(200, json=_call_reply(("get_weather", '{"city":"Paris"}')))
+    )
+    body = _body(
+        tools=_tool_json(WEATHER, TIME),
+        toolChoice="required",
+        parallelToolCalls=False,
+        callerSettings=["tools"],
+    )
+    with _client(tmp_path) as client:
+        response = client.post("/v1/generate/stream" if stream else "/v1/generate", json=body)
+    assert response.status_code == 200, response.text
+    sent = _sent(route)
+    assert sent["tool_choice"] == "required" and sent["parallel_tool_calls"] is False
+    assert HEADER not in response.headers
 
 
 @respx.mock

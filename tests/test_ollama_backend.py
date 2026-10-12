@@ -136,14 +136,16 @@ async def test_a_tool_choice_ollama_ignores_is_sent_and_named_not_refused(
 ) -> None:
     """Refused, an explicit one blocked every caller that sends it, and an inherited one was
     left out without a word on the wire. A setting a backend is not read by is sent as it is
-    and said to be ignored (`x-eugene-plexus-ignored-settings`, `settingsNotHonoured`)."""
+    and said to be ignored (`x-eugene-plexus-ignored-settings`, `settingsNotHonoured`) --
+    **named only when the caller sent it** (`callerSettings`), as the gateway names it, so an
+    inherited one is sent all the same and the header says nothing of it."""
     route = _route(OLLAMA)
     engine = _engine("ollama")
     request = _ask(explicit=explicit, tools=TOOLS, toolChoice=choice)
     await engine.generate(request)
     assert _sent(route)["tool_choice"] == choice
     assert [t["function"]["name"] for t in _sent(route)["tools"]] == ["a", "b"]
-    assert engine.ignored_settings(request) == ["toolChoice"]
+    assert engine.ignored_settings(request) == (["toolChoice"] if explicit else [])
 
 
 @respx.mock

@@ -11,7 +11,9 @@ signatures.
   `functionDeclarations`, `response_format` to a response schema,
   `reasoning_effort` to `thinkingConfig`, thoughts back as reasoning.
 * **Thought signatures** are remembered here by tool-call id (G2, G7).
-* **A setting Gemini cannot honour is refused** (A2), never sent and ignored.
+* **A setting Gemini cannot honour is refused** (A2), never sent and ignored --
+  except the one it merely does not obey, `parallel_tool_calls: false`, which has
+  no field to go in: that is named (`settings_not_honoured`), not refused.
 * **Embeddings, images, Veo video, speech (WAV or PCM, G5) and transcription**
   through the routes the other media engines use.
 
@@ -52,6 +54,7 @@ from .._generated.models import (
     ImageRequest,
     ImageResponse,
     ImageUsage,
+    SettingNotHonoured,
     SpeakRequest,
     SpeechFormat,
     Stage,
@@ -168,6 +171,7 @@ class GeminiApiEngine:
             fetch=self._fetch_catalogue,
             get=get or (lambda _key: None),
             path=catalogue_path,
+            view=self._served_view,
         )
 
     # -- construction -------------------------------------------------------
@@ -311,6 +315,72 @@ class GeminiApiEngine:
             field,
         )
 
+    def _warn_parallel_not_sent(self, model: str) -> None:
+        """`parallel_tool_calls: false`, explicit or not, has nowhere to go: said once."""
+        if (model, "parallel_tool_calls") in self._warned:
+            return
+        self._warned.add((model, "parallel_tool_calls"))
+        log.warning(
+            "Gemini model %r has no setting to stop several tool calls in one turn, so "
+            "`parallel_tool_calls: false` is not sent and the request is answered; what a "
+            "caller sent is named as not honoured (`settingsNotHonoured`, "
+            "`x-eugene-plexus-ignored-settings`). Said once per model for the life of this "
+            "engine.",
+            model,
+        )
+
+    # -- what Gemini does not honour ---------------------------------------------
+
+    def settings_not_honoured(self) -> list[SettingNotHonoured]:
+        """What a chat request is sent and Gemini does not honour, by value.
+
+        `parallel_tool_calls: false`: Gemini "may make several calls in one turn and
+        has no setting to prevent it" (its native `toolConfig.functionCallingConfig`
+        takes a mode and the names a call may be made to, and nothing about how
+        many), so `false` cannot be put on the wire. **Named, not refused** (Troy,
+        2026-10-12, `docs/design/tools-assumed.md`): Codex sends `false` on every
+        request, and a refusal made every Gemini model unusable from it. `true` is
+        what Gemini does anyway, so it is not listed. Reported as
+        `capabilities.settingsNotHonoured` on every chat model (`_served_view`) and
+        named per request by `ignored_settings`. A fresh list per call.
+        """
+        return [SettingNotHonoured(setting="parallelToolCalls", values=[False])]
+
+    def _served_view(self, model: DriverModel) -> DriverModel:
+        """A model as it is SERVED: what this engine knows of Gemini, laid over
+        Google's listing. A chat model carries `settingsNotHonoured`, which is static
+        and so not in the listing; a copy, never the stored entry, which is saved to
+        disk and read again from Google (`Catalogue`'s `view`)."""
+        caps = model.capabilities
+        if caps is None or "chat" not in model.surfaces:
+            return model
+        named = caps.model_copy(update={"settingsNotHonoured": self.settings_not_honoured()})
+        return model.model_copy(update={"capabilities": named})
+
+    def ignored_settings(self, request: GenerateRequest) -> list[str]:
+        """The request's fields, in this contract's spelling, that the caller sent and
+        Gemini does not honour (`settings_not_honoured`): `parallelToolCalls` when the
+        caller sent `false`.
+
+        Named on `x-eugene-plexus-ignored-settings` by `POST /v1/generate` and its
+        stream, before the first frame. **Only what the caller sent**
+        (`callerSettings`), as the gateway names it, so the two cannot disagree; a
+        `false` that arrives filled in from a profile is dropped like the explicit
+        one and not named.
+        """
+        try:
+            target = self.resolve_model(request.model)
+        except (ModelNotServed, ModelRequired):
+            return []  # the route refuses it before anything is sent: nothing is ignored
+        if "chat" not in target.entry.surfaces:
+            return []
+        sent = set(request.callerSettings or [])
+        return [
+            gap.setting
+            for gap in self.settings_not_honoured()
+            if gap.setting in sent and getattr(request, gap.setting, None) in gap.values
+        ]
+
     # -- the account -----------------------------------------------------------
 
     async def _fetch_catalogue(self) -> list[DriverModel]:
@@ -392,15 +462,10 @@ class GeminiApiEngine:
             )
         unsupported = self._unsupported(target)
         refuse_unsupported_settings(request, unsupported=unsupported)
-        explicit = set(request.callerSettings or [])
         if request.parallelToolCalls is False:
-            if "parallelToolCalls" in explicit:
-                raise CliError(
-                    "parallel_tool_calls: Gemini may make several calls in one turn and has "
-                    "no setting to prevent it, so false cannot be honoured; remove it.",
-                    upstream_status=400,
-                )
-            self._warn_dropped(target.id, "parallel_tool_calls")
+            # Nowhere to put it, and not refused: a measured gap is named
+            # (`settings_not_honoured`), and a refusal is Codex unable to use the model.
+            self._warn_parallel_not_sent(target.id)
         for field, value in (
             ("minP", request.minP),
             ("logprobs", request.logprobs),

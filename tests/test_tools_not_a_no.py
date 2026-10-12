@@ -10,8 +10,11 @@ three places where an absent field read as "no tools":
 * the route's own door, which read a catalogue entry with no `toolCalling` (a list saved by an
   older driver) as false.
 
-A listing that SAYS something and leaves tools out stays a no: OpenRouter's list without `tools`,
-Ollama's capabilities without `tools`, LM Studio's naming other capabilities.
+A listing that SAYS something and leaves tools out stays a no where the provider means it as one:
+OpenRouter's `supported_parameters` without `tools` (it lists what each model accepts) and Ollama's
+capabilities without `tools`. **LM Studio's is not one** (round three): its `capabilities` names
+what a model is trained for, which is not the server refusing tools, and a list that named other
+things and not `tool_use` read as no tools, a refusal nobody had seen.
 """
 
 from __future__ import annotations
@@ -214,7 +217,7 @@ def test_gemma_still_cannot_read_what_it_was_never_listed_to_read() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Ollama and LM Studio: a list that names things is read, one that names none says nothing
+# Ollama reads its capabilities; LM Studio's say nothing of tools being refused
 # --------------------------------------------------------------------------- #
 
 DEFAULTS = EngineDefaults(
@@ -242,25 +245,99 @@ def test_ollama_reads_its_capabilities_only_when_it_gave_a_list(
 
 
 @pytest.mark.parametrize(
-    ("capabilities", "tools"),
+    "capabilities",
     [
-        (["tool_use"], True),
-        (["vision", "tool_use"], True),
-        ([], True),  # names nothing: says nothing
-        (None, True),  # absent
-        ("tool_use", True),  # not a list
-        (["vision"], False),  # names something and leaves tools out: LM Studio's own list
+        ["tool_use"],
+        ["vision", "tool_use"],
+        [],
+        None,
+        "tool_use",
+        # Names something and leaves `tool_use` out: it was read as no tools, and is not a
+        # refusal of anything. Only the backend refusing tools, in its own words, is evidence.
+        ["vision"],
+        ["vision", "reasoning"],
+        ["completion"],
     ],
-    ids=["tool-use", "vision-and-tool-use", "empty", "absent", "not-a-list", "others-only"],
+    ids=[
+        "tool-use",
+        "vision-and-tool-use",
+        "empty",
+        "absent",
+        "not-a-list",
+        "vision-only",
+        "vision-and-reasoning",
+        "completion-only",
+    ],
 )
-def test_lm_studio_reads_its_capabilities_only_when_they_name_something(
-    capabilities: Any, tools: bool
+@pytest.mark.parametrize("kind", ["llm", "vlm"])
+def test_lm_studio_takes_tools_whatever_its_capability_list_names(
+    capabilities: Any, kind: str
 ) -> None:
-    entry: dict[str, Any] = {"id": "qwen", "type": "llm"}
+    entry: dict[str, Any] = {"id": "qwen", "type": kind}
     if capabilities is not None:
         entry["capabilities"] = capabilities
     (model,) = from_lmstudio({"data": [entry]}, DEFAULTS)
-    assert model.capabilities is not None and model.capabilities.toolCalling is tools
+    caps = model.capabilities
+    assert caps is not None and caps.toolCalling is True
+    assert "tools" in (caps.supportedSettings or [])
+
+
+def test_lm_studio_still_reads_what_its_listing_does_say() -> None:
+    """Only tools moved: the type, the window and the vision pairing are still read from it."""
+    entries = [
+        {"id": "chat", "type": "llm", "capabilities": ["tool_use"], "loaded_context_length": 8192},
+        {"id": "eyes", "type": "vlm", "capabilities": ["vision"]},
+        {"id": "vectors", "type": "embeddings"},
+    ]
+    chat, eyes, vectors = from_lmstudio({"data": entries}, DEFAULTS)
+    assert chat.capabilities is not None and chat.capabilities.maxContextTokens == 8192
+    assert eyes.capabilities is not None and eyes.capabilities.imageInput is True
+    assert eyes.inputModalities == ["text", "image"]
+    assert vectors.surfaces == ["embeddings"]
+    assert vectors.capabilities is not None and not vectors.capabilities.toolCalling
+
+
+@respx.mock
+def test_through_the_app_an_lm_studio_model_that_names_no_tool_use_gets_its_tools(
+    tmp_path: Path,
+) -> None:
+    """The whole path for a driver the agent runs for LM Studio: the listing, `/v1/info`, the
+    door and the wire. The model's `capabilities` name vision and not `tool_use`; the request
+    carrying tools reaches LM Studio, which answers for itself (it was a 400 at the door)."""
+    lm = "http://127.0.0.1:1234"
+    respx.get(f"{lm}/api/v0/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "qwen2.5-vl-7b", "type": "vlm", "capabilities": ["vision"]},
+                    {"id": "qwen3-coder-30b", "type": "llm", "capabilities": ["tool_use"]},
+                ]
+            },
+        )
+    )
+    chat = respx.post(f"{lm}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_completion("qwen2.5-vl-7b"))
+    )
+    config = tmp_path / "lmstudio.yaml"
+    _write(config, {"provider": "lmstudio_local"})
+    with TestClient(create_app(settings=Settings(config_file=config))) as client:
+        info = _wait_for_catalogue(client)
+        by_id = {m["id"]: m["capabilities"] for m in info["models"]}
+        assert by_id["qwen2.5-vl-7b"]["toolCalling"] is True
+        assert "tools" in by_id["qwen2.5-vl-7b"]["supportedSettings"]
+        response = client.post(
+            "/v1/generate",
+            json={
+                "model": "qwen2.5-vl-7b",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [WEATHER],
+                "callerSettings": ["tools"],
+            },
+        )
+    assert response.status_code == 200, response.text
+    sent = json.loads(chat.calls.last.request.content)
+    assert [t["function"]["name"] for t in sent["tools"]] == ["get_weather"]
 
 
 # --------------------------------------------------------------------------- #

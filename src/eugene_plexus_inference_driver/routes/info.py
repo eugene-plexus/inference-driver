@@ -52,7 +52,14 @@ async def info(request: Request, models: bool = True, model: str | None = None) 
         elif catalogue is not None:
             # A provider account: its catalogue, filtered by its patterns.
             # No per-model probes -- the listing is the answer (P1-3).
-            served = catalogue.exposed()
+            if model is not None:
+                # The gateway's per-request re-check names one model: only that model's
+                # served view is built, not every one an account lists (659 for OpenRouter's,
+                # each a copy since the tool settings it names are laid over the listing).
+                found = catalogue.find(model)
+                served = [found] if found is not None else []
+            else:
+                served = catalogue.exposed()
         else:
             served = await _single_model(engine)
         if served is not None and model is not None:

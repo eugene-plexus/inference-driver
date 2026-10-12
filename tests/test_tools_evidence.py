@@ -93,7 +93,10 @@ STRATA_FORMAT_WITH_TOOLS = {
         "message": "structured response_format with tools/MCP is not supported",
     }
 }
-LOADING = {"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}}
+#: llama-server while its model is still loading, verbatim (measured 2026-10-12 on b10948, key order
+#: and all): a 503 that mentions no tools and refuses nothing about them. Nothing was computed, so
+#: it is safe to send again (`test_loading_is_safe.py`), and it is not evidence about tools.
+LOADING = {"error": {"message": "Loading model", "type": "unavailable_error", "code": 503}}
 OK = {
     "model": "qwen",
     "choices": [
@@ -430,34 +433,52 @@ def test_through_the_app_the_first_request_is_a_400_and_info_then_says_false(
 # --------------------------------------------------------------------------- #
 
 NOT_EVIDENCE = [
-    pytest.param(400, NO_MESSAGES, True, id="an-unrelated-400"),
-    pytest.param(500, BAD_TOOLS, True, id="a-malformed-tool-definition-measured-with-jinja-on"),
-    pytest.param(400, UNPARSEABLE_SCHEMA, True, id="a-schema-the-engine-cannot-parse-measured"),
-    pytest.param(400, STRATA_FORMAT_WITH_TOOLS, True, id="stratas-format-with-tools"),
-    pytest.param(503, LOADING, True, id="a-backend-still-loading"),
+    pytest.param(400, NO_MESSAGES, True, "terminal", id="an-unrelated-400"),
     pytest.param(
-        502, {"error": {"message": f"upstream said: {WORDS}"}}, True, id="the-words-wrapped"
+        500,
+        BAD_TOOLS,
+        True,
+        "indeterminate",
+        id="a-malformed-tool-definition-measured-with-jinja-on",
     ),
-    pytest.param(500, f"backend failure: {WORDS}", True, id="the-words-inside-plain-text"),
+    pytest.param(
+        400, UNPARSEABLE_SCHEMA, True, "terminal", id="a-schema-the-engine-cannot-parse-measured"
+    ),
+    pytest.param(400, STRATA_FORMAT_WITH_TOOLS, True, "terminal", id="stratas-format-with-tools"),
+    # Loading is nothing to do with tools -- and it is the one here that is safe to send again.
+    pytest.param(503, LOADING, True, "safe", id="a-backend-still-loading"),
+    pytest.param(
+        502,
+        {"error": {"message": f"upstream said: {WORDS}"}},
+        True,
+        "indeterminate",
+        id="the-words-wrapped",
+    ),
+    pytest.param(
+        500, f"backend failure: {WORDS}", True, "indeterminate", id="the-words-inside-plain-text"
+    ),
     pytest.param(
         500,
         {"error": {"message": "tool_choice param requires --jinja flag"}},
         True,
+        "indeterminate",
         id="unmeasured",
     ),
-    pytest.param(500, NO_JINJA, False, id="the-exact-words-to-a-request-with-no-tools"),
+    pytest.param(
+        500, NO_JINJA, False, "indeterminate", id="the-exact-words-to-a-request-with-no-tools"
+    ),
     # A body `json.loads` cannot get to the bottom of (RecursionError, not ValueError). The
     # backend's own refusal must still be what the caller gets, not a crash of the driver's.
-    pytest.param(500, "[" * 4000, True, id="a-body-nested-too-deep-to-parse"),
+    pytest.param(500, "[" * 4000, True, "indeterminate", id="a-body-nested-too-deep-to-parse"),
 ]
 
 
 @respx.mock
 @pytest.mark.anyio
-@pytest.mark.parametrize(("status", "body", "tools"), NOT_EVIDENCE)
+@pytest.mark.parametrize(("status", "body", "tools", "retry"), NOT_EVIDENCE)
 @pytest.mark.parametrize("stream", [False, True])
 async def test_an_unrelated_refusal_leaves_tools_on(
-    status: int, body: Any, tools: bool, stream: bool
+    status: int, body: Any, tools: bool, retry: str, stream: bool
 ) -> None:
     respx.post(CHAT).mock(return_value=_response(status, body))
     engine = _engine()
@@ -475,9 +496,9 @@ async def test_an_unrelated_refusal_leaves_tools_on(
     assert engine.supports_tool_calling is True
     assert engine.tools_refused_words() is None
     assert {"tools", "toolChoice", "parallelToolCalls"} <= set(engine.supported_settings)
-    # The status keeps its meaning: a 4xx is the caller's, anything else is the backend's.
-    expected = "terminal" if 400 <= status < 500 else "indeterminate"
-    assert disposition(refused.value) == expected
+    # The status keeps its meaning: a 4xx is the caller's, anything else is the backend's, and
+    # what nothing was computed for (llama-server still loading) is safe to send again.
+    assert disposition(refused.value) == retry
 
 
 @respx.mock

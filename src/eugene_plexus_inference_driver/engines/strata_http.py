@@ -5,11 +5,12 @@ llama.cpp semantics from Strata's compatibility /props or /slots endpoints.
 
 **Tools are assumed, as for every engine** (Troy, 2026-10-12,
 `docs/design/tools-assumed.md`). Until that day this engine refused tools and
-structured output because nobody had tried them. Measured on Strata v0.1.39
-(`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint), it calls tools correctly
--- one call, two at once, streamed, and the round trip with the tool's result --
-and answers `response_format` natively (`json_schema` and `json_object`). Three
-things it does not do. The first two are sent anyway and named, never refused
+structured output because nobody had tried them. Measured on Troy's running Strata,
+2026-10-12 (`qwen3.8-flash-next-iq2_xs`, its own OpenAI endpoint; its `/health`
+names no version, so none is claimed), it calls tools correctly -- one call, two at
+once, streamed, and the round trip with the tool's result -- and answers
+`response_format` natively (`json_schema` and `json_object`). Three things it does
+not do. The first two are sent anyway and named, never refused
 (`settings_not_honoured`, reported as `capabilities.settingsNotHonoured` and, per
 request, on `x-eugene-plexus-ignored-settings`):
 

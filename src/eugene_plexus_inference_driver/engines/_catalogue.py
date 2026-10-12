@@ -395,9 +395,14 @@ def from_lmstudio(body: Any, defaults: EngineDefaults) -> list[DriverModel]:
     """LM Studio's `/api/v0/models`: `type` is `llm`, `vlm` or `embeddings`.
 
     **Written from LM Studio's documentation, not measured** -- no LM Studio
-    was available on 2026-09-27. A `capabilities` array naming `tool_use`
-    is read when it names anything; an absent or empty one says nothing, and
-    tool calling is inherited.
+    was available on 2026-09-27. **A `capabilities` array is not read for tools**
+    (Troy, 2026-10-12, `docs/design/tools-assumed.md`): it names what a model is
+    trained for (`tool_use` is the one LM Studio marks), which is not the server
+    refusing tools, and a chat model takes tools unless the backend refuses them
+    in its own words. Until 2026-10-12 a list that named other things and not
+    `tool_use` (`["vision"]`) read as no tools, a refusal nobody had seen, made at
+    this driver's door. Only a refusal is evidence (`failures.tools_refusal`); tool
+    calling is inherited for every chat model.
     """
     data = body.get("data") if isinstance(body, dict) else None
     if not isinstance(data, list):
@@ -411,13 +416,7 @@ def from_lmstudio(body: Any, defaults: EngineDefaults) -> list[DriverModel]:
             models.append(_inherited(entry["id"], defaults, surfaces=["embeddings"]))
             continue
         model = _inherited(entry["id"], defaults)
-        caps = entry.get("capabilities")
         assert model.capabilities is not None
-        # A list naming what the model can do. One with nothing in it says nothing,
-        # which is not a no (`from_openrouter`): the model keeps what the engine
-        # assumes for every chat model.
-        if isinstance(caps, list) and caps:
-            model.capabilities.toolCalling = "tool_use" in caps
         if kind == "vlm":
             model.capabilities.imageInput = True
             model.inputModalities = ["text", "image"]
@@ -564,7 +563,9 @@ class Catalogue:
         return DriverCatalogue(
             source=self.source,
             total=len(self._models),
-            exposed=len(self.exposed()),
+            # Counted, not served: a view is built for every model `exposed` returns, and
+            # this is asked on every `/v1/info` (a count needs none of them).
+            exposed=sum(1 for m in self._models if exposed_by(include, exclude, m.id)),
             include=include,
             exclude=exclude,
             refreshedAt=self._refreshed_at,

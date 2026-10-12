@@ -148,7 +148,13 @@ def test_an_openrouter_account_lists_its_models_not_one(openrouter_config: Path)
         "tools",
         "toolChoice",
         "seed",
+        # Its listing names `tools` and leaves out `parallel_tool_calls`: a measured gap is
+        # named and not refused (Troy, 2026-10-12), so it is offered and listed below.
+        "parallelToolCalls",
     }
+    assert nemo["capabilities"]["settingsNotHonoured"] == [
+        {"setting": "parallelToolCalls", "values": [False]}
+    ]
     # Per model, not per driver: this one takes no tools.
     assert by_id["openai/gpt-oss-20b"]["capabilities"]["toolCalling"] is False
     image = by_id["google/gemini-3.1-flash-lite-image"]
@@ -670,3 +676,40 @@ def test_info_for_one_model_answers_that_entry_alone(openrouter_config: Path) ->
     assert [m["id"] for m in one["models"]] == ["mistralai/mistral-nemo"]
     assert none["models"] == []
     assert one["catalogue"]["exposed"] == 5
+
+
+@respx.mock
+def test_info_builds_a_served_view_only_for_the_models_it_answers(openrouter_config: Path) -> None:
+    """A model is SERVED as a copy with what the engine knows laid over the listing (tool
+    settings named per model, a learned refusal of tools), which costs a copy each: 377 of
+    OpenRouter's 659 on 2026-10-12. The gateway asks for one model on every request, and the
+    count in `catalogue.exposed` needs none, so neither may build the rest: a request's re-check
+    went from 1.5 ms to 7.9 ms measured on that list when they did."""
+    respx.get(f"{OPENROUTER}/v1/models/user").mock(
+        return_value=httpx.Response(200, json=OPENROUTER_LIST)
+    )
+    respx.get(f"{OPENROUTER}/v1/images/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    respx.get(f"{OPENROUTER}/v1/videos/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    with TestClient(create_app(settings=Settings(config_file=openrouter_config))) as client:
+        _wait_for_catalogue(client)
+        catalogue = client.app.state.adapter.catalogue  # type: ignore[attr-defined]
+        built: list[str] = []
+        real = catalogue._view
+        catalogue._view = lambda model: (built.append(model.id), real(model))[1]
+
+        one = client.get("/v1/info", params={"model": "mistralai/mistral-nemo"}).json()
+        assert built == ["mistralai/mistral-nemo"]
+        assert one["catalogue"]["exposed"] == 5
+
+        built.clear()
+        light = client.get("/v1/info", params={"models": "false"}).json()
+        assert built == [] and light["catalogue"]["exposed"] == 5
+
+        built.clear()
+        everything = client.get("/v1/info").json()
+        assert sorted(built) == sorted(m["id"] for m in everything["models"])
+        assert len(built) == 5, "once each, not once for the list and again for the count"

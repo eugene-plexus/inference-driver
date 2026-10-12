@@ -482,7 +482,6 @@ def test_a_model_that_cannot_see_is_refused_before_anything_is_sent(tmp_path: Pa
         ({"logitBias": {"5": 1}}, "logit_bias"),
         ({"verbosity": "low"}, "verbosity"),
         ({"webSearchOptions": {}}, "web_search_options"),
-        ({"parallelToolCalls": False}, "parallel_tool_calls"),
     ],
 )
 @respx.mock
@@ -508,8 +507,9 @@ def test_a_setting_gemini_cannot_honour_is_refused_not_dropped(
     assert response.status_code == 400 and named in response.text
     assert inherited.status_code == 200 and route.call_count == 1
     sent = json.dumps(_sent(route))
-    for word in ("minP", "min_p", "logprobs", "logitBias", "verbosity", "parallel"):
+    for word in ("minP", "min_p", "logprobs", "logitBias", "verbosity"):
         assert word not in sent
+    # (`parallel_tool_calls: false` is not in this list: it is named, not refused, below.)
 
 
 @respx.mock
@@ -766,6 +766,174 @@ def test_the_signature_cache_is_bounded_and_expires() -> None:
     short.remember("x", wire.RememberedCall("f", "s", False))
     assert short.recall("x") is None
     assert wire.SIGNATURE_ENTRIES == 4096 and wire.SIGNATURE_SECONDS == 86400
+
+
+# --------------------------------------------------------------------------- #
+# parallel_tool_calls: Gemini has no setting for it, so it is named, not refused
+# --------------------------------------------------------------------------- #
+
+HEADER = "x-eugene-plexus-ignored-settings"
+PARALLEL_GAP = [{"setting": "parallelToolCalls", "values": [False]}]
+CHAT_MODELS = [CHAT, "gemini-2.5-flash", "gemini-3.1-flash-lite", "gemma-3-27b-it"]
+NOT_CHAT = [
+    "gemini-3.1-flash-image",
+    "gemini-3.8-flash-tts",
+    "gemini-3.5-transcribe",
+    "gemini-embedding-001",
+    "veo-3.1-generate-preview",
+]
+
+
+def _answers_ok(stream: bool) -> respx.Route:
+    if stream:
+        return respx.post(STREAM).mock(return_value=_sse(_answer([{"text": "ok"}])))
+    return respx.post(GENERATE).mock(
+        return_value=httpx.Response(200, json=_answer([{"text": "ok"}]))
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@respx.mock
+def test_an_explicit_parallel_false_is_answered_and_named_not_refused(
+    tmp_path: Path, stream: bool
+) -> None:
+    """Gemini's native API has no field for it (`toolConfig.functionCallingConfig` takes a mode
+    and the functions a call may name, nothing about how many), so `false` cannot be sent. It
+    was a 400 ("has no setting to prevent it"), and Codex sends it on every request, so it
+    could use no Gemini model. Now the request is answered, none of it reaches Google, and
+    the gap is named on the response, before a stream's first frame."""
+    client = _start(tmp_path)
+    route = _answers_ok(stream)
+    with client:
+        response = client.post(
+            "/v1/generate/stream" if stream else "/v1/generate",
+            json=_chat(
+                tools=TOOLS,
+                toolChoice="auto",
+                parallelToolCalls=False,
+                callerSettings=["tools", "toolChoice", "parallelToolCalls"],
+            ),
+        )
+    assert response.status_code == 200, response.text
+    assert response.headers[HEADER] == "parallelToolCalls"
+    sent = _sent(route)
+    assert sent["tools"][0]["functionDeclarations"][0]["name"] == "get_weather"
+    assert sent["toolConfig"] == {"functionCallingConfig": {"mode": "AUTO"}}
+    assert "parallel" not in json.dumps(sent).lower()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"parallelToolCalls": True, "callerSettings": ["tools", "parallelToolCalls"]},
+        {"parallelToolCalls": False, "callerSettings": ["tools"]},
+        {"callerSettings": ["tools"]},
+    ],
+    ids=["true-is-what-it-does-anyway", "a-profiles-false-is-not-named", "nothing-sent"],
+)
+@respx.mock
+def test_only_a_false_the_caller_sent_is_named(
+    tmp_path: Path, stream: bool, fields: dict[str, Any]
+) -> None:
+    client = _start(tmp_path)
+    route = _answers_ok(stream)
+    with client:
+        response = client.post(
+            "/v1/generate/stream" if stream else "/v1/generate", json=_chat(tools=TOOLS, **fields)
+        )
+    assert response.status_code == 200, response.text
+    assert HEADER not in response.headers
+    assert "parallel" not in json.dumps(_sent(route)).lower()
+
+
+@respx.mock
+def test_info_names_the_gap_on_every_chat_model_and_on_nothing_else(tmp_path: Path) -> None:
+    client = _start(tmp_path)
+    with client:
+        models = {m["id"]: m["capabilities"] for m in client.get("/v1/info").json()["models"]}
+    for model in CHAT_MODELS:
+        assert models[model]["settingsNotHonoured"] == PARALLEL_GAP, model
+        # A measured gap is named, not refused, so it is offered too (the contract says so).
+        assert "parallelToolCalls" in models[model]["supportedSettings"], model
+    for model in NOT_CHAT:
+        assert "settingsNotHonoured" not in models[model], model
+
+
+@respx.mock
+def test_the_gap_is_laid_over_the_listing_and_never_saved_into_it(tmp_path: Path) -> None:
+    """The list is Google's own word, saved to disk and read again. What this engine knows is
+    laid over it when it is served, so a list saved by an older driver (without the field)
+    still carries the gap, and a list read from Google never does."""
+    first = _start(tmp_path)
+    with first:
+        pass
+    saved = json.loads((tmp_path / "gemini.catalogue.json").read_text("utf-8"))
+    assert saved["models"]
+    for model in saved["models"]:
+        assert "settingsNotHonoured" not in (model.get("capabilities") or {}), model["id"]
+    # Started again while Google refuses the list: the saved one is what is served.
+    respx.get(f"{BASE}/models").mock(return_value=_error(503, "UNAVAILABLE", "try again later"))
+    with TestClient(create_app(settings=Settings(config_file=tmp_path / "gemini.yaml"))) as again:
+        info = again.get("/v1/info").json()
+    assert info["catalogue"]["error"], "the refresh failed, so this is the saved list"
+    served = {m["id"]: m["capabilities"] for m in info["models"]}
+    assert served[CHAT]["settingsNotHonoured"] == PARALLEL_GAP
+    assert "settingsNotHonoured" not in served["gemini-embedding-001"]
+
+
+@respx.mock
+def test_it_is_said_once_in_the_log_however_many_requests(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="eugene_plexus_inference_driver.engines.gemini_api")
+    client = _start(tmp_path)
+    _answers_ok(False)
+    with client:
+        for _ in range(3):
+            response = client.post(
+                "/v1/generate",
+                json=_chat(
+                    tools=TOOLS,
+                    parallelToolCalls=False,
+                    callerSettings=["tools", "parallelToolCalls"],
+                ),
+            )
+            assert response.status_code == 200, response.text
+    said = [r.getMessage() for r in caplog.records if "parallel_tool_calls" in r.getMessage()]
+    assert len(said) == 1, said
+    assert (
+        CHAT in said[0] and "not sent" in said[0] and "x-eugene-plexus-ignored-settings" in said[0]
+    )
+
+
+@respx.mock
+def test_the_hook_names_nothing_for_a_model_that_does_not_chat_or_is_not_served(
+    tmp_path: Path,
+) -> None:
+    """The route refuses those before anything is sent, so there is nothing ignored, and the
+    hook must not raise on the way."""
+    from eugene_plexus_inference_driver._generated.models import GenerateRequest
+
+    client = _start(tmp_path)
+    with client:
+        engine = client.app.state.adapter  # type: ignore[attr-defined]
+
+        def ask(model: str | None) -> GenerateRequest:
+            return GenerateRequest.model_validate(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "parallelToolCalls": False,
+                    "callerSettings": ["parallelToolCalls"],
+                }
+            )
+
+        assert engine.ignored_settings(ask(CHAT)) == ["parallelToolCalls"]
+        assert engine.ignored_settings(ask("gemini-3.8-flash-tts")) == []
+        assert engine.ignored_settings(ask("gemini-embedding-001")) == []
+        assert engine.ignored_settings(ask("gemini-9")) == []
+        assert engine.ignored_settings(ask(None)) == []
 
 
 # --------------------------------------------------------------------------- #

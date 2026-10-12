@@ -60,7 +60,8 @@ def _ignored_settings_headers(engine: BackendEngine, body: GenerateRequest) -> d
     backend has been measured not to honour. Known before anything is sent, so a
     stream carries it on its first byte. A setting the backend is known to drop
     is sent anyway and named here, rather than refused: a refusal is for what
-    cannot be sent at all.
+    cannot be sent at all. **Only what the caller sent** (`callerSettings`) is
+    named, as the gateway names it on its own header, so the two never disagree.
     """
     named = getattr(engine, "ignored_settings", None)
     fields = list(dict.fromkeys(named(body))) if named is not None else []

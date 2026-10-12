@@ -36,6 +36,8 @@ import pytest
 import respx
 
 from eugene_plexus_inference_driver import _http
+from eugene_plexus_inference_driver._generated.models import Capabilities, DriverModel
+from eugene_plexus_inference_driver.engines import openai_compat_http
 from eugene_plexus_inference_driver.engines._subprocess import ToolsRefused
 from eugene_plexus_inference_driver.engines.openai_compat_http import (
     OpenAiCompatibleHttpEngine,
@@ -90,21 +92,45 @@ class Backend:
         self.answer: Callable[[httpx.Request], httpx.Response] | None = None
         self.requests: list[dict[str, Any]] = []
         self.headers: list[httpx.Headers] = []
+        #: Index-aligned with `requests`: when each arrived (`perf_counter`), and the time budget
+        #: it carried (httpx's `timeout` extension: connect, read, write and pool seconds).
+        self.stamps: list[float] = []
+        self.budgets: list[dict[str, float | None]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.requests.append(body)
         self.headers.append(request.headers)
+        self.stamps.append(time.perf_counter())
+        self.budgets.append(request.extensions["timeout"])
         if not body.get("tools"):
             return _ok(body)
         if self.answer is not None:
             return self.answer(request)
         return _ok(body) if self.fixed else httpx.Response(500, json=NO_JINJA)
 
+    @staticmethod
+    def _is_a_question(body: dict[str, Any]) -> bool:
+        return bool(body.get("tools")) and body.get("max_tokens") == 1
+
     @property
     def probes(self) -> list[dict[str, Any]]:
         """The questions asked again: a tool and one token of output."""
-        return [b for b in self.requests if b.get("tools") and b.get("max_tokens") == 1]
+        return [b for b in self.requests if self._is_a_question(b)]
+
+    @property
+    def probe_stamps(self) -> list[float]:
+        """When each question arrived."""
+        return [
+            at for b, at in zip(self.requests, self.stamps, strict=True) if self._is_a_question(b)
+        ]
+
+    @property
+    def probe_budgets(self) -> list[dict[str, float | None]]:
+        """The time each question was allowed."""
+        return [
+            t for b, t in zip(self.requests, self.budgets, strict=True) if self._is_a_question(b)
+        ]
 
 
 async def _until(condition: Callable[[], bool], what: str, patience: float = PATIENCE) -> None:
@@ -677,3 +703,148 @@ def test_an_account_through_the_app_serves_a_companion_only_request_after_a_flip
         served = client.post("/v1/generate", json=plain)
         assert served.status_code == 200, served.text
         assert "tool_choice" not in seen[-1]
+
+
+# --------------------------------------------------------------------------- #
+# the asking, held to what the report and the contract say of it
+# --------------------------------------------------------------------------- #
+#
+# Every test above shortens the interval on the engine (`_fast`), and the contract (specs
+# 6178255) says "every 10 minutes", a question "with one tool and one token", and a bounded wait.
+# These are the checks that a number, or a cap, written once is the one the loop uses.
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_the_spacing_is_the_constant_and_not_a_number_the_loop_remembers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The constant is patched and the engine is built the way the driver builds it, never
+    shortened by hand: the first question waits one whole interval after the refusal, and each
+    next one waits one whole interval after the last. (A hard-coded 600 anywhere between the
+    constant and the sleep never asks at all within this test's patience.)"""
+    interval = 0.3
+    monkeypatch.setattr(openai_compat_http, "TOOLS_REASK_SECONDS", interval)
+    backend = Backend()
+    respx.post(CHAT).mock(side_effect=backend)
+    engine = _engine()
+    assert engine.tools_reask_seconds == interval
+    try:
+        with pytest.raises(ToolsRefused):
+            await engine.generate(_ask())
+        refused = time.perf_counter()
+        await _until(lambda: len(backend.probe_stamps) >= 3, "three questions")
+        stamps = backend.probe_stamps[:3]
+    finally:
+        await engine.aclose()
+
+    # Not a tick early: `asyncio.sleep` runs on a clock that can be 15.6 ms coarse on Windows.
+    least = interval * 0.8
+    assert stamps[0] - refused >= least, "asked at once, not after an interval"
+    assert stamps[1] - stamps[0] >= least and stamps[2] - stamps[1] >= least
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_the_question_is_allowed_60_seconds_and_5_to_connect_whatever_a_request_is() -> None:
+    """Longer than a probe's, because it is a real one-token generation that may queue behind a
+    busy slot; shorter than a request's, because nobody is waiting on it. Carried on the ask
+    itself (the engine's one client carries the request budget): 42 s here, so an ask that
+    inherited it would show."""
+    backend = Backend()
+    respx.post(CHAT).mock(side_effect=backend)
+    engine = _fast(_engine(timeout_seconds=42.0))
+    try:
+        with pytest.raises(ToolsRefused):
+            await engine.generate(_ask())
+        await _until(lambda: bool(backend.probe_budgets), "a first question")
+        asked = backend.probe_budgets[0]
+        requested = backend.budgets[0]
+    finally:
+        await engine.aclose()
+
+    assert requested == {"connect": 10.0, "read": 42.0, "write": 42.0, "pool": 42.0}
+    assert asked == {"connect": 5.0, "read": 60.0, "write": 60.0, "pool": 60.0}
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_a_second_refusal_does_not_start_a_second_asker(tmp_path: Path) -> None:
+    """One task for the engine however many of its models are off. Two would ask about each
+    model twice a round, and `aclose()` would cancel only the last one made."""
+    respx.get(f"{BASE}/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "a"}, {"id": "b"}]})
+    )
+    backend = Backend()
+    respx.post(CHAT).mock(side_effect=backend)
+    engine = _fast(_account(tmp_path / "models.json"), seconds=0.05)
+    assert engine.catalogue is not None
+    try:
+        await engine.catalogue.refresh()
+        with pytest.raises(ToolsRefused):
+            await engine.generate(_ask(model="a"))
+        asker = engine._tools_watch
+        assert asker is not None and not asker.done()
+
+        with pytest.raises(ToolsRefused):
+            await engine.generate(_ask(model="b"))
+        assert engine._tools_watch is asker, "the asker already running is the one for both"
+        askers = [t for t in asyncio.all_tasks() if t.get_name() == "tools-again"]
+        assert askers == [asker]
+        assert engine.tools_refused_words("a") == WORDS and engine.tools_refused_words("b") == WORDS
+    finally:
+        await engine.aclose()
+    assert [t for t in asyncio.all_tasks() if t.get_name() == "tools-again"] == []
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_the_question_names_the_upstream_model_and_never_the_public_one() -> None:
+    """A driver may serve a model under one name and ask its backend for another
+    (`upstreamModelId`). The request does, and so must the question: asked by the public name
+    it would be answered by nothing (a 404 or a different model) and a backend that had been
+    fixed would never be heard from."""
+    backend = Backend()
+    respx.post(CHAT).mock(side_effect=backend)
+    engine = _fast(_engine(upstream_model_id="vendor/qwen-real"))
+    try:
+        with pytest.raises(ToolsRefused):
+            await engine.generate(_ask())
+        await _until(lambda: len(backend.probes) >= 2, "two questions")
+        assert backend.requests[0]["model"] == "vendor/qwen-real"
+        assert {b["model"] for b in backend.probes} == {"vendor/qwen-real"}
+        # And it is the same model that is believed when the backend answers.
+        backend.fixed = True
+        await _until(lambda: engine.supports_tool_calling, "tools back on")
+    finally:
+        await engine.aclose()
+    assert "qwen" not in {b["model"] for b in backend.requests}
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_an_accounts_question_names_the_entrys_upstream_id(tmp_path: Path) -> None:
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
+    backend = Backend()
+    respx.post(CHAT).mock(side_effect=backend)
+    engine = _fast(_account(tmp_path / "models.json"))
+    assert engine.catalogue is not None
+    engine.catalogue._set(
+        [
+            DriverModel(
+                id="public/alias",
+                upstreamId="vendor/real",
+                surfaces=["chat"],
+                capabilities=Capabilities(supportedSettings=["tools"], toolCalling=True),
+            )
+        ],
+        None,
+    )
+    try:
+        with pytest.raises(ToolsRefused):
+            await engine.generate(_ask(model="public/alias"))
+        await _until(lambda: len(backend.probes) >= 2, "two questions")
+        assert engine.tools_refused_words("public/alias") == WORDS
+    finally:
+        await engine.aclose()
+    assert {b["model"] for b in backend.requests} == {"vendor/real"}

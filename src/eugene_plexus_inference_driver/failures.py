@@ -89,6 +89,25 @@ def input_too_long(text: str) -> bool:
     return _INPUT_TOO_LONG.search(text) is not None
 
 
+#: llama-server's words while its model is not in memory yet, in the two forms
+#: this driver reports them: the whole JSON body of a chat or an embeddings
+#: request (`"message":"Loading model"`, whatever order the keys come in), and
+#: the bare message of a rerank (`...for a rerank: Loading model`, which the
+#: engine reduces to the backend's message). Measured 2026-10-12 on b10948,
+#: Qwen3-0.6B on the CPU, polling from the moment the port was bound: for the
+#: ~0.7 s the model took, **every path that needs it answered HTTP 503 with the
+#: same 75 bytes** -- chat (streamed or not, with tools or without), embeddings
+#: and rerank, and `/health`, `/props` and `/v1/models` too:
+#: `{"error":{"message":"Loading model","type":"unavailable_error","code":503}}`
+#: (`Server: llama.cpp`, `Connection: close`, no `Retry-After`). A larger model
+#: stays in that state for as long as it takes to load, and a replica that is
+#: loading is exactly the one a healthy sibling should be tried before
+#: (inference-driver#10). Only these words, as the whole message, and only with
+#: the 503 (`loading_refused`): a 502 or a 500 that merely mentions loading is
+#: not llama-server's refusal.
+_LOADING = re.compile(r'(?:"message"\s*:\s*"|: )Loading model(?:"|\.?\s*\Z)')
+
+
 #: The backend's whole message, for each backend that has been MEASURED
 #: refusing a request because it carries tools. Tools are assumed to work
 #: (`docs/design/tools-assumed.md`, Troy 2026-10-12), so this table is the
@@ -183,11 +202,29 @@ def capacity_refused(error: Exception) -> bool:
     return bool(_POOL_FULL.search(str(error)))
 
 
+def loading_refused(error: Exception) -> bool:
+    """True when the backend refused because its model is not in memory yet.
+
+    llama-server's 503 `Loading model` (`_LOADING`). Nothing was computed: the
+    engine refuses before it looks at the request, so another replica may take it
+    and the same request may be sent again, and "outcome unknown" would say
+    something untrue of it. **Keyed on the 503 and the words together**: the words
+    under another status are not llama-server's, and a 503 with other words is a
+    backend that may be broken, which stays `indeterminate`.
+    """
+    return getattr(error, "upstream_status", None) == 503 and bool(_LOADING.search(str(error)))
+
+
 def disposition(error: Exception) -> str:
     status = getattr(error, "upstream_status", None)
     if status == 429 or isinstance(error.__cause__, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "safe"
     if capacity_refused(error):
+        return "safe"
+    # A backend still loading its model refused before any work (a 503 that, as a
+    # 502 `indeterminate`, kept the gateway from trying the healthy replica
+    # beside it, and said "work may have occurred" of a request nothing touched).
+    if loading_refused(error):
         return "safe"
     if isinstance(status, int) and 400 <= status < 500 and status not in {408, 409, 425}:
         return "terminal"
