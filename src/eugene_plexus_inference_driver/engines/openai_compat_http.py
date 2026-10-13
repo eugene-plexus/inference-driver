@@ -1094,18 +1094,12 @@ class OpenAiCompatibleHttpEngine:
                 key="streamStallSeconds",
                 label="Stream stall timeout",
                 description=(
-                    "How long a streamed answer may go silent between "
-                    "tokens before this driver declares the backend "
-                    "stalled and ends the stream with an error. The "
-                    "clock starts at the first token — the quiet model "
-                    "load and prompt reading before it are covered by "
-                    "the backend timeout instead — so a slow machine is "
-                    "not punished for a slow start, only for going "
-                    "quiet mid-answer. Be generous for a model running "
-                    "on the processor, where tokens can be seconds "
-                    "apart. 0 turns the check off. Set per driver: a "
-                    "fast card and a CPU box can each hold their own "
-                    "number."
+                    "How long a streamed answer may go silent between tokens "
+                    "before the driver ends it with an error.\n\n"
+                    "The clock starts at the first token; model load and prompt "
+                    "reading before it fall under the backend timeout. Be generous for "
+                    "a model on the processor, where tokens can be seconds apart. 0 "
+                    "turns the check off. Each driver has its own value."
                 ),
                 category="network",
                 valueType=ConfigValueType.duration,
@@ -1119,15 +1113,14 @@ class OpenAiCompatibleHttpEngine:
                 key="slotPinning",
                 label="Keep each conversation in one slot",
                 description=(
-                    "llama.cpp only, and set by the agent from the model's "
-                    "settings profile together with the engine's "
-                    "`--no-cache-idle-slots`. Each conversation keeps one "
-                    "engine slot, least recently used out, and a request "
-                    "never names a slot that is busy: it waits here "
-                    "instead, because a request pinned to a busy slot "
-                    "wedged llama-server for up to 30 minutes. Worth about "
-                    "3 points of prompt reuse where the context per slot "
-                    "holds a whole conversation, and worse where it does not."
+                    "Keeps each conversation in one llama.cpp slot; the agent sets "
+                    "it from the model's settings profile.\n\n"
+                    "The agent also turns on the engine's `--no-cache-idle-slots`. "
+                    "Each conversation keeps one slot, least recently used out. A "
+                    "request never names a busy slot; it waits here instead, because "
+                    "naming one can stall llama-server. Worth a few points of prompt "
+                    "reuse where the context per slot holds a whole conversation, and "
+                    "worse where it does not."
                 ),
                 category="adapter",
                 valueType=ConfigValueType.boolean,

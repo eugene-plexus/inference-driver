@@ -200,11 +200,11 @@ class SystemOneHttpEngine:
                 key="decisionMaxConcurrent",
                 label="Backend concurrency",
                 description=(
-                    "How many decision requests the backend can hold at once, "
-                    "advertised to the gateway so it never over-admits a "
-                    "backend that cannot shed work. A supervised Kev runtime's "
-                    "companion sets 1 automatically — Kev's server handles one "
-                    "request at a time. Leave empty when unknown."
+                    "How many decision requests the backend can hold at once; the "
+                    "gateway admits no more.\n\n"
+                    "A supervised Kev runtime's companion sets 1 automatically, "
+                    "because Kev's server handles one request at a time. Leave it "
+                    "empty when unknown."
                 ),
                 category="adapter",
                 valueType=ConfigValueType.integer,

@@ -68,14 +68,11 @@ def _provider_field() -> ConfigField:
         key="provider",
         label="Provider",
         description=(
-            "Which LLM subscription or service this driver wraps. "
-            "The fields shown below adapt to your choice — Claude / "
-            "ChatGPT subscriptions ask for the local CLI binary; "
-            "OpenAI / xAI / OpenRouter / MiniMax / etc. ask for an "
-            "API key; the Custom option lets you point at any "
-            "OpenAI-compatible URL. Switching this changes which "
-            "other fields are relevant; restart required so the "
-            "engine reconnects."
+            "Which LLM subscription or service this driver wraps.\n\n"
+            "The fields below adapt to your choice: Claude and ChatGPT subscriptions "
+            "ask for the local CLI binary, API providers such as OpenAI, xAI or "
+            "OpenRouter ask for an API key, and Custom takes any OpenAI-compatible "
+            "URL."
         ),
         category="adapter",
         valueType=ConfigValueType.enum,
@@ -94,15 +91,12 @@ def _modelid_field() -> ConfigField:
         key="modelId",
         label="Model",
         description=(
-            "Which specific model to ask the backend for (e.g. "
-            '"gpt-4o", "claude-opus-4-7", "grok-2", '
-            '"llama3.1:70b"). The list below is discovered from the '
-            "selected provider. **Leave it empty to use every model** an "
-            "API provider or local server lists (OpenRouter, OpenAI, "
-            "Ollama, LM Studio, a custom URL): this driver then serves "
-            "them all, each published as <this driver's name>/<model>. "
-            "For the Claude and ChatGPT subscriptions, empty falls back "
-            "to the CLI's own default model."
+            "Which model to ask the backend for, such as `gpt-4o` or "
+            "`claude-opus-4-7`.\n\n"
+            "The list is discovered from the selected provider. **Leave it empty to "
+            "serve every model** an API provider or local server lists, each published "
+            "as `<this driver's name>/<model>`. For the Claude and ChatGPT "
+            "subscriptions, empty uses the CLI's own default model."
         ),
         category="adapter",
         valueType=ConfigValueType.string,
@@ -124,13 +118,11 @@ def _upstream_modelid_field() -> ConfigField:
         key="upstreamModelId",
         label="Upstream model name",
         description=(
-            "What this driver actually asks its backend for, when that "
-            "differs from the public Model above. Leave empty to send "
-            "the Model value verbatim (the normal case). Supervised MLX "
-            'runtimes set this to "default_model" automatically, because '
-            "mlx_lm.server has no flag to serve a chosen name. Never "
-            "used for routing, and never reported on responses — callers "
-            "always see the public Model."
+            "The model name this driver sends its backend, when that differs from "
+            "the public Model above.\n\n"
+            "Leave it empty to send the Model value as it is. Supervised MLX runtimes "
+            "set it to `default_model` automatically. It is never used for routing or "
+            "shown on responses; callers always see the public Model."
         ),
         category="adapter",
         valueType=ConfigValueType.string,
@@ -153,15 +145,15 @@ def _common_fields() -> list[ConfigField]:
             key="backendLocality",
             label="Endpoint trust",
             description=(
-                "For custom, Ollama and LM Studio endpoints, explicitly confirm whether "
-                "inference stays inside your trusted local installation. A local URL is "
-                "not proof: a proxy may forward to cloud. Unknown endpoints cannot serve "
-                "local-only keys. Supervised runtimes are classified local automatically; "
-                "cloud APIs and subscription CLIs always remain external. Ollama sends its "
-                "`:cloud` models to ollama.com, and this setting covers every model the "
-                "backend lists: before confirming an Ollama local, start it with "
-                "OLLAMA_NO_CLOUD=1 or pull no cloud models. Restart applies this setting to "
-                "the active engine."
+                "Confirms whether inference on a custom, Ollama or LM Studio "
+                "endpoint stays inside your trusted local installation.\n\n"
+                "A local URL is not proof, since a proxy may forward to the cloud, and "
+                "an unknown endpoint cannot serve local-only keys. Supervised runtimes "
+                "count as local automatically; cloud APIs and subscription CLIs always "
+                "count as external. Ollama sends its `:cloud` models to ollama.com, "
+                "and this setting covers every model it lists: before confirming an "
+                "Ollama local, start it with `OLLAMA_NO_CLOUD=1` or pull no cloud "
+                "models."
             ),
             category="adapter",
             valueType=ConfigValueType.enum,
@@ -174,17 +166,13 @@ def _common_fields() -> list[ConfigField]:
             key="thinkingMode",
             label="Thinking mode",
             description=(
-                "Controls how much internal reasoning this driver's model "
-                "produces before answering. `auto` defers to the model's "
-                "natural behavior. `off` instructs the model NOT to emit "
-                "`<think>...</think>` blocks or scratchpad reasoning — "
-                "useful for reasoning-tag models (DeepSeek R1, Qwen QwQ, "
-                "Kimi, etc.) where the internal thinking otherwise leaks "
-                "into the response. `low` / `medium` / `high` ask for "
-                "progressively more deliberation. v0.2.x applies this as "
-                "a system-prompt directive; native API budget control "
-                "(Anthropic extended thinking, OpenAI `reasoning_effort`) "
-                "lands in v0.3+."
+                "How much internal reasoning this driver's model does before "
+                "answering.\n\n"
+                "`auto` leaves it to the model. `off` tells the model not to write "
+                "`<think>` blocks or scratchpad reasoning, which stops reasoning-tag "
+                "models such as DeepSeek R1 or Qwen QwQ from leaking their thinking "
+                "into the answer. `low`, `medium` and `high` ask for progressively "
+                "more deliberation. It is applied as a system-prompt instruction."
             ),
             category="adapter",
             valueType=ConfigValueType.enum,
@@ -216,14 +204,12 @@ def _common_fields() -> list[ConfigField]:
             key="requestTimeoutSeconds",
             label="Backend timeout",
             description=(
-                "How long this driver waits on a single call to its "
-                "backend. A backstop: the gateway holds the deadline "
-                "that normally decides, and this sits one minute above "
-                "it so the gateway's is the one that fires. Raise both "
-                "if a model on the processor needs longer. When it does "
-                "fire, the request is not retried on another backend — "
-                "the next one would take the same time on the same "
-                "prompt — so it comes back as one 504 saying so."
+                "How long this driver waits on a single call to its backend.\n\n"
+                "This is a backstop: the gateway's deadline normally decides, and this "
+                "sits one minute above it. Raise both if a model on the processor "
+                "needs longer. When this one fires, the request is not retried on "
+                "another backend, because the next would take as long; it comes back "
+                "as one 504."
             ),
             category="network",
             valueType=ConfigValueType.duration,

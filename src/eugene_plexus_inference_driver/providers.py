@@ -91,14 +91,12 @@ def _custom_backend_fields() -> list[ConfigField]:
             key="runtimeName",
             label="Supervised runtime",
             description=(
-                "The engine runtime this driver fronts, by the name it has on "
-                "the agent (`GET /v1/runtimes`). The driver resolves the name "
-                "to a URL from the agent when it starts and whenever it is "
-                "restarted, so it follows the runtime through whatever the "
-                "agent does with ports — the agent assigns those, and a "
-                "hand-typed URL is wrong the moment the runtime moves. Wins "
-                "over `baseUrl` when both are set. Leave empty for a backend "
-                "that is not a runtime this install supervises."
+                "The engine runtime this driver fronts, by the name it has on the "
+                "agent.\n\n"
+                "The driver looks the name up on the agent whenever it starts, so it "
+                "follows the runtime if the agent moves its port; a typed URL would "
+                "not. It wins over `baseUrl` when both are set. Leave it empty for a "
+                "backend this install does not supervise."
             ),
             category="adapter",
             valueType=ConfigValueType.runtime_name,
@@ -109,14 +107,13 @@ def _custom_backend_fields() -> list[ConfigField]:
             key="baseUrl",
             label="Base URL",
             description=(
-                "HTTP base of an endpoint that is *not* a runtime this "
-                "install supervises — a remote LM Studio, an engine "
-                "somebody else operates, a self-hosted server (e.g. "
-                "`https://my-vllm.example.com`). The driver appends the "
-                "protocol's own path automatically: `/v1/chat/completions` "
-                "for an OpenAI-compatible server, `/v1/systemone` for a "
-                "System One decision server. Ignored when `runtimeName` is "
-                "set. One of the two is required."
+                "The address of an endpoint this install does not supervise, such "
+                "as a remote LM Studio.\n\n"
+                "For example `https://my-vllm.example.com`, or any self-hosted server. "
+                "The driver adds the protocol's own path: `/v1/chat/completions` for "
+                "an OpenAI-compatible server, `/v1/systemone` for a System One "
+                "decision server. Ignored when `runtimeName` is set; one of the two is "
+                "required."
             ),
             category="adapter",
             valueType=ConfigValueType.url,
