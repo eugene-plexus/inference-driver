@@ -15,8 +15,9 @@ or not, with tools or without), embeddings and rerank -- and `/health`, `/props`
 `Connection: close`, no `Retry-After`. **The key order is `message`, `type`, `code`**: this
 repository's earlier fixtures had `code` first, which llama-server does not send.
 
-Keyed on the 503 and the words together, as the pool-full case is keyed on its words: another
-status with these words, or a 503 with other words, is not this.
+Keyed on the 503 and on the backend's whole message being these words, as a refusal of tools is
+keyed on its message (`failures.tools_refusal`): another status with these words, a 503 with
+other words, and a 503 whose body only mentions them, are not this.
 """
 
 from __future__ import annotations
@@ -254,7 +255,8 @@ async def test_a_loading_engine_is_safe_whichever_path_met_it(operation: str, bo
 
 #: Bodies that merely mention the words: echoed inside another field, behind a proxy's own
 #: words, and as the message of a nested object. Each was `safe` while the match searched the
-#: text of the whole failure.
+#: text of the whole failure. For chat (streamed or not) and embeddings, whose failure text
+#: carries the backend's body whole (to 500 characters).
 MENTIONS = {
     "echoed": (
         b'{"echo":{"messages":[{"role":"user","message":"Loading model"}]}}',
@@ -267,15 +269,46 @@ MENTIONS = {
     ),
 }
 
+#: The same for a rerank, with bodies of its own. **The rerank path does not carry the body
+#: whole**: it reduces it to what the backend said (`upstream_words`: the error's `message`, a
+#: `detail`, a bare `message` or `error`, or, for a body that is not JSON, its first characters).
+#: So the JSON `echoed` and `nested` bodies above never reach a rerank's failure text (it reads
+#: `HTTP 503` and `upstream failed`), the old search of the text could not take them for
+#: loading either, and the two rows made of them passed before `failures.loading_refused` read the
+#: backend's whole message and after it, which is not a check. What does reach the text, and
+#: was `safe` under the old search of it, is a message with other words before the loading
+#: words, whether a proxy's own text or an error's `message`, and a body that is not JSON with
+#: a loading engine's JSON inside it.
+RERANK_MENTIONS = {
+    "proxy": (b"Service Unavailable: Loading model", "text/plain"),
+    "prefixed-message": (
+        b'{"error":{"message":"upstream failed: Loading model"}}',
+        "application/json",
+    ),
+    "echoed-in-text": (b'bad gateway {"error":{"message":"Loading model"}}', "text/plain"),
+}
+
+
+def _mentions() -> list[Any]:
+    return [
+        pytest.param(operation, mention, id=f"{operation}-{mention}")
+        for operation, bodies in (
+            ("generate", MENTIONS),
+            ("stream", MENTIONS),
+            ("embed", MENTIONS),
+            ("rerank", RERANK_MENTIONS),
+        )
+        for mention in bodies
+    ]
+
 
 @respx.mock
 @pytest.mark.anyio
-@pytest.mark.parametrize("mention", list(MENTIONS))
-@pytest.mark.parametrize("operation", ["generate", "stream", "embed", "rerank"])
+@pytest.mark.parametrize(("operation", "mention"), _mentions())
 async def test_a_503_that_only_mentions_loading_is_outcome_unknown_whichever_path_met_it(
     operation: str, mention: str
 ) -> None:
-    body, content_type = MENTIONS[mention]
+    body, content_type = (RERANK_MENTIONS if operation == "rerank" else MENTIONS)[mention]
     refusal = httpx.Response(503, content=body, headers={"Content-Type": content_type})
     respx.post(f"{BASE}/v1/chat/completions").mock(return_value=refusal)
     respx.post(f"{BASE}/v1/embeddings").mock(return_value=refusal)

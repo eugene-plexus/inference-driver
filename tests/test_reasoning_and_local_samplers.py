@@ -500,6 +500,9 @@ async def test_a_fixed_sampler_model_refuses_the_penalties(field: str) -> None:
     assert field not in engine.supported_settings
 
 
+# `parallelToolCalls` is not here, though it was until round five: it says nothing on a request
+# that carries no tools, so the CLIs drop it from one (Codex sends it on every request) and refuse
+# it only with tools: `test_tools_off_rule.py`.
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -507,7 +510,6 @@ async def test_a_fixed_sampler_model_refuses_the_penalties(field: str) -> None:
         ("minP", 0.1),
         ("frequencyPenalty", 0.5),
         ("presencePenalty", 0.5),
-        ("parallelToolCalls", False),
     ],
 )
 def test_the_cli_engines_refuse_every_new_explicit_setting(field: str, value: object) -> None:

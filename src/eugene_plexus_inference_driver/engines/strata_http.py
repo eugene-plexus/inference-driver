@@ -38,6 +38,7 @@ lists in `callerSettings`: a direct caller that lists none is named nothing):
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -49,8 +50,11 @@ from .._generated.models import (
     SettingNotHonoured,
     Tool,
 )
+from ._subprocess import CliError
 from .base import RerankUnsupported
 from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target, unread_tool_settings
+
+log = logging.getLogger(__name__)
 
 #: What Strata's endpoint can carry, of the request's settings. `tools`,
 #: `toolChoice`, `parallelToolCalls` and `responseFormat` are here since
@@ -71,8 +75,13 @@ from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target, unread_tool
 #: answered the same sentence both times, and `seed` 4243 another. One run of three
 #: requests, so it shows that this Strata honoured a seed, not that it always will:
 #: its documentation says a sampled result is not reproducible run to run on its
-#: default adaptive expert tier. Its source forwards a positive seed only (`seed > 0`;
-#: read, not measured), so `seed` 0 is sent and Strata takes it as no seed.
+#: default adaptive expert tier. **Its source forwards a positive seed only** (`seed > 0`
+#: in `sampling_keys`, and its config check says "expected a positive integer"; read, not
+#: measured), so a seed of 0 or below is ignored, and a caller who asked for one is not told.
+#: An explicit one is refused here, naming the value; an inherited one is left out and said
+#: once (`StrataHttpEngine._payload_for`). **Negative penalties are sent**: Strata's per-request
+#: path reads a penalty that is not zero (`!= 0.0`), the "expected a number >= 0" in its source
+#: is the check of a default in its config file, and any refusal it gives is relayed in its words.
 _SUPPORTED = frozenset(
     {
         "maxTokens",
@@ -105,6 +114,46 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
         from .openai_compat_http import _ALL_ENGINE_SETTINGS
 
         return super()._unsupported_settings(target) | (_ALL_ENGINE_SETTINGS - _SUPPORTED)
+
+    def _payload_for(
+        self, request: GenerateRequest, target: _Target, forced: Tool | None = None
+    ) -> dict[str, Any]:
+        """The request as Strata takes it, which for a seed is only a positive whole number.
+
+        Strata forwards a seed when it is `> 0` (`sampling_keys`) and otherwise answers without
+        one, saying nothing: a caller who asked for a seed asked for a reproducible answer and
+        would be handed a different one each time. So an explicit seed of 0 or below is refused,
+        before anything is sent, in words that name the value. One that is not the caller's own
+        (a profile's or the install's default) is left out and said once, not refused (A2): the
+        caller never asked for it, and Strata would have ignored it all the same.
+        """
+        seed = request.seed
+        if seed is not None and seed <= 0:
+            if "seed" in (request.callerSettings or []):
+                raise CliError(
+                    f"seed: {seed} cannot be used with Strata. Strata uses a seed only when it is "
+                    f"a positive whole number, so it would ignore {seed} and answer without one, "
+                    "which is not the reproducible answer a seed asks for. Send a positive whole "
+                    "number, or remove the seed.",
+                    upstream_status=400,
+                )
+            request = request.model_copy(update={"seed": None})
+            self._warn_seed_left_out(seed, target)
+        return super()._payload_for(request, target, forced)
+
+    def _warn_seed_left_out(self, seed: int, target: _Target) -> None:
+        """Said once per model per engine, as every setting that is left out is."""
+        if (target.id, "seed") in self._warned_dropped:
+            return
+        self._warned_dropped.add((target.id, "seed"))
+        log.warning(
+            "model %r: a seed of %d is left out of the request, because Strata uses a seed only "
+            "when it is a positive whole number, so it would ignore it and answer without one. "
+            "It came from a default and not from the caller's own request, so it is not "
+            "refused. This is said once for the life of this engine.",
+            target.id,
+            seed,
+        )
 
     def settings_not_honoured(self) -> list[SettingNotHonoured]:
         """What Strata is sent and does not honour (measured 2026-10-12):

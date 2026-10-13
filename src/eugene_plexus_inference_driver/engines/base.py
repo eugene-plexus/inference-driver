@@ -22,7 +22,7 @@ classmethods (`field_specs`, `from_config`) let `config.py` and
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Collection
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -346,11 +346,27 @@ class BackendEngine(Protocol):
 
 log = logging.getLogger(__name__)
 
+#: What rides with `tools` and says nothing without them: a request that carries no tools has
+#: nothing to choose among and nothing to run in parallel. **One rule for a chat model whose
+#: tools are off, whatever turned them off** (Troy, 2026-10-12, `docs/design/tools-assumed.md`):
+#: it lists these two in its `supportedSettings`, so the gateway admits a request that carries
+#: only them (Codex sends both on every request, tools or not); a request that carries no tools
+#: has them dropped, said once per field with the cause; a request that carries tools is refused.
+TOOL_COMPANION_SETTINGS = ("toolChoice", "parallelToolCalls")
 
-def refuse_unsupported_settings(request: GenerateRequest, *, unsupported: set[str]) -> None:
-    """An explicit caller constraint cannot be treated as an adapter default."""
+
+def refuse_unsupported_settings(
+    request: GenerateRequest, *, unsupported: Collection[str], because: str | None = None
+) -> None:
+    """An explicit caller constraint cannot be treated as an adapter default.
+
+    `because` is the observed cause, in words, where the refusal has one beyond "this engine
+    cannot" (a request that carries tools to a model whose tools are off): it is said in the
+    refusal, so the person reads why and not only what.
+    """
     from ._subprocess import CliError
 
+    why = f" because {because}" if because else ""
     names = {
         "maxTokens": "max_tokens/max_completion_tokens",
         "topP": "top_p",
@@ -368,8 +384,8 @@ def refuse_unsupported_settings(request: GenerateRequest, *, unsupported: set[st
     for field in request.callerSettings or []:
         if field in unsupported:
             raise CliError(
-                f"{names.get(field, field)}: this engine cannot honor this explicit setting; "
-                "remove it or select a backend that supports it.",
+                f"{names.get(field, field)}: this engine cannot honor this explicit setting"
+                f"{why}; remove it or select a backend that supports it.",
                 upstream_status=400,
             )
 
@@ -395,36 +411,57 @@ def warn_dropped_sampling(
     A2: callerSettings distinguishes explicit constraints from inherited defaults.
     CLI engines now refuse explicit controls they cannot honor before spawning.
     Implicit profile/default settings retain the legacy behavior described above.
+
+    **Tools are off for these engines, and the cause is Eugene's own limit** (Troy, 2026-10-12,
+    `docs/design/tools-assumed.md`, round five): there is no way to hand the harness a tool
+    definition, so a request that carries tools is refused (here, for an explicit one, and at the
+    route's door for any), said as Eugene's limit and never as the model's. **What rides with tools
+    says nothing without them** (`TOOL_COMPANION_SETTINGS`): Codex sends `tool_choice` and
+    `parallel_tool_calls` on every request, tools or not, so a request that carries no tools
+    (`None` or `[]`) is not refused for them. They are dropped, said once per field, and the
+    engine lists them in its `supported_settings` so the gateway admits such a request. The same
+    rule as for every other chat model whose tools are off.
     """
-    refuse_unsupported_settings(
-        request,
-        unsupported={
-            "maxTokens",
-            "temperature",
-            "topP",
-            "seed",
-            "stop",
-            "tools",
-            "toolChoice",
-            "responseFormat",
-            # 2026-09-23. The harness owns its sampler and its own tool
-            # loop, so none of these has anywhere to go -- and each one
-            # changes the answer, so an explicit one is refused, never
-            # quietly dropped.
-            "topK",
-            "minP",
-            "frequencyPenalty",
-            "presencePenalty",
-            "parallelToolCalls",
-            # P2c (2026-09-28): the same answer, for the same reason.
-            "logprobs",
-            "logitBias",
-            "reasoningEffort",
-            "verbosity",
-            "prediction",
-            "webSearchOptions",
-        },
-    )
+    carries_tools = bool(request.tools)
+    unsupported = {
+        "maxTokens",
+        "temperature",
+        "topP",
+        "seed",
+        "stop",
+        "tools",
+        "toolChoice",
+        "responseFormat",
+        # 2026-09-23. The harness owns its sampler and its own tool
+        # loop, so none of these has anywhere to go -- and each one
+        # changes the answer, so an explicit one is refused, never
+        # quietly dropped.
+        "topK",
+        "minP",
+        "frequencyPenalty",
+        "presencePenalty",
+        "parallelToolCalls",
+        # P2c (2026-09-28): the same answer, for the same reason.
+        "logprobs",
+        "logitBias",
+        "reasoningEffort",
+        "verbosity",
+        "prediction",
+        "webSearchOptions",
+    }
+    if carries_tools:
+        # Still refused, and the person is told why before anything is spawned.
+        refuse_unsupported_settings(
+            request,
+            unsupported={"tools", *TOOL_COMPANION_SETTINGS},
+            because=(
+                f"Eugene has no way to carry tools to {engine} (the harness on the other side "
+                "of the pipe runs its own tools)"
+            ),
+        )
+    else:
+        unsupported -= set(TOOL_COMPANION_SETTINGS)
+    refuse_unsupported_settings(request, unsupported=unsupported)
     for field, value in (("topP", request.topP), ("seed", request.seed)):
         if value is None or field in warned:
             continue
@@ -437,4 +474,19 @@ def warn_dropped_sampling(
             engine,
             field,
             model_id,
+        )
+    if carries_tools:
+        return
+    for field in TOOL_COMPANION_SETTINGS:
+        if getattr(request, field) is None or field in warned:
+            continue
+        warned.add(field)
+        log.warning(
+            "%s cannot carry tools to %r -- Eugene has no way to carry tools to the harness on "
+            "the other side of the pipe, which runs its own -- so `%s` was dropped from a request "
+            "that carries no tools, where it says nothing, and the request was answered. Said "
+            "once per parameter for the life of this engine.",
+            engine,
+            model_id,
+            field,
         )

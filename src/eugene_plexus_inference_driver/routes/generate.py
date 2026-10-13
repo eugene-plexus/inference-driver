@@ -57,12 +57,14 @@ def _ignored_settings_headers(engine: BackendEngine, body: GenerateRequest) -> d
 
     The engine says (`ignored_settings`, an optional hook like
     `probe_embeddings`): it alone knows which values of which settings its
-    backend has been measured not to honour. Known before anything is sent, so a
-    stream carries it on its first byte. A setting the backend is known to drop
-    is sent anyway and named here, rather than refused: a refusal is for what
-    cannot be sent at all. (One an OpenRouter model's listing leaves out is not
-    delivered while Eugene asks for `require_parameters`, and is named all the
-    same.) **Only what the caller sent** (`callerSettings`) is named, as the
+    backend is known not to honour (measured for Strata; read from Ollama's source
+    and from OpenRouter's listing, neither of which is a measurement). Known before
+    anything is sent, so a stream carries it on its first byte. A setting the backend
+    is known to drop is sent anyway and named here, rather than refused: a refusal is
+    for what cannot be sent at all. (One an OpenRouter model's listing leaves out is
+    not delivered on a request that asks OpenRouter to hold to the listing
+    (`require_parameters`, which Eugene asks for when the caller sent a setting), and
+    is named all the same.) **Only what the caller sent** (`callerSettings`) is named, as the
     gateway names it on its own header, so the two never disagree. **A direct
     caller gets the header only for the settings it lists in `callerSettings`**:
     a request that lists none, as one made without the gateway (which always
@@ -625,10 +627,23 @@ def _refuse_unsupported_tools(
             f"was refused rather than answered without them. {again}"
         )
     else:
-        why = (
-            f"This driver's backend ({kind_label}) cannot carry tool definitions, "
-            "so the request was refused rather than answered without them. "
-        )
+        # The engine's own observed cause where it has one: OpenRouter's listing for the model
+        # names no tools, Ollama's capabilities list none, OpenAI's endpoint serves it without
+        # them. That is the provider's word and not a limit of this driver, which is what
+        # "cannot carry tool definitions" says (and is right to, for an engine that has no way
+        # to carry them: the subscription CLIs).
+        cause_of = getattr(engine, "tools_off_because", None)
+        cause = cause_of(body.model) if cause_of is not None else None
+        if cause is not None:
+            why = (
+                f"Tools are off for this model: {cause}. This request carries tools, so it "
+                "was refused rather than answered without them. "
+            )
+        else:
+            why = (
+                f"This driver's backend ({kind_label}) cannot carry tool definitions, "
+                "so the request was refused rather than answered without them. "
+            )
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=Problem(

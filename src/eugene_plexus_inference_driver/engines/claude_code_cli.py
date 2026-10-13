@@ -42,7 +42,7 @@ import os
 import tempfile
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 from .._generated.models import (
     BackendKind,
@@ -61,7 +61,12 @@ from .._generated.models import (
 from ._prompt import messages_to_prompt, text_content
 from ._subprocess import CliError, run_cli, stream_cli_lines
 from ._thinking import apply_thinking_mode, strip_thinking_blocks
-from .base import DEFAULT_REQUEST_TIMEOUT_SECONDS, Chunk, warn_dropped_sampling
+from .base import (
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    TOOL_COMPANION_SETTINGS,
+    Chunk,
+    warn_dropped_sampling,
+)
 
 log = logging.getLogger(__name__)
 
@@ -202,6 +207,13 @@ class ClaudeCodeCliEngine:
     Declared rather than inherited, because the default being
     False is a safety net and not a statement. A request carrying
     `tools` is refused with a reason; see `routes/generate.py`."""
+    #: The settings this engine can carry, which is only what rides with `tools` and says
+    #: nothing without them. Eugene has no way to hand the harness a tool, so `toolCalling`
+    #: is false (Eugene's limit, never the model's), and a request that carries no tools is
+    #: not refused for `tool_choice` or `parallel_tool_calls`, which Codex sends on every
+    #: request: they are dropped, said once (`warn_dropped_sampling`). Listed, so the gateway
+    #: admits such a request; the sampler settings are not (the harness owns its sampler).
+    supported_settings: ClassVar[list[str]] = list(TOOL_COMPANION_SETTINGS)
 
     def __init__(
         self,

@@ -226,9 +226,10 @@ def loading_refused(error: Exception) -> bool:
     llama-server's 503 `Loading model` (`_LOADING`). Nothing was computed: the
     engine refuses before it looks at the request, so another replica may take it
     and the same request may be sent again, and "outcome unknown" would say
-    something untrue of it. **Keyed on the 503 and the words together**: the words
-    under another status are not llama-server's, and a 503 with other words is a
-    backend that may be broken, which stays `indeterminate`.
+    something untrue of it. **Keyed on the 503 and on the backend's whole message being
+    these words**: the words under another status are not llama-server's, a 503 with other
+    words is a backend that may be broken, and a 503 whose body only mentions them is not
+    its loading engine either. Each stays `indeterminate`.
 
     **The words are the backend's whole message, not something its body mentions.** The
     body is read as `tools_refusal` reads one (`_backend_message`): the error object's

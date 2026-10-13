@@ -243,10 +243,19 @@ def test_info_offers_and_lists_the_gap_of_each_model_and_the_saved_list_has_none
     # Nothing to name: it lists both, it lists no tools, it says nothing, it does not chat.
     for model in ("vendor/full", "vendor/no-tools", "vendor/silent", "vendor/embed"):
         assert "settingsNotHonoured" not in caps[model], model
-    # And the other models' settings are what their listings said.
-    assert "toolChoice" not in caps["vendor/no-tools"]["supportedSettings"]
-    assert "parallelToolCalls" not in caps["vendor/no-tools"]["supportedSettings"]
+    # A model whose listing names no tools is the provider's word on tools: `toolCalling` false
+    # and no `tools`. What rides with tools is offered all the same (round five): a request that
+    # carries none has it dropped, and the gateway admits by this list (`test_tools_off_rule.py`).
     assert caps["vendor/no-tools"]["toolCalling"] is False
+    assert "tools" not in caps["vendor/no-tools"]["supportedSettings"]
+    assert {"toolChoice", "parallelToolCalls"} <= set(caps["vendor/no-tools"]["supportedSettings"])
+    # And every other model's settings are what its listing said.
+    assert set(caps["vendor/no-parallel"]["supportedSettings"]) == {
+        "maxTokens",
+        "tools",
+        "toolChoice",
+        "parallelToolCalls",
+    }
 
     # The provider's own word is what is saved. What this engine adds is laid over it
     # when it is served, and a list read again from OpenRouter must not carry it.
@@ -256,6 +265,7 @@ def test_info_offers_and_lists_the_gap_of_each_model_and_the_saved_list_has_none
     stored = {m["id"]: m["capabilities"]["supportedSettings"] for m in saved["models"]}
     assert "parallelToolCalls" not in stored["vendor/no-parallel"]
     assert "toolChoice" not in stored["vendor/no-choice"]
+    assert stored["vendor/no-tools"] == ["maxTokens"], "what is offered beside it is not saved"
 
 
 @respx.mock
@@ -275,6 +285,13 @@ def test_serving_a_model_never_changes_the_entry_the_driver_stores(tmp_path: Pat
         assert entry.capabilities.settingsNotHonoured is None, model_id
     neither = stored["vendor/neither"].capabilities
     assert neither is not None and set(neither.supportedSettings or []) == {"maxTokens", "tools"}
+    no_tools = stored["vendor/no-tools"].capabilities
+    assert no_tools is not None and set(no_tools.supportedSettings or []) == {"maxTokens"}
+    assert set(served["vendor/no-tools"]["supportedSettings"]) == {
+        "maxTokens",
+        "toolChoice",
+        "parallelToolCalls",
+    }, "served with what rides with tools offered, on a copy"
 
 
 # --------------------------------------------------------------------------- #
@@ -610,7 +627,7 @@ async def test_what_is_withheld_follows_require_parameters_whatever_the_entry_sa
         target = _Target(
             id="vendor/neither", upstream="vendor/neither", temperature_fixed=False, entry=carrying
         )
-        withheld = engine._withheld_settings(target)
+        withheld = engine._withheld_settings(target, _ask("vendor/neither", **EXPLICIT))
         assert withheld == (
             frozenset({"toolChoice", "parallelToolCalls"}) if require_parameters else frozenset()
         )
@@ -638,6 +655,99 @@ async def test_the_log_says_why_in_one_set_of_words_and_claims_nothing_about_pro
         assert NOT_DELIVERED in message
         assert "measured" not in message.lower() and "takes none" not in message
         assert "x-eugene-plexus-ignored-settings" in message
+
+
+# --------------------------------------------------------------------------- #
+# only when the request itself asks OpenRouter to hold to the listing (round five)
+# --------------------------------------------------------------------------- #
+#
+# The premise of withholding is OpenRouter's rule for `require_parameters`: a parameter the
+# listing leaves out would leave the request no provider. Eugene puts `require_parameters` in the
+# payload only for a request that carries a setting the caller sent (`callerSettings`), so a
+# request that lists none asks OpenRouter for nothing strict, and has no reason to lose a setting:
+# it is sent, an unknown counting as yes, and nothing is named or logged as not delivered.
+
+
+@respx.mock
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("caller_settings", "asks"),
+    [
+        (None, False),
+        ([], False),
+        (["maxTokens"], True),
+        (["tools", "toolChoice", "parallelToolCalls"], True),
+    ],
+    ids=["absent", "empty", "another-setting", "the-tool-settings"],
+)
+async def test_a_setting_is_withheld_exactly_when_the_payload_asks_for_require_parameters(
+    caller_settings: list[str] | None, asks: bool
+) -> None:
+    engine = await _account(require_parameters=True)
+    try:
+        fields: dict[str, Any] = {"toolChoice": "required", "parallelToolCalls": False}
+        if caller_settings is not None:
+            fields["callerSettings"] = caller_settings
+        request = _ask("vendor/neither", **fields)
+        payload = engine._payload_for(request, engine.resolve_model("vendor/neither"))
+        assert ("provider" in payload) is asks
+        if asks:
+            assert payload["provider"] == {"require_parameters": True}
+            assert not {"tool_choice", "parallel_tool_calls"} & payload.keys()
+        else:
+            assert payload["tool_choice"] == "required"
+            assert payload["parallel_tool_calls"] is False
+    finally:
+        await engine.aclose()
+
+
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("fields", [{}, {"callerSettings": []}], ids=["absent", "empty"])
+def test_with_no_caller_settings_the_listed_out_settings_are_sent_and_nothing_is_named(
+    tmp_path: Path, stream: bool, fields: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The through-the-app shape of a caller that is not the gateway (which always lists what it
+    sends): `vendor/neither`'s listing leaves out both, and a request that names neither in
+    `callerSettings` is sent both as asked."""
+    caplog.set_level(logging.WARNING, logger=ENGINE_LOG)
+    with _driver(tmp_path) as (client, chat):
+        response = _post(
+            client,
+            stream,
+            _body("vendor/neither", toolChoice="required", parallelToolCalls=False, **fields),
+        )
+    assert response.status_code == 200, response.text
+    assert HEADER not in response.headers, "nothing the caller listed, so nothing is named"
+    sent = _sent(chat)
+    assert sent["tool_choice"] == "required" and sent["parallel_tool_calls"] is False
+    assert "provider" not in sent, "nothing asks OpenRouter to hold to the listing"
+    assert [t["function"]["name"] for t in sent["tools"]] == ["get_weather"]
+    assert not [r for r in caplog.records if "not delivered" in r.getMessage()]
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_the_not_delivered_line_is_said_only_when_something_was_withheld(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=ENGINE_LOG)
+    engine = await _account(require_parameters=True)
+    try:
+        target = engine.resolve_model("vendor/neither")
+        sends = {"toolChoice": "required", "parallelToolCalls": False}
+        for _ in range(3):
+            engine._payload_for(_ask("vendor/neither", **sends), target)
+        assert not [r for r in caplog.records if "not delivered" in r.getMessage()], (
+            "no caller setting: nothing was withheld, so nothing is said"
+        )
+        for _ in range(3):
+            engine._payload_for(_ask("vendor/neither", callerSettings=["tools"], **sends), target)
+    finally:
+        await engine.aclose()
+    said = [r.getMessage() for r in caplog.records if "not delivered" in r.getMessage()]
+    assert sum("`tool_choice`" in m for m in said) == 1, said
+    assert sum("`parallel_tool_calls`" in m for m in said) == 1, said
 
 
 # --------------------------------------------------------------------------- #

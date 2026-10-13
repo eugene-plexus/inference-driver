@@ -153,7 +153,11 @@ def test_responses_only_tool_models_are_not_tool_capable_on_chat(model: str) -> 
     engine = _openai(model)
     assert engine.supports_tool_calling is False
     settings = set(engine.supported_settings)
-    assert not settings & {"tools", "toolChoice", "parallelToolCalls"}
+    assert "tools" not in settings
+    # What rides with tools says nothing without them, and is dropped from a request that carries
+    # none (below), so it is offered: the gateway admits a request that carries only those
+    # (`test_tools_off_rule.py`).
+    assert {"toolChoice", "parallelToolCalls"} <= settings
 
 
 @respx.mock
@@ -206,6 +210,8 @@ async def test_an_openai_account_marks_each_model_by_its_own_name() -> None:
         assert caps is not None
         assert caps.toolCalling is tools, name
         assert ("tools" in (caps.supportedSettings or [])) is tools, name
+        # Offered whether or not the model takes tools: without them they are dropped.
+        assert {"toolChoice", "parallelToolCalls"} <= set(caps.supportedSettings or []), name
 
 
 def test_the_same_name_elsewhere_is_left_to_that_provider() -> None:

@@ -143,6 +143,7 @@ from ._thinking import ThinkingFilter, apply_thinking_mode, strip_thinking_block
 from .base import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_STREAM_STALL_SECONDS,
+    TOOL_COMPANION_SETTINGS,
     Chunk,
     ModelNotServed,
     ModelRequired,
@@ -302,8 +303,10 @@ _RESPONSES_ONLY_TOOLS: re.Pattern[str] = re.compile(
 _CHAT_TOOL_SETTINGS = TOOL_SETTINGS
 
 # The two that ride with tools. A request that carries no tools has nothing to
-# choose among and nothing to run in parallel, so these say nothing on it.
-_TOOL_COMPANIONS = TOOL_SETTINGS - {"tools"}
+# choose among and nothing to run in parallel, so these say nothing on it: a chat model
+# whose tools are off, whatever turned them off, lists them and has them dropped from such
+# a request, and is refused them on a request that carries tools (`base.TOOL_COMPANION_SETTINGS`).
+_TOOL_COMPANIONS = frozenset(TOOL_COMPANION_SETTINGS)
 
 
 #: What a backend that does not read each tool setting leaves unhonoured, by value, in
@@ -387,9 +390,11 @@ def unlisted_tool_settings(listed: Collection[str]) -> list[SettingNotHonoured]:
     a model's providers that says what OpenRouter lists, and a provider may read a field it does
     not list: OpenAI's and Mistral's take `parallel_tool_calls`, and none of the 99 `openai/*`
     models that name `tools` lists it (nor do any of the 32 `mistralai/*` listings), counted
-    on OpenRouter's public list of 2026-10-12. So it holds only while Eugene asks for
-    `require_parameters`; with that off nothing is withheld and nothing is named
-    (`OpenAiCompatibleHttpEngine._served_view`), an unknown counting as yes.
+    on OpenRouter's public list of 2026-10-12. So it holds only on a request that asks for
+    `require_parameters` (`OpenAiCompatibleHttpEngine._asks_require_parameters`: the engine
+    does, and the caller sent a setting); on any other nothing is withheld, an unknown
+    counting as yes, and with the engine's `require_parameters` off nothing is named either
+    (`OpenAiCompatibleHttpEngine._served_view`).
 
     Counted on that list (659 models, 390 chat models naming `tools`): **377 of the 390 leave
     out `parallel_tool_calls`**, and 8 leave out `tool_choice` (`amazon/nova-*`,
@@ -1288,6 +1293,20 @@ class OpenAiCompatibleHttpEngine:
         off = self._tools_refused.get(model or self._model_id or "")
         return off.words if off is not None else None
 
+    def tools_off_because(self, model: str | None = None) -> str | None:
+        """The observed cause, in words, of this model's tools being off, or None while they
+        are assumed (`_tools_off_because`): the backend's own refusal, OpenAI's endpoint
+        serving the model without them, or its provider's own listing naming none (OpenRouter's
+        `supported_parameters`, Ollama's capabilities). The route reads this to say WHY a
+        request that carries tools is refused at the door, in the cause's own words and not
+        in a generic one; `model` is what the request named (None for a single-model driver).
+        A model this driver does not serve has no cause to give: the route refuses it first."""
+        try:
+            target = self.resolve_model(model)
+        except (ModelNotServed, ModelRequired):
+            return None
+        return self._tools_off_because(target)
+
     def _learn_tools_refused(self, target: _Target, words: str, status: int) -> None:
         """Remember that the backend refused this model's tools, in its own words.
 
@@ -1428,17 +1447,23 @@ class OpenAiCompatibleHttpEngine:
           names `tools` and leaves out `tool_choice` or `parallel_tool_calls` has the
           setting offered (`supportedSettings`: an unknown counts as yes, and a gap is
           named, not refused). **While Eugene asks OpenRouter only for providers that
-          take every parameter it sends (`require_parameters`)** it also has the matching
-          gap (`unlisted_tool_settings`): the setting is not delivered, and says so. With
-          `require_parameters` off nothing is named and nothing is withheld
-          (`_withheld_settings`). It is the entry the request resolves to
-          (`resolve_model`), so `_withheld_settings` and the per-request header read the
-          same list.
-        * A model whose tools the backend has refused says `toolCalling` false and
-          carries no `tools`. It keeps `toolChoice` and `parallelToolCalls`: they say
-          nothing on a request without tools, which is dropped of them rather than
-          refused (`_payload_for`), so a harness that sends them on every request
-          (Codex does) can still chat with it.
+          take every parameter it sends (`require_parameters`)**, which it does for a
+          request that carries a setting the caller sent, it also has the matching gap
+          (`unlisted_tool_settings`): the setting is not delivered, and says so. With
+          `require_parameters` off, or on a request that lists none of the caller's
+          settings, nothing is named and nothing is withheld (`_withheld_settings`). It is
+          the entry the request resolves to (`resolve_model`), so `_withheld_settings` and
+          the per-request header read the same list.
+        * **One rule for a chat model whose tools are off, whatever turned them off** (the
+          backend refused them in its own words, its provider's listing names none, or its
+          endpoint serves it without them): `toolChoice` and `parallelToolCalls` are
+          offered. They say nothing on a request without tools, which is dropped of them
+          rather than refused (`_payload_for`), so a harness that sends them on every
+          request (Codex does) can still chat with it, and the gateway, which admits by
+          `supportedSettings`, can tell. A model whose tools the backend has refused also
+          says `toolCalling` false and carries no `tools`. **Only an explicit `false` is
+          off**: a list saved by an older driver has no `toolCalling`, which says nothing
+          of tools, and such a model is served as its list says.
 
         A copy, never the stored entry: the list is saved to disk and refreshed from
         the provider, and what a backend said in this engine's life must not outlive
@@ -1456,7 +1481,8 @@ class OpenAiCompatibleHttpEngine:
         )
         if self._require_parameters:
             gaps += [gap for gap in unlisted if all(gap.setting != named.setting for named in gaps)]
-        off = model.id in self._tools_refused
+        learned = model.id in self._tools_refused
+        off = learned or (chat and caps.toolCalling is False)
         if not gaps and not off and not unlisted:
             return model
         update: dict[str, Any] = {}
@@ -1465,9 +1491,11 @@ class OpenAiCompatibleHttpEngine:
         if off or unlisted:
             offered = list(caps.supportedSettings or [])
             offered += [gap.setting for gap in unlisted if gap.setting not in offered]
-            if off:
+            if learned:
                 update["toolCalling"] = False
                 offered = [s for s in offered if s != "tools"]
+            if off:
+                offered += [s for s in TOOL_COMPANION_SETTINGS if s not in offered]
             update["supportedSettings"] = offered
         return model.model_copy(update={"capabilities": caps.model_copy(update=update)})
 
@@ -1557,25 +1585,35 @@ class OpenAiCompatibleHttpEngine:
             for gap in self._gaps_for(target)
         )
 
-    def _withheld_settings(self, target: _Target) -> frozenset[str]:
-        """The settings a request is NOT to carry to the provider for this model,
+    def _asks_require_parameters(self, request: GenerateRequest) -> bool:
+        """Whether this request asks OpenRouter to route only to providers that support every
+        parameter it carries (`provider.require_parameters`): while this engine asks for it
+        (every OpenRouter account does: `providers.py`), for a request that carries a setting the
+        caller sent (`callerSettings`). **One answer for what the payload says and for what is
+        withheld because of it** (`_payload_for`, `_withheld_settings`): a setting is withheld
+        only where the request itself asks OpenRouter to hold to the listing."""
+        return self._require_parameters and bool(request.callerSettings)
+
+    def _withheld_settings(self, target: _Target, request: GenerateRequest) -> frozenset[str]:
+        """The settings this request is NOT to carry to the provider for this model,
         although it is not refused for them: **not delivered: OpenRouter lists no
         provider of this model that takes it, and Eugene asks OpenRouter only for
         providers that take every parameter it sends (`require_parameters`)**.
 
-        **OpenRouter only, and only while this engine asks for `require_parameters`**
-        (every OpenRouter account does: `providers.py`). Then OpenRouter, by its
-        documentation, routes only to providers that support every parameter in the
-        request, so a setting the model's listing leaves out and the gaps name
-        (`unlisted_tool_settings`) would leave it no provider to route to (not tried: no
-        key was used). So it is left out of the payload and named instead. The listing
-        says what OpenRouter lists, not what a provider reads, so with
-        `require_parameters` off nothing is withheld: the setting is sent, an unknown
-        counting as yes, and nothing is named for it. Everywhere else the gaps are what a
-        backend reads and ignores (Strata, Ollama), which is sent.
+        **OpenRouter only, and only where the request asks for `require_parameters`**
+        (`_asks_require_parameters`: every OpenRouter account does, for a request that
+        carries a setting the caller sent). Then OpenRouter, by its documentation, routes
+        only to providers that support every parameter in the request, so a setting the
+        model's listing leaves out and the gaps name (`unlisted_tool_settings`) would leave
+        it no provider to route to (not tried: no key was used). So it is left out of the
+        payload and named instead. The listing says what OpenRouter lists, not what a
+        provider reads, so where the request does not ask for `require_parameters` (the
+        engine does not, or the caller sent no setting) nothing is withheld: the setting is
+        sent, an unknown counting as yes, and nothing is named or logged for it. Everywhere
+        else the gaps are what a backend reads and ignores (Strata, Ollama), which is sent.
         """
         if (
-            not self._require_parameters
+            not self._asks_require_parameters(request)
             or self._dialect.catalogue != "openrouter"
             or target.entry is None
         ):
@@ -1780,14 +1818,15 @@ class OpenAiCompatibleHttpEngine:
         return model
 
     def _with_chat_tools(self, model: DriverModel) -> DriverModel:
-        """Take tools off a model this endpoint serves without them."""
+        """Take tools off a model this endpoint serves without them: `tools` alone. What rides
+        with them says nothing on a request that carries none, is dropped from one rather than
+        refused (`_payload_for`), and stays offered, as for every chat model whose tools are
+        off (`_served_view`)."""
         caps = model.capabilities
         if caps is None or not self._chat_tools_unavailable(model.upstreamId or model.id):
             return model
         caps.toolCalling = False
-        caps.supportedSettings = [
-            s for s in (caps.supportedSettings or []) if s not in _CHAT_TOOL_SETTINGS
-        ]
+        caps.supportedSettings = [s for s in (caps.supportedSettings or []) if s != "tools"]
         return model
 
     @property
@@ -1822,12 +1861,11 @@ class OpenAiCompatibleHttpEngine:
             unsupported |= _FIXED_SAMPLER_SETTINGS
         if self._dialect.openai_parameters:
             unsupported |= _LOCAL_ENGINE_SETTINGS
-        if self._chat_tools_unavailable(target.upstream):
-            unsupported |= _CHAT_TOOL_SETTINGS
-        if target.id in self._tools_refused:
-            # `tools` alone: the backend refused those. What rides with them says
-            # nothing on a request that carries none, and is dropped there rather
-            # than refused (`_payload_for`), so it stays offered.
+        if self._chat_tools_unavailable(target.upstream) or target.id in self._tools_refused:
+            # `tools` alone: OpenAI's Chat Completions serves this model without them, or
+            # the backend refused them. What rides with them says nothing on a request that
+            # carries none, and is dropped there rather than refused (`_payload_for`), so
+            # it stays offered, for either cause as for a listing that names no tools.
             unsupported.add("tools")
         if self._dialect.catalogue == "ollama":
             unsupported |= _OLLAMA_DROPPED_SETTINGS
@@ -1864,7 +1902,8 @@ class OpenAiCompatibleHttpEngine:
                 update={"tools": None, "toolChoice": None, "parallelToolCalls": None}
             )
         unsupported = self._unsupported_settings(target)
-        withheld = self._withheld_settings(target)
+        asks_require_parameters = self._asks_require_parameters(request)
+        withheld = self._withheld_settings(target, request)
         # **A fixed-sampler model takes logprobs only at reasoning effort
         # `none`** (OpenAI's "Using GPT-6", 2026-10-03), so whether it is
         # carried depends on the request, not the model: still listed for
@@ -1884,12 +1923,19 @@ class OpenAiCompatibleHttpEngine:
         # **A model whose tools are off** -- whether the backend refused them in its own
         # words (`_learn_tools_refused`), its provider's listing names none, or its
         # endpoint serves it without them (`_tools_off_because`) -- is not refused, on a
-        # request that carries none, for what rides with them (`tool_choice`,
-        # `parallel_tool_calls`; Codex sends both on every request, tools or not). They say
-        # nothing there, so they are dropped, and said once like any other setting a
-        # backend cannot take. One rule, whether the "no" was learned or listed.
+        # request that carries none (`None` or `[]`), for what rides with them
+        # (`tool_choice`, `parallel_tool_calls`; Codex sends both on every request, tools or
+        # not). They say nothing there, so they are dropped, and said once like any other
+        # setting a backend cannot take. **With tools it is still refused**: the explicit
+        # ones that ride with them are, before anything is sent, saying why. One rule,
+        # whether the "no" was learned or listed.
+        off_because = self._tools_off_because(target)
         # The cause, in words, while those are being dropped (None: they are not).
-        dropping_because = self._tools_off_because(target) if not request.tools else None
+        dropping_because = off_because if not request.tools else None
+        if off_because is not None and request.tools:
+            refuse_unsupported_settings(
+                request, unsupported=_CHAT_TOOL_SETTINGS, because=off_because
+            )
         refusable = (
             set(unsupported) - _TOOL_COMPANIONS
             if dropping_because is not None
@@ -2005,7 +2051,7 @@ class OpenAiCompatibleHttpEngine:
             payload["response_format"] = request.responseFormat.model_dump(
                 mode="json", by_alias=True, exclude_none=True
             )
-        if self._require_parameters and request.callerSettings:
+        if asks_require_parameters:
             payload["provider"] = {"require_parameters": True}
         if request.logprobs is not None and logprobs_held:
             self._warn_dropped("logprobs", target)
