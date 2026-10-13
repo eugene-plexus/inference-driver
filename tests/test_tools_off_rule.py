@@ -137,9 +137,6 @@ class Family:
     chat: respx.Route
     #: Part of what the engine says of why, which is the observed cause.
     cause: str
-    #: Whether the entry also offers `tools`. Ollama's does: its entry is built from the engine's
-    #: own defaults, which are older than this rule and not what it is about.
-    offers_tools: bool = False
 
     def entry(self) -> DriverModel | None:
         if self.model is None:
@@ -147,12 +144,17 @@ class Family:
         assert self.engine.catalogue is not None
         return self.engine.catalogue.find(self.model)
 
-    def listed(self) -> set[str]:
+    def settings(self) -> list[str]:
+        """`supportedSettings` as served, in order and with any repeat it has: a set would
+        say nothing of a setting listed twice."""
         entry = self.entry()
         if entry is None:
-            return set(self.engine.supported_settings)
+            return list(self.engine.supported_settings)
         assert entry.capabilities is not None
-        return set(entry.capabilities.supportedSettings or [])
+        return list(entry.capabilities.supportedSettings or [])
+
+    def listed(self) -> set[str]:
+        return set(self.settings())
 
     def tools_are_off(self) -> bool:
         entry = self.entry()
@@ -219,7 +221,7 @@ async def _ollama() -> Family:
         catalogue_source="ollama",
     )
     assert engine.catalogue is not None and await engine.catalogue.refresh()
-    return Family(engine, "gemma3:4b", chat, "Ollama's own capabilities", offers_tools=True)
+    return Family(engine, "gemma3:4b", chat, "Ollama's own capabilities")
 
 
 def _openai(model_id: str | None) -> OpenAiCompatibleHttpEngine:
@@ -273,15 +275,101 @@ async def test_a_model_whose_tools_are_off_lists_what_rides_with_them(name: str)
     """The gateway admits by `supportedSettings` (round five). Before this, an OpenRouter listing
     that names no tools, and OpenAI's Responses-only models, left both settings out, so a request
     carrying only `tool_choice` or `parallel_tool_calls` (Codex's, tools or not) was turned away
-    from a model that drops them and answers."""
+    from a model that drops them and answers.
+
+    **And an entry whose tools are off never lists `tools`**, whatever its list was made from:
+    an Ollama entry's is the engine's own defaults, which name it, and it was listed with
+    `toolCalling` false all the same (round six). Each setting once: a set would not say."""
     family = await FAMILIES[name]()
     try:
         assert family.tools_are_off()
-        assert family.listed() >= COMPANIONS
-        if not family.offers_tools:
-            assert "tools" not in family.listed()
+        settings = family.settings()
+        assert set(settings) >= COMPANIONS
+        assert "tools" not in settings, "an entry whose tools are off never lists them"
+        assert len(settings) == len(set(settings)), f"each setting once: {settings}"
     finally:
         await family.engine.aclose()
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_a_model_whose_tools_are_on_still_lists_them() -> None:
+    """The control for the rule above: only an entry whose tools are OFF loses `tools`. An
+    OpenRouter listing that names tools (and one that names tools and leaves out the two
+    settings, which are then offered beside them) and an Ollama model whose capabilities list
+    them keep it, with what rides with it, each once."""
+    listing = {
+        "data": [
+            _or_model(
+                "vendor/tools",
+                supported_parameters=["max_tokens", "tools", "tool_choice", "parallel_tool_calls"],
+            ),
+            _or_model("vendor/tools-only", supported_parameters=["max_tokens", "tools"]),
+        ]
+    }
+    _mock_openrouter(listing, "vendor/tools")
+    router = _openrouter_engine()
+    respx.get(f"{OLLAMA}/api/tags").mock(
+        return_value=httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+    )
+    respx.post(f"{OLLAMA}/api/show").mock(
+        return_value=httpx.Response(200, json={"capabilities": ["completion", "tools"]})
+    )
+    ollama = OpenAiCompatibleHttpEngine(
+        base_url=OLLAMA,
+        model_id=None,
+        backend_kind=BackendKind.openai_compat_http,
+        auth_required=False,
+        catalogue_source="ollama",
+    )
+    try:
+        for engine, model in (
+            (router, "vendor/tools"),
+            (router, "vendor/tools-only"),
+            (ollama, "qwen3:8b"),
+        ):
+            assert engine.catalogue is not None and await engine.catalogue.refresh()
+            entry = engine.catalogue.find(model)
+            assert entry is not None and entry.capabilities is not None
+            assert entry.capabilities.toolCalling is True
+            settings = entry.capabilities.supportedSettings or []
+            assert {"tools", *COMPANIONS} <= set(settings), settings
+            assert len(settings) == len(set(settings)), f"each setting once: {settings}"
+    finally:
+        await router.aclose()
+        await ollama.aclose()
+
+
+@respx.mock
+@pytest.mark.anyio
+async def test_what_rides_with_tools_is_offered_once_where_the_list_already_names_it() -> None:
+    """A list that already names `toolChoice` or `parallelToolCalls` is not given them again.
+    Two ways it is so: a model whose listing names tools and both settings, whose tools a
+    backend then refuses (a learned refusal on an account), and a listing that names
+    `tool_choice` and no tools. (A family's own list is checked above; this is for the ones
+    the families leave out, which a set would not have shown.)"""
+    listing = {
+        "data": [
+            _or_model(
+                "vendor/all3",
+                supported_parameters=["max_tokens", "tools", "tool_choice", "parallel_tool_calls"],
+            ),
+            _or_model("vendor/choice-only", supported_parameters=["max_tokens", "tool_choice"]),
+        ]
+    }
+    _mock_openrouter(listing, "vendor/all3")
+    engine = _openrouter_engine()
+    try:
+        assert engine.catalogue is not None and await engine.catalogue.refresh()
+        engine._learn_tools_refused(engine.resolve_model("vendor/all3"), WORDS, 500)
+        for model in ("vendor/all3", "vendor/choice-only"):
+            entry = engine.catalogue.find(model)
+            assert entry is not None and entry.capabilities is not None
+            assert entry.capabilities.toolCalling is False
+            settings = entry.capabilities.supportedSettings or []
+            assert sorted(settings) == sorted(["maxTokens", *COMPANIONS]), (model, settings)
+    finally:
+        await engine.aclose()
 
 
 @respx.mock
@@ -768,6 +856,11 @@ async def test_a_cli_engine_still_refuses_what_rides_with_tools_when_it_carries_
             await engine.generate(request)
     assert refused.value.upstream_status == 400
     assert WIRE[field] in str(refused.value) and "no way to carry tools" in str(refused.value)
+    # The cause names the engine that has no way to, and not the other one.
+    kind = engine_type.backend_kind.value
+    other = ({e.backend_kind.value for e in (ClaudeCodeCliEngine, CodexCliEngine)} - {kind}).pop()
+    assert f"Eugene has no way to carry tools to {kind} (" in str(refused.value)
+    assert other not in str(refused.value)
     assert captured["argv"] is None, "refused before its CLI was started"
 
 

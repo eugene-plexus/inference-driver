@@ -1460,10 +1460,12 @@ class OpenAiCompatibleHttpEngine:
           offered. They say nothing on a request without tools, which is dropped of them
           rather than refused (`_payload_for`), so a harness that sends them on every
           request (Codex does) can still chat with it, and the gateway, which admits by
-          `supportedSettings`, can tell. A model whose tools the backend has refused also
-          says `toolCalling` false and carries no `tools`. **Only an explicit `false` is
-          off**: a list saved by an older driver has no `toolCalling`, which says nothing
-          of tools, and such a model is served as its list says.
+          `supportedSettings`, can tell. **Such a model never lists `tools`**, whatever its
+          list was made from (an Ollama entry's is the engine's own defaults, which name
+          it), and each of the two once. A model whose tools the backend has refused also
+          says `toolCalling` false. **Only an explicit `false` is off**: a list saved by an
+          older driver has no `toolCalling`, which says nothing of tools, and such a model
+          is served as its list says.
 
         A copy, never the stored entry: the list is saved to disk and refreshed from
         the provider, and what a backend said in this engine's life must not outlive
@@ -1493,8 +1495,11 @@ class OpenAiCompatibleHttpEngine:
             offered += [gap.setting for gap in unlisted if gap.setting not in offered]
             if learned:
                 update["toolCalling"] = False
-                offered = [s for s in offered if s != "tools"]
             if off:
+                # No `tools` for an entry whose tools are off, however its list was made (an
+                # Ollama entry's is the engine's own defaults, which name it), and what rides
+                # with them offered, once each (a list may already name one).
+                offered = [s for s in offered if s != "tools"]
                 offered += [s for s in TOOL_COMPANION_SETTINGS if s not in offered]
             update["supportedSettings"] = offered
         return model.model_copy(update={"capabilities": caps.model_copy(update=update)})

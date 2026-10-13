@@ -280,6 +280,12 @@ def test_through_the_app_an_ollama_model_without_tools_is_not_sent_what_rides_wi
         info = _wait_for_catalogue(client)
         (model,) = info["models"]
         assert model["capabilities"]["toolCalling"] is False
+        # Listed as `toolCalling` says: what rides with tools, once each, and not `tools`. The
+        # entry is built from the engine's own defaults, which name it (round six).
+        settings = model["capabilities"]["supportedSettings"]
+        assert {"toolChoice", "parallelToolCalls"} <= set(settings)
+        assert "tools" not in settings, settings
+        assert len(settings) == len(set(settings)), settings
         for _ in range(2):
             served = client.post("/v1/generate", json=plain)
             assert served.status_code == 200, served.text
@@ -297,6 +303,26 @@ def test_through_the_app_an_ollama_model_without_tools_is_not_sent_what_rides_wi
     assert sum("`tool_choice`" in m for m in left_out) == 1, left_out
     assert sum("`parallel_tool_calls`" in m for m in left_out) == 1, left_out
     assert all("Ollama's own capabilities" in m and "do not list tools" in m for m in left_out)
+
+
+@respx.mock
+def test_through_the_app_an_ollama_model_with_tools_still_lists_them(tmp_path: Path) -> None:
+    """The control for the test above: `/api/show` lists `tools`, so the entry says
+    `toolCalling` true and keeps `tools` among its settings, with what rides with it."""
+    respx.get(f"{OLLAMA}/api/tags").mock(
+        return_value=httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+    )
+    respx.post(f"{OLLAMA}/api/show").mock(
+        return_value=httpx.Response(200, json={"capabilities": ["completion", "tools"]})
+    )
+    config = tmp_path / "ollama.yaml"
+    config.write_text(json.dumps({"provider": "ollama_local"}), "utf-8")
+    with TestClient(create_app(settings=Settings(config_file=config))) as client:
+        (model,) = _wait_for_catalogue(client)["models"]
+    assert model["capabilities"]["toolCalling"] is True
+    settings = model["capabilities"]["supportedSettings"]
+    assert {"tools", "toolChoice", "parallelToolCalls"} <= set(settings), settings
+    assert len(settings) == len(set(settings)), settings
 
 
 @respx.mock
