@@ -34,7 +34,14 @@ from ..engines.base import (
     resolve_single_model,
 )
 from ..engines.systemone_http import validate_questions
-from ..failures import capacity_refused, credential_refused, disposition, every, request_id
+from ..failures import (
+    capacity_refused,
+    credential_refused,
+    disposition,
+    every,
+    loading_refused,
+    request_id,
+)
 from ..images import ImageRefusal, attachment_kinds, validate_messages
 from ..locality import enforce
 from ..raw_completion import CompletionRefusal
@@ -779,11 +786,15 @@ def _backend_error(e: Exception, kind_label: str) -> HTTPException:
         detail=Problem(
             type="https://github.com/eugene-plexus/inference-driver#backend-rejected-request"
             if outcome == "terminal"
+            else "https://github.com/eugene-plexus/inference-driver#backend-loading"
+            if loading_refused(e)
             else "https://github.com/eugene-plexus/inference-driver#backend-error",
             title="Backend rejected the request"
             if outcome == "terminal"
             else "Backend did not finish in time"
             if code == 504
+            else "Backend is loading its model"
+            if loading_refused(e)
             else "Backend error",
             status=code,
             detail=message,

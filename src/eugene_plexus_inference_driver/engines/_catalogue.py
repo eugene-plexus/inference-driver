@@ -206,22 +206,26 @@ def from_openrouter(body: Any) -> list[DriverModel]:
         raw_params = entry.get("supported_parameters")
         # **A listing that says nothing is not a no** (Troy, 2026-10-12,
         # `docs/design/tools-assumed.md`). An entry with no `supported_parameters`
-        # list at all (the key absent, or null) has said nothing of tools, so a chat
+        # list at all (the key absent, null, or empty) has said nothing of tools, so a chat
         # model there is taken to carry them, and the settings that carry them are
         # offered with it: a `toolCalling: true` that this driver then refused an
         # explicit `tools` against would be no better than the `false` it replaces.
-        # An entry that HAS the list and does not name `tools` is OpenRouter's own
+        # A nonempty list that does not name `tools` is OpenRouter's own
         # listing naming no tools for the model, the provider's word on tools
         # (evidence of the second kind), and stays false.
         names = raw_params if isinstance(raw_params, list) else None
-        listed = names is not None
+        listed = bool(names)
         params = {p for p in names or [] if isinstance(p, str)}
         settings = [ours for theirs, ours in _OPENROUTER_SETTINGS if theirs in params]
         if "structured_outputs" in params and "responseFormat" not in settings:
             settings.append("responseFormat")
         surfaces = surfaces_from_output(output, inputs)
         if not listed and "chat" in surfaces:
-            settings = [ours for _, ours in _OPENROUTER_SETTINGS if ours in TOOL_SETTINGS]
+            # Messages always supplies a token cap. An empty router listing
+            # is no evidence that this basic chat field is refused upstream.
+            settings = [
+                ours for _, ours in _OPENROUTER_SETTINGS if ours in TOOL_SETTINGS | {"maxTokens"}
+            ]
         context = entry.get("context_length")
         voices = entry.get("supported_voices")
         models.append(

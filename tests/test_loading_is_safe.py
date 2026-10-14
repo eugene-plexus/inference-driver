@@ -248,7 +248,7 @@ async def test_a_loading_engine_is_safe_whichever_path_met_it(operation: str, bo
     assert failure.status_code == 502
     detail = failure.detail
     assert detail["retryDisposition"] == "safe"
-    assert detail["type"].endswith("#backend-error")
+    assert detail["type"].endswith("#backend-loading")
     assert "Loading model" in detail["detail"]
     assert "Outcome unknown" not in detail["detail"] and "work may have occurred" not in str(detail)
 
@@ -389,7 +389,7 @@ def test_through_the_app_a_loading_engine_is_a_safe_502_and_answers_once_loaded(
         assert loading.status_code == 502, loading.text
         problem = loading.json()["detail"]
         assert problem["retryDisposition"] == "safe"
-        assert problem["type"].endswith("#backend-error")
+        assert problem["type"].endswith("#backend-loading")
         assert "Loading model" in problem["detail"]
         assert "Outcome unknown" not in problem["detail"]
         assert "Retry-After" not in loading.headers, "llama-server gave none, and none is invented"

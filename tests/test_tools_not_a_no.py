@@ -85,8 +85,8 @@ def _only(entry: dict[str, Any]) -> DriverModel:
 
 @pytest.mark.parametrize(
     "listing",
-    [..., None, "tools", {"tools": True}],
-    ids=["key-absent", "null", "a-string", "an-object"],
+    [..., None, [], "tools", {"tools": True}],
+    ids=["key-absent", "null", "empty", "a-string", "an-object"],
 )
 def test_an_openrouter_chat_model_whose_listing_names_no_parameters_takes_tools(
     listing: Any,
@@ -98,12 +98,13 @@ def test_an_openrouter_chat_model_whose_listing_names_no_parameters_takes_tools(
     assert caps.toolCalling is True
     # Offered, so that a `true` here is one an explicit `tools` is not then refused against.
     assert set(caps.supportedSettings or []) >= TOOL_SETTINGS
+    assert "maxTokens" in (caps.supportedSettings or [])
 
 
 @pytest.mark.parametrize(
     "listing",
-    [[], ["max_tokens", "temperature"], ["tools_unrelated", "tool_choice"]],
-    ids=["empty", "others", "tool-choice-only"],
+    [["max_tokens", "temperature"], ["tools_unrelated", "tool_choice"]],
+    ids=["others", "tool-choice-only"],
 )
 def test_an_openrouter_list_that_leaves_tools_out_is_openrouters_no(listing: list[str]) -> None:
     caps = _only(_entry(supported_parameters=listing)).capabilities
