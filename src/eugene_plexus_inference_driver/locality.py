@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from ._generated.models import Locality, Problem
 
 DECLARABLE_PROVIDERS = frozenset(
-    {"openai_compat_custom", "ollama_local", "lmstudio_local", "systemone_custom"}
+    {"openai_compat_custom", "ollama_local", "lmstudio_local", "systemone_custom", "strata_local"}
 )
 
 

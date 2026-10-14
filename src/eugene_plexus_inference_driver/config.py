@@ -325,6 +325,7 @@ def _read_by() -> dict[str, list[str] | None]:
         # provider is external (or, fronting a runtime here, local) whatever
         # this says.
         "backendLocality": [
+            "strata_local",
             "ollama_local",
             "lmstudio_local",
             "openai_compat_custom",

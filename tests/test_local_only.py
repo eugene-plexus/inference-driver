@@ -110,6 +110,11 @@ def test_unrestricted_work_can_still_use_external_engine(client):
         ("chatgpt_subscription", "local", False, "external"),
         ("openai", "local", False, "external"),
         ("openrouter", "local", True, "external"),
+        ("strata_local", None, True, "local"),
+        ("strata_local", "external", True, "local"),
+        ("strata_local", None, False, "unknown"),
+        ("strata_local", "local", False, "local"),
+        ("strata_local", "external", False, "external"),
     ],
 )
 def test_engine_classification_is_captured_at_construction(provider, declared, managed, expected):
