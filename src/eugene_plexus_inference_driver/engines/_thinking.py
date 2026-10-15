@@ -1,4 +1,7 @@
-"""Translate operator `thinkingMode` config into a model-side directive.
+"""Fallback translation of operator `thinkingMode` into a model-side directive.
+
+Strata overrides this path with native effort controls. Other engines still use
+these prompt instructions when no native adapter mapping is available.
 
 The engines we ship in v0.2 don't have a uniform API for native
 reasoning-budget control (Anthropic Messages API has

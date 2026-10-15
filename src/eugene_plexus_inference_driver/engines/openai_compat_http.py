@@ -58,6 +58,7 @@ from .._generated.models import (
     ImagePartial,
     ImageRequest,
     ImageResponse,
+    Message,
     ModerateRequest,
     ModerateResponse,
     ModerationPartType,
@@ -1590,7 +1591,10 @@ class OpenAiCompatibleHttpEngine:
         caller sent (`callerSettings`). **One answer for what the payload says and for what is
         withheld because of it** (`_payload_for`, `_withheld_settings`): a setting is withheld
         only where the request itself asks OpenRouter to hold to the listing."""
-        return self._require_parameters and bool(request.callerSettings)
+        # Effort alone must not turn a preference into strict provider routing.
+        return self._require_parameters and bool(
+            set(request.callerSettings or []) - {"reasoningEffort"}
+        )
 
     def _withheld_settings(self, target: _Target, request: GenerateRequest) -> frozenset[str]:
         """The settings this request is NOT to carry to the provider for this model,
@@ -1646,16 +1650,21 @@ class OpenAiCompatibleHttpEngine:
         except (ModelNotServed, ModelRequired):
             return []  # the route refuses it before anything is sent: nothing is ignored
         gaps = self._gaps_for(target)
-        if not gaps or (
-            request.toolChoice == ToolChoice.none and self._none_is_given_as_no_tools(target)
-        ):
-            return []
+        if request.toolChoice == ToolChoice.none and self._none_is_given_as_no_tools(target):
+            gaps = []
         sent = set(request.callerSettings or [])
-        return [
+        named = [
             gap.setting
             for gap in gaps
             if gap.setting in sent and _contract_value(request, gap.setting) in gap.values
         ]
+        if (
+            "reasoningEffort" in sent
+            and request.reasoningEffort is not None
+            and "reasoningEffort" in self._unsupported_settings(target)
+        ):
+            named.append("reasoningEffort")
+        return named
 
     def resolve_model(self, requested: str | None) -> _Target:
         """The model a request is for, or `ModelNotServed` / `ModelRequired`.
@@ -1945,7 +1954,7 @@ class OpenAiCompatibleHttpEngine:
         # message before role-coercion. See engines/_thinking.py for
         # the per-mode directives — `off` is the one that suppresses
         # inline `<think>` blocks leaking into chat responses.
-        messages = apply_thinking_mode(list(request.messages), self._thinking_mode)
+        messages = self._messages_for(request)
         payload: dict[str, Any] = {
             "model": target.upstream,
             "messages": _to_openai_messages(
@@ -2060,7 +2069,10 @@ class OpenAiCompatibleHttpEngine:
         if request.logitBias is not None:
             payload["logit_bias"] = dict(request.logitBias)
         if request.reasoningEffort is not None:
-            payload["reasoning_effort"] = request.reasoningEffort.value
+            if "reasoningEffort" in unsupported:
+                self._warn_dropped("reasoning_effort", target)
+            else:
+                payload["reasoning_effort"] = request.reasoningEffort.value
         if request.verbosity is not None:
             payload["verbosity"] = request.verbosity.value
         if request.prediction is not None:
@@ -2089,6 +2101,12 @@ class OpenAiCompatibleHttpEngine:
         if forced is not None:
             _force_by_schema(payload, forced)
         return payload
+
+    def _thinking_mode_for(self, request: GenerateRequest) -> str:
+        return self._thinking_mode
+
+    def _messages_for(self, request: GenerateRequest) -> list[Message]:
+        return apply_thinking_mode(list(request.messages), self._thinking_mode_for(request))
 
     async def _forced_tool(self, request: GenerateRequest) -> Tool | None:
         """The tool a named `tool_choice` forces, when the backend is llama-server.
@@ -2389,7 +2407,7 @@ class OpenAiCompatibleHttpEngine:
             if not tool_calls and not reasoning:
                 raise CliError("openai_compat_http response missing string content")
             content = None
-        elif self._thinking_mode == "off":
+        elif self._thinking_mode_for(request) == "off":
             # Defensive strip of <think>...</think> when the operator opted
             # out of thinking but the model emitted tags anyway. See
             # _thinking.strip_thinking_blocks for the why.
@@ -2407,7 +2425,7 @@ class OpenAiCompatibleHttpEngine:
             # `off` withholds it on this path exactly as the stream
             # withholds its frames: the operator said not to show
             # reasoning, and a separate field is still showing it.
-            reasoning=reasoning if self._thinking_mode != "off" else None,
+            reasoning=reasoning if self._thinking_mode_for(request) != "off" else None,
             toolCalls=tool_calls or None,
             finishReason=FinishReason.stop_sequence
             if stop_sequence is not None
@@ -2516,13 +2534,13 @@ class OpenAiCompatibleHttpEngine:
         generated = 0
 
         started = time.perf_counter()
-        filtered = ThinkingFilter() if self._thinking_mode == "off" else None
+        filtered = ThinkingFilter() if self._thinking_mode_for(request) == "off" else None
         emitted: list[str] = []
         # Reasoning the backend streamed on its own channel. Forwarded
         # frame by frame and kept for the terminal `done`, unless the
         # operator's thinkingMode is `off`, in which case it is read
         # past exactly as it was for everyone before 2026-09-23.
-        show_reasoning = self._thinking_mode != "off"
+        show_reasoning = self._thinking_mode_for(request) != "off"
         reasoned: list[str] = []
         stop_sequence: str | None = None
         # Did upstream actually say it was finished? Iterating a closed

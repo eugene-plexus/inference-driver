@@ -377,11 +377,18 @@ class GeminiApiEngine:
         if "chat" not in target.entry.surfaces:
             return []
         sent = set(request.callerSettings or [])
-        return [
+        named = [
             gap.setting
             for gap in self.settings_not_honoured()
             if gap.setting in sent and getattr(request, gap.setting, None) in gap.values
         ]
+        if (
+            "reasoningEffort" in sent
+            and request.reasoningEffort is not None
+            and "reasoningEffort" in self._unsupported(target)
+        ):
+            named.append("reasoningEffort")
+        return named
 
     # -- the account -----------------------------------------------------------
 

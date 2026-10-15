@@ -20,7 +20,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from eugene_plexus_inference_driver._generated.models import GenerateRequest
+from eugene_plexus_inference_driver._generated.models import GenerateRequest, ReasoningEffort
 from eugene_plexus_inference_driver.app import create_app
 from eugene_plexus_inference_driver.engines._catalogue import from_openrouter
 from eugene_plexus_inference_driver.engines._subprocess import CliError
@@ -225,7 +225,6 @@ def test_reasoning_effort_max_reaches_the_backend(tmp_path: Path) -> None:
     [
         ("logprobs", "logprobs"),
         ("logitBias", "logit_bias"),
-        ("reasoningEffort", "reasoning_effort"),
         ("verbosity", "verbosity"),
         ("prediction", "prediction"),
         ("webSearchOptions", "web_search_options"),
@@ -251,7 +250,7 @@ def test_a_setting_the_model_does_not_list_is_refused_not_dropped(
 
 
 def test_an_agentic_cli_refuses_each_of_them() -> None:
-    for setting in SETTINGS:
+    for setting in set(SETTINGS) - {"reasoningEffort"}:
         request = GenerateRequest.model_validate(
             {
                 "messages": [{"role": "user", "content": "hi"}],
@@ -261,6 +260,47 @@ def test_an_agentic_cli_refuses_each_of_them() -> None:
         )
         with pytest.raises(CliError):
             warn_dropped_sampling(request, engine="claude_code_cli", model_id="m", warned=set())
+
+
+@pytest.mark.parametrize("effort", list(ReasoningEffort))
+@pytest.mark.parametrize("stream", [False, True])
+@respx.mock
+def test_unlisted_reasoning_effort_is_omitted_instead_of_refused(
+    tmp_path: Path, effort: ReasoningEffort, stream: bool
+) -> None:
+    upstream = (
+        _sse(_frame({"content": "ok"})) if stream else httpx.Response(200, json=_completion())
+    )
+    client, route = _serve(_account(tmp_path), upstream)
+    with client:
+        _ready(client)
+        response = client.post(
+            "/v1/generate/stream" if stream else "/v1/generate",
+            json={
+                "model": "acme/plain",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoningEffort": effort,
+                "callerSettings": ["reasoningEffort"],
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert "reasoning_effort" not in json.loads(route.calls[-1].request.content)
+    assert "provider" not in json.loads(route.calls[-1].request.content)
+    assert response.headers["x-eugene-plexus-ignored-settings"] == "reasoningEffort"
+    if stream:
+        assert "event: done" in response.text
+
+
+def test_an_agentic_cli_ignores_effort_with_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    request = GenerateRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoningEffort": "none",
+            "callerSettings": ["reasoningEffort"],
+        }
+    )
+    warn_dropped_sampling(request, engine="claude_code_cli", model_id="m", warned=set())
+    assert "reasoningEffort" in caplog.text
 
 
 # --------------------------------------------------------------------------- #

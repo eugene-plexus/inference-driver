@@ -513,7 +513,7 @@ def test_a_setting_gemini_cannot_honour_is_refused_not_dropped(
 
 
 @respx.mock
-def test_reasoning_effort_is_refused_on_a_model_that_does_not_think(tmp_path: Path) -> None:
+def test_reasoning_effort_is_omitted_on_a_model_that_does_not_think(tmp_path: Path) -> None:
     client = _start(tmp_path)
     route = respx.post(f"{BASE}/models/gemini-3.1-flash-lite:generateContent").mock(
         return_value=httpx.Response(200, json=_answer([{"text": "x"}]))
@@ -527,8 +527,9 @@ def test_reasoning_effort_is_refused_on_a_model_that_does_not_think(tmp_path: Pa
                 callerSettings=["reasoningEffort"],
             ),
         )
-    assert response.status_code == 400 and "reasoning_effort" in response.text
-    assert not route.called
+    assert response.status_code == 200, response.text
+    assert "thinkingConfig" not in _sent(route).get("generationConfig", {})
+    assert response.headers["x-eugene-plexus-ignored-settings"] == "reasoningEffort"
 
 
 @respx.mock

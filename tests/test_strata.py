@@ -11,7 +11,12 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from eugene_plexus_inference_driver._generated.models import GenerateRequest, Message, Role
+from eugene_plexus_inference_driver._generated.models import (
+    GenerateRequest,
+    Message,
+    ReasoningEffort,
+    Role,
+)
 from eugene_plexus_inference_driver.app import create_app
 from eugene_plexus_inference_driver.engines._subprocess import CliError
 from eugene_plexus_inference_driver.engines.openai_compat_http import OpenAiCompatibleHttpEngine
@@ -41,6 +46,7 @@ def test_supported_settings_are_what_strata_reads_and_not_what_it_has_never_show
         "seed",
         "frequencyPenalty",
         "presencePenalty",
+        "reasoningEffort",
         "tools",
         "toolChoice",
         "parallelToolCalls",
@@ -166,6 +172,31 @@ async def _serve(engine: StrataHttpEngine, request: GenerateRequest, stream: boo
         _ = [chunk async for chunk in engine.stream(request)]
     else:
         await engine.generate(request)
+
+
+@respx.mock
+@pytest.mark.parametrize("effort", list(ReasoningEffort))
+@pytest.mark.parametrize("stream", [False, True])
+def test_strata_advertises_and_forwards_every_reasoning_effort(
+    tmp_path: Path, effort: ReasoningEffort, stream: bool
+) -> None:
+    route = respx.post(f"{BASE}/v1/chat/completions").mock(side_effect=_chat)
+    with _strata_app(tmp_path) as client:
+        info = client.get("/v1/info").json()
+        assert "reasoningEffort" in info["models"][0]["capabilities"]["supportedSettings"]
+        response = client.post(
+            "/v1/generate/stream" if stream else "/v1/generate",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoningEffort": effort,
+                "callerSettings": ["reasoningEffort"],
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert json.loads(route.calls[-1].request.content)["reasoning_effort"] == effort
+    assert "x-eugene-plexus-ignored-settings" not in response.headers
+    if stream:
+        assert "event: done" in response.text
 
 
 @pytest.mark.anyio

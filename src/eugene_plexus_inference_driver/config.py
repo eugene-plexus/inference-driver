@@ -172,7 +172,9 @@ def _common_fields() -> list[ConfigField]:
                 "`<think>` blocks or scratchpad reasoning, which stops reasoning-tag "
                 "models such as DeepSeek R1 or Qwen QwQ from leaking their thinking "
                 "into the answer. `low`, `medium` and `high` ask for progressively "
-                "more deliberation. It is applied as a system-prompt instruction."
+                "more deliberation. Strata uses its native reasoning-effort control; an "
+                "explicit request effort overrides this default. Other compatible engines "
+                "apply a system-prompt instruction."
             ),
             category="adapter",
             valueType=ConfigValueType.enum,

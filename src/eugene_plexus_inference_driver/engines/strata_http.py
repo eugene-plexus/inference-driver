@@ -1,6 +1,8 @@
 """Strata's OpenAI HTTP endpoint: text chat, tool calls and structured output.
 
-Reuse transport, incremental reasoning, usage and cancellation. Do not infer
+Reuse transport, incremental reasoning, usage and cancellation. Caller stop
+strings are enforced here on visible answer text; Strata only handles its model's
+stop tokens. Do not infer
 llama.cpp semantics from Strata's compatibility /props or /slots endpoints.
 
 **Tools are assumed, as for every engine** (Troy, 2026-10-12,
@@ -38,25 +40,40 @@ lists in `callerSettings`: a direct caller that lists none is named nothing):
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import time
+from collections.abc import AsyncGenerator
+from dataclasses import replace
 from typing import Any
 
 import httpx
 
 from .._generated.models import (
+    FinishReason,
     GenerateRequest,
+    GenerateResponse,
+    Message,
+    ReasoningEffort,
     RerankPassagesRequest,
     RerankPassagesResponse,
     SettingNotHonoured,
     Tool,
 )
 from ._subprocess import CliError
-from .base import RerankUnsupported
-from .openai_compat_http import OpenAiCompatibleHttpEngine, _Target, unread_tool_settings
+from .base import Chunk, RerankUnsupported
+from .openai_compat_http import (
+    OpenAiCompatibleHttpEngine,
+    _accumulate_tool_calls,
+    _finish_tool_calls,
+    _Target,
+    unread_tool_settings,
+)
 
 log = logging.getLogger(__name__)
 
-#: What Strata's endpoint can carry, of the request's settings. `tools`,
+#: What this adapter can honour or carry, of the request's settings. Stop
+#: strings are enforced by the adapter, not Strata's endpoint. `tools`,
 #: `toolChoice`, `parallelToolCalls` and `responseFormat` are here since
 #: 2026-10-12; **`seed`, `frequencyPenalty` and `presencePenalty` since round
 #: four**: Strata's own source reads all three per request (`sampling_keys` forwards
@@ -113,7 +130,11 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
     def _unsupported_settings(self, target: _Target) -> frozenset[str]:
         from .openai_compat_http import _ALL_ENGINE_SETTINGS
 
-        return super()._unsupported_settings(target) | (_ALL_ENGINE_SETTINGS - _SUPPORTED)
+        # Strata reads effort in serve/frontend.py (effort_kwargs); the generic
+        # adapter's hosted-only assumption must not override that support.
+        return (super()._unsupported_settings(target) - {"reasoningEffort"}) | (
+            _ALL_ENGINE_SETTINGS - _SUPPORTED
+        )
 
     def _payload_for(
         self, request: GenerateRequest, target: _Target, forced: Tool | None = None
@@ -127,6 +148,19 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
         (a profile's or the install's default) is left out and said once, not refused (A2): the
         caller never asked for it, and Strata would have ignored it all the same.
         """
+        if request.reasoningEffort is None and self._thinking_mode in {
+            "off",
+            "low",
+            "medium",
+            "high",
+        }:
+            request = request.model_copy(
+                update={
+                    "reasoningEffort": ReasoningEffort.none
+                    if self._thinking_mode == "off"
+                    else ReasoningEffort(self._thinking_mode)
+                }
+            )
         seed = request.seed
         if seed is not None and seed <= 0:
             if "seed" in (request.callerSettings or []):
@@ -140,6 +174,110 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
             request = request.model_copy(update={"seed": None})
             self._warn_seed_left_out(seed, target)
         return super()._payload_for(request, target, forced)
+
+    def _thinking_mode_for(self, request: GenerateRequest) -> str:
+        if request.reasoningEffort is not None:
+            return (
+                "off"
+                if request.reasoningEffort in {ReasoningEffort.none, ReasoningEffort.minimal}
+                else "auto"
+            )
+        return self._thinking_mode
+
+    def _messages_for(self, request: GenerateRequest) -> list[Message]:
+        # Native template controls avoid changing the prompt and its cache prefix.
+        return list(request.messages)
+
+    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        if not request.stop:
+            return await super().generate(request)
+        # Use the streaming path so a matched stop closes the upstream connection
+        # immediately, including for callers asking for a whole answer.
+        async with contextlib.aclosing(self.stream(request)) as chunks:
+            async for chunk in chunks:
+                if chunk.done and chunk.result is not None:
+                    return chunk.result
+        raise CliError("Strata stream ended without a result")
+
+    async def stream(
+        self, request: GenerateRequest, *, assemble_audio: bool = False
+    ) -> AsyncGenerator[Chunk, None]:
+        stops = [stop for stop in (request.stop or []) if stop]
+        pending = ""
+        emitted: list[str] = []
+        reasoned: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        started = time.perf_counter()
+        async with contextlib.aclosing(
+            super().stream(request, assemble_audio=assemble_audio)
+        ) as chunks:
+            async for chunk in chunks:
+                if not stops:
+                    yield chunk
+                    continue
+                if chunk.reasoning:
+                    reasoned.append(chunk.reasoning)
+                if chunk.toolCalls:
+                    _accumulate_tool_calls(
+                        calls,
+                        [c.model_dump(mode="json", exclude_none=True) for c in chunk.toolCalls],
+                    )
+                if chunk.text:
+                    pending += chunk.text
+                    matches = [(pending.find(stop), stop) for stop in stops if stop in pending]
+                    if matches:
+                        at, matched = min(matches, key=lambda match: match[0])
+                        visible = pending[:at]
+                        emitted.append(visible)
+                        # The backend has no stop-string implementation. Closing its
+                        # stream triggers its disconnect cancellation; usage is unknown.
+                        await chunks.aclose()
+                        if visible:
+                            yield replace(chunk, text=visible)
+                        yield Chunk(
+                            done=True,
+                            result=GenerateResponse(
+                                content="".join(emitted),
+                                reasoning="".join(reasoned) or None,
+                                toolCalls=_finish_tool_calls(calls) or None,
+                                finishReason=FinishReason.stop,
+                                stopSequence=matched,
+                                backend=self.backend_kind,
+                                modelId=self.resolve_model(request.model).id,
+                                requestId=request.requestId,
+                                latencyMs=int((time.perf_counter() - started) * 1000),
+                            ),
+                        )
+                        return
+                    keep = max(
+                        (
+                            length
+                            for stop in stops
+                            for length in range(1, min(len(stop), len(pending) + 1))
+                            if pending.endswith(stop[:length])
+                        ),
+                        default=0,
+                    )
+                    visible = pending[:-keep] if keep else pending
+                    pending = pending[-keep:] if keep else ""
+                    emitted.append(visible)
+                    if visible:
+                        yield replace(chunk, text=visible)
+                    continue
+                if pending and (chunk.done or chunk.toolCalls or chunk.reasoning):
+                    emitted.append(pending)
+                    yield Chunk(text=pending)
+                    pending = ""
+                if chunk.done and chunk.result is not None:
+                    chunk = replace(
+                        chunk,
+                        result=chunk.result.model_copy(
+                            update={
+                                "content": "".join(emitted) if emitted else chunk.result.content
+                            }
+                        ),
+                    )
+                yield chunk
 
     def _warn_seed_left_out(self, seed: int, target: _Target) -> None:
         """Said once per model per engine, as every setting that is left out is."""

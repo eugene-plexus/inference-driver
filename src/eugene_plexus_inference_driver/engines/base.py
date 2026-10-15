@@ -360,6 +360,8 @@ def refuse_unsupported_settings(
 ) -> None:
     """An explicit caller constraint cannot be treated as an adapter default.
 
+    Reasoning effort is a preference, not a constraint; unsupported effort is dropped.
+
     `because` is the observed cause, in words, where the refusal has one beyond "this engine
     cannot" (a request that carries tools to a model whose tools are off): it is said in the
     refusal, so the person reads why and not only what.
@@ -382,7 +384,7 @@ def refuse_unsupported_settings(
         "webSearchOptions": "web_search_options",
     }
     for field in request.callerSettings or []:
-        if field in unsupported:
+        if field in unsupported and field != "reasoningEffort":
             raise CliError(
                 f"{names.get(field, field)}: this engine cannot honor this explicit setting"
                 f"{why}; remove it or select a backend that supports it.",
@@ -462,13 +464,17 @@ def warn_dropped_sampling(
     else:
         unsupported -= set(TOOL_COMPANION_SETTINGS)
     refuse_unsupported_settings(request, unsupported=unsupported)
-    for field, value in (("topP", request.topP), ("seed", request.seed)):
+    for field, value in (
+        ("topP", request.topP),
+        ("seed", request.seed),
+        ("reasoningEffort", request.reasoningEffort),
+    ):
         if value is None or field in warned:
             continue
         warned.add(field)
         log.warning(
             "%s cannot carry `%s` to %r -- the harness on the other side of the "
-            "pipe owns its own sampler -- so the parameter was dropped and the "
+            "pipe owns these generation settings -- so the parameter was dropped and the "
             "request was answered. Said once per parameter for the life of this "
             "engine.",
             engine,
