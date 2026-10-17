@@ -1,4 +1,4 @@
-"""Strata's OpenAI HTTP endpoint: text chat, tool calls and structured output.
+"""Strata's OpenAI HTTP endpoint: chat, optional images, tools and structured output.
 
 Reuse transport, incremental reasoning, usage and cancellation. Caller stop
 strings are enforced here on visible answer text; Strata only handles its model's
@@ -347,7 +347,25 @@ class StrataHttpEngine(OpenAiCompatibleHttpEngine):
         raise RerankUnsupported("Strata serves text chat only")
 
     async def probe_image_input(self) -> bool:
-        return False
+        try:
+            response = await self._client().get("/v1/status", headers=self._headers(), timeout=2.0)
+            if response.status_code != 200:
+                return False
+            body = response.json()
+            if not isinstance(body, dict):
+                return False
+            vision = body.get("vision")
+            return (
+                body.get("service") == "strata"
+                and body.get("model") == self._upstream_model_id
+                and body.get("loaded") is True
+                and isinstance(vision, dict)
+                and vision.get("enabled") is True
+                and vision.get("available") is True
+                and not vision.get("error")
+            )
+        except (httpx.HTTPError, ValueError, TimeoutError):
+            return False
 
     async def probe_audio_input(self) -> bool:
         return False

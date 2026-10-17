@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 from pathlib import Path
@@ -10,6 +12,7 @@ import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from eugene_plexus_inference_driver._generated.models import (
     GenerateRequest,
@@ -24,6 +27,50 @@ from eugene_plexus_inference_driver.engines.strata_http import StrataHttpEngine
 from eugene_plexus_inference_driver.settings import Settings
 
 BASE = "http://127.0.0.1:8095"
+
+
+@pytest.mark.anyio
+@respx.mock
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({}, True),
+        ({"vision": {"enabled": False, "available": False}}, False),
+        ({"vision": None}, False),
+        ({"vision": {"enabled": "true", "available": True}}, False),
+        ({"vision": {"enabled": True, "available": True, "error": "failed"}}, False),
+        ({"model": "other"}, False),
+        ({"service": "other"}, False),
+        ({"loaded": False}, False),
+    ],
+)
+async def test_image_support_is_read_from_the_running_model(changes, expected):
+    status = {
+        "service": "strata",
+        "model": "qwen",
+        "loaded": True,
+        "vision": {"enabled": True, "available": True, "error": None},
+    }
+    route = respx.get(f"{BASE}/v1/status").respond(200, json={**status, **changes})
+    engine = StrataHttpEngine(base_url=BASE, model_id="qwen", auth_required=False)
+    try:
+        assert await engine.probe_image_input() is expected
+        route.respond(200, json={**status, "vision": {"enabled": False}})
+        assert not await engine.probe_image_input()
+    finally:
+        await engine.aclose()
+
+
+@pytest.mark.anyio
+@respx.mock
+@pytest.mark.parametrize("response", [httpx.Response(503), httpx.Response(200, text="broken")])
+async def test_image_support_is_not_claimed_when_status_cannot_be_read(response):
+    respx.get(f"{BASE}/v1/status").mock(return_value=response)
+    engine = StrataHttpEngine(base_url=BASE, model_id="qwen", auth_required=False)
+    try:
+        assert not await engine.probe_image_input()
+    finally:
+        await engine.aclose()
 
 
 def test_supported_settings_are_what_strata_reads_and_not_what_it_has_never_shown():
@@ -172,6 +219,37 @@ async def _serve(engine: StrataHttpEngine, request: GenerateRequest, stream: boo
         _ = [chunk async for chunk in engine.stream(request)]
     else:
         await engine.generate(request)
+
+
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+def test_strata_advertises_and_forwards_images(tmp_path, stream):
+    respx.get(f"{BASE}/v1/status").respond(
+        200,
+        json={
+            "service": "strata",
+            "model": "qwen",
+            "loaded": True,
+            "vision": {"enabled": True, "available": True, "error": None},
+        },
+    )
+    route = respx.post(f"{BASE}/v1/chat/completions").mock(side_effect=_chat)
+    image = io.BytesIO()
+    Image.new("RGB", (1, 1), "red").save(image, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(image.getvalue()).decode("ascii")
+    content = [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]
+    with _strata_app(tmp_path) as client:
+        info = client.get("/v1/info").json()
+        assert info["models"][0]["capabilities"]["imageInput"] is True
+        response = client.post(
+            "/v1/generate/stream" if stream else "/v1/generate",
+            json={"messages": [{"role": "user", "content": content}]},
+        )
+    assert response.status_code == 200, response.text
+    assert json.loads(route.calls[-1].request.content)["messages"][0]["content"] == content
 
 
 @respx.mock
