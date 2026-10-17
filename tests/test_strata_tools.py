@@ -896,7 +896,16 @@ def test_a_part_that_is_not_text_is_refused_before_strata_is_asked(
     """The check that used to sit in `StrataHttpEngine._payload_for` ("text messages only") was
     dead code: a message's content there is a typed object, never a Python `list`, so it
     never fired. The route is what refuses, and it does so for every engine whose backend has
-    not confirmed the input: a 400 that says what the backend lacks, before anything is sent."""
+    not confirmed the input: a 400 that says what the backend lacks, before inference is sent."""
+    status = respx.get(f"{BASE}/v1/status").respond(
+        200,
+        json={
+            "service": "strata",
+            "model": MODEL,
+            "loaded": True,
+            "vision": {"enabled": False, "available": False},
+        },
+    )
     chat = respx.post(CHAT).mock(return_value=httpx.Response(200, json=_text_reply("Hello!")))
     body = {
         "messages": [
@@ -909,7 +918,8 @@ def test_a_part_that_is_not_text_is_refused_before_strata_is_asked(
     detail = response.json()["detail"]
     assert detail["title"] == title
     assert "capabilities." in detail["detail"] and "must be true" in detail["detail"]
-    assert not chat.called, "nothing was sent to Strata"
+    assert status.called is (part["type"] == "image_url")
+    assert not chat.called, "no inference was sent to Strata"
 
 
 @respx.mock
