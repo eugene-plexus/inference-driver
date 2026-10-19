@@ -391,8 +391,11 @@ def test_through_the_app_the_first_request_is_a_400_and_info_then_says_false(
         (before,) = client.get("/v1/info").json()["models"]
         assert before["capabilities"]["toolCalling"] is True
         assert "tools" in before["capabilities"]["supportedSettings"]
-        # llama-server honours what it is sent: nothing to name (absent, not an empty list).
-        assert "settingsNotHonoured" not in before["capabilities"]
+        # llama-server honours what it is sent, but for reasoning effort: its template takes
+        # `none` (thinking off, MR8) and nothing else, so only those efforts are named.
+        gaps = before["capabilities"].get("settingsNotHonoured") or []
+        assert [g["setting"] for g in gaps] == ["reasoningEffort"]
+        assert "none" not in gaps[0]["values"]
 
         first = client.post(path, json=_body())
         assert first.status_code == 400, first.text

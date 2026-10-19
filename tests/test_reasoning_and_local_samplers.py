@@ -568,3 +568,70 @@ def test_the_stream_route_frames_reasoning_as_its_own_token(client: TestClient) 
     assert tokens == [{"reasoning": "ROUTETHOUGHT"}, {"text": "answer"}]
     done = next(b for b in response.text.split("\n\n") if b.startswith("event: done"))
     assert json.loads(done.split("data: ", 1)[1])["reasoning"] == "ROUTETHOUGHT"
+
+
+# --------------------------------------------------------------------------- #
+# reasoning_effort: none to llama.cpp (MR8, 2026-10-18)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@respx.mock
+async def test_effort_none_turns_a_llama_cpp_templates_thinking_off(stream: bool) -> None:
+    """llama-server takes no `reasoning_effort`, but Qwen's templates take `enable_thinking`:
+    measured, 258 of 258 suggestion calls thought by default and 0 of 86 with it false."""
+    route = respx.post(f"{BASE}/v1/chat/completions")
+    route.side_effect = [
+        _sse("llamacpp_b10948_thinking_hits_length.sse")
+        if stream
+        else httpx.Response(200, json=_vllm_reply(content="hi", finish_reason="stop"))
+    ]
+    engine = _engine()
+    engine._llama_cpp = True  # what its `/props` said
+    request = _ask(reasoningEffort="none", callerSettings=["reasoningEffort"])
+    if stream:
+        await _drain(engine, request)
+    else:
+        await engine.generate(request)
+    payload = _sent(route)
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in payload
+    assert engine.ignored_settings(request) == [], "it was honoured, so it is not named"
+    assert "reasoningEffort" in engine.supported_settings, "offered, so the gateway sends it"
+    gap = next(g for g in engine.settings_not_honoured() if g.setting == "reasoningEffort")
+    assert "none" not in gap.values and "high" in gap.values
+
+
+@respx.mock
+async def test_other_efforts_and_other_backends_are_still_dropped_and_named() -> None:
+    route = respx.post(f"{BASE}/v1/chat/completions")
+    route.side_effect = [
+        httpx.Response(200, json=_vllm_reply(content="hi", finish_reason="stop")) for _ in range(2)
+    ]
+    llama = _engine()
+    llama._llama_cpp = True
+    high = _ask(reasoningEffort="high", callerSettings=["reasoningEffort"])
+    await llama.generate(high)
+    assert "chat_template_kwargs" not in _sent(route, 0)
+    assert llama.ignored_settings(high) == ["reasoningEffort"]
+    respx.get(f"{BASE}/props").mock(return_value=httpx.Response(404))
+    unknown = _engine()  # asked, and not llama.cpp
+    none = _ask(reasoningEffort="none", callerSettings=["reasoningEffort"])
+    await unknown.generate(none)
+    assert "chat_template_kwargs" not in _sent(route, 1)
+    assert unknown.ignored_settings(none) == ["reasoningEffort"]
+
+
+@respx.mock
+async def test_a_driver_nobody_polled_asks_its_backend_before_deciding() -> None:
+    """The first request to a fresh driver: no `/v1/info` poll has read `/props` yet, and
+    guessing "not llama.cpp" would let the model think (MR8's live run, 2026-10-18)."""
+    props = respx.get(f"{BASE}/props").mock(
+        return_value=httpx.Response(200, json={"default_generation_settings": {"n_ctx": 8192}})
+    )
+    route = respx.post(f"{BASE}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_vllm_reply(content="hi", finish_reason="stop"))
+    )
+    await _engine().generate(_ask(reasoningEffort="none", callerSettings=["reasoningEffort"]))
+    assert props.called
+    assert _sent(route)["chat_template_kwargs"] == {"enable_thinking": False}

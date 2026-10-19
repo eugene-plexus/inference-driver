@@ -1553,7 +1553,16 @@ class OpenAiCompatibleHttpEngine:
         are not here. Every other backend this engine fronts honours what it is sent, or
         refuses what it cannot take, in `_payload_for`.
         """
-        return unread_tool_settings() if self._dialect.catalogue == "ollama" else []
+        gaps = unread_tool_settings() if self._dialect.catalogue == "ollama" else []
+        if self._effort_by_template():
+            gaps = [
+                *gaps,
+                SettingNotHonoured(
+                    setting="reasoningEffort",
+                    values=[e.value for e in ReasoningEffort if e is not ReasoningEffort.none],
+                ),
+            ]
+        return gaps
 
     def _gaps_for(self, target: _Target) -> list[SettingNotHonoured]:
         """What this backend does not honour for the model one request is for.
@@ -1665,6 +1674,29 @@ class OpenAiCompatibleHttpEngine:
         ):
             named.append("reasoningEffort")
         return named
+
+    async def _know_if_llama_cpp(self, request: GenerateRequest) -> None:
+        """Ask the backend whether it is llama.cpp before `reasoning_effort: none` is decided,
+        when no `/props` probe has said yet: a driver the gateway has not polled is the first
+        to hear a request, and a guess of no would let the model think (MR8's live run)."""
+        hosted = self._dialect.openai_parameters or self._dialect.catalogue == "openrouter"
+        if (
+            request.reasoningEffort is ReasoningEffort.none
+            and self._llama_cpp is None
+            and not hosted
+        ):
+            await self._answers_as_llama_cpp()
+
+    def _effort_by_template(self) -> bool:
+        """Whether `reasoning_effort` is taken here by the chat template (MR8, 2026-10-18).
+
+        llama-server reads no effort, but its chat template takes `enable_thinking`, and
+        Qwen3's, Qwen3.5's and Qwen3.6's turn thinking off by it (measured: 0 of 258 suggestion
+        calls thought, against 31-100% by default). So for a backend `/props` says is llama.cpp
+        the setting is offered, `none` is sent as `chat_template_kwargs.enable_thinking: false`,
+        and every other effort is reported not honoured (`settings_not_honoured`), dropped and
+        named. A template without the variable ignores it; such a model still answers."""
+        return self._llama_cpp is True and not self._dialect.openai_parameters
 
     def resolve_model(self, requested: str | None) -> _Target:
         """The model a request is for, or `ModelNotServed` / `ModelRequired`.
@@ -1885,6 +1917,8 @@ class OpenAiCompatibleHttpEngine:
             # setting it does not name is one OpenRouter would drop.
             listed = set(caps.supportedSettings or [])
             unsupported |= _ALL_ENGINE_SETTINGS - listed
+        if self._effort_by_template():
+            unsupported.discard("reasoningEffort")  # `none` is honoured; the rest are named
         return frozenset(unsupported)
 
     def _payload_for(
@@ -2069,7 +2103,12 @@ class OpenAiCompatibleHttpEngine:
         if request.logitBias is not None:
             payload["logit_bias"] = dict(request.logitBias)
         if request.reasoningEffort is not None:
-            if "reasoningEffort" in unsupported:
+            if self._effort_by_template():
+                if request.reasoningEffort is ReasoningEffort.none:
+                    payload["chat_template_kwargs"] = {"enable_thinking": False}
+                else:
+                    self._warn_dropped("reasoning_effort", target)
+            elif "reasoningEffort" in unsupported:
                 self._warn_dropped("reasoning_effort", target)
             else:
                 payload["reasoning_effort"] = request.reasoningEffort.value
@@ -2303,6 +2342,7 @@ class OpenAiCompatibleHttpEngine:
         started = time.perf_counter()
         target = self.resolve_model(request.model)
         forced = await self._forced_tool(request)
+        await self._know_if_llama_cpp(request)
         payload = self._payload_for(request, target, forced)
         if slot is not None:
             payload["id_slot"] = slot
@@ -2511,6 +2551,7 @@ class OpenAiCompatibleHttpEngine:
             return
         target = self.resolve_model(request.model)
         forced = await self._forced_tool(request)
+        await self._know_if_llama_cpp(request)
         payload = self._payload_for(request, target, forced)
         if slot is not None:
             payload["id_slot"] = slot
