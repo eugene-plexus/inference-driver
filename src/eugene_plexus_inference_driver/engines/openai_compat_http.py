@@ -573,6 +573,13 @@ _HINTS: tuple[tuple[str, str], ...] = (
     ("safetyIdentifier", "safety_identifier"),
 )
 
+# PC6: the client's `cache_control` (`GenerateRequest.cacheControl`) is carried to the
+# one provider known to act on it through this engine: an OpenRouter model Anthropic
+# serves, whose id starts `anthropic/`. OpenRouter then places the breakpoint after the
+# last message, so each earlier turn is cached. A hint, never refused: elsewhere it is
+# dropped with a warning once, like the hints above.
+_CACHE_CONTROL_MODELS = "anthropic/"
+
 # Settings a fixed-sampler model rejects along with `temperature`: OpenAI's
 # reasoning models refuse the penalties as they refuse the sampler itself.
 _FIXED_SAMPLER_SETTINGS = frozenset({"temperature", "topP", "frequencyPenalty", "presencePenalty"})
@@ -1479,12 +1486,18 @@ class OpenAiCompatibleHttpEngine:
             gaps += [gap for gap in unlisted if all(gap.setting != named.setting for named in gaps)]
         learned = model.id in self._tools_refused
         off = learned or (chat and caps.toolCalling is False)
-        if not gaps and not off and not unlisted:
+        # PC6: the hint is no listed parameter, so a provider's own listing never names it.
+        caches = (
+            chat
+            and self._carries_cache_control(model.upstreamId or model.id)
+            and "cacheControl" not in (caps.supportedSettings or [])
+        )
+        if not gaps and not off and not unlisted and not caches:
             return model
         update: dict[str, Any] = {}
         if gaps:
             update["settingsNotHonoured"] = gaps
-        if off or unlisted:
+        if off or unlisted or caches:
             offered = list(caps.supportedSettings or [])
             offered += [gap.setting for gap in unlisted if gap.setting not in offered]
             if learned:
@@ -1495,6 +1508,8 @@ class OpenAiCompatibleHttpEngine:
                 # with them offered, once each (a list may already name one).
                 offered = [s for s in offered if s != "tools"]
                 offered += [s for s in TOOL_COMPANION_SETTINGS if s not in offered]
+            if caches:
+                offered.append("cacheControl")
             update["supportedSettings"] = offered
         return model.model_copy(update={"capabilities": caps.model_copy(update=update)})
 
@@ -1885,7 +1900,17 @@ class OpenAiCompatibleHttpEngine:
         names, intersected with what this engine can send at all.
         """
         unsupported = self._unsupported_settings(target)
-        return [field for field in _ENGINE_SETTINGS if field not in unsupported]
+        offered = [field for field in _ENGINE_SETTINGS if field not in unsupported]
+        # The hint is named here and never refused (`_carries_cache_control`).
+        return (
+            [*offered, "cacheControl"] if self._carries_cache_control(target.upstream) else offered
+        )
+
+    def _carries_cache_control(self, upstream: str) -> bool:
+        """Whether a request's `cacheControl` hint is sent to this model (PC6)."""
+        return self._dialect.catalogue == "openrouter" and upstream.startswith(
+            _CACHE_CONTROL_MODELS
+        )
 
     def _unsupported_settings(self, target: _Target) -> frozenset[str]:
         """What this backend cannot carry, whoever asks.
@@ -2128,6 +2153,14 @@ class OpenAiCompatibleHttpEngine:
                 payload[theirs] = getattr(value, "value", value)
             else:
                 self._warn_dropped(theirs, target)
+        if request.cacheControl is not None:
+            if self._carries_cache_control(target.upstream):
+                payload["cache_control"] = {
+                    "type": "ephemeral",
+                    **({"ttl": request.cacheControl.ttl.value} if request.cacheControl.ttl else {}),
+                }
+            else:
+                self._warn_dropped("cache_control", target)
         if request.audioOutput is not None:
             # **Always `pcm16`, whatever was asked** (P2b): every
             # audio-output model behind an account answers audio only on

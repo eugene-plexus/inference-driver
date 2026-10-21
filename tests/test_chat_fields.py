@@ -135,10 +135,15 @@ def _sse(*frames: dict[str, Any]) -> httpx.Response:
     return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
 
 
-def _serve(config: Path, upstream: httpx.Response, base: str = OPENROUTER):
+def _serve(
+    config: Path,
+    upstream: httpx.Response,
+    base: str = OPENROUTER,
+    listing: dict[str, Any] = LISTING,
+):
     if base == OPENROUTER:
         respx.get(f"{OPENROUTER}/v1/models/user").mock(
-            return_value=httpx.Response(200, json=LISTING)
+            return_value=httpx.Response(200, json=listing)
         )
         respx.get(f"{OPENROUTER}/v1/images/models").mock(
             return_value=httpx.Response(200, json={"data": []})
@@ -355,6 +360,132 @@ def test_hints_are_dropped_where_no_backend_takes_them(tmp_path: Path) -> None:
         "service_tier",
         "safety_identifier",
     } & set(sent)
+
+
+#: Two models whose listings say nothing about caching, as OpenRouter's say none:
+#: whether one takes `cache_control` is the provider's name, not a listed parameter.
+CACHE_LISTING = {
+    "data": [
+        _or_model("anthropic/claude-sonnet-4.5", ["max_tokens", "tools"]),
+        _or_model("openai/gpt-5", ["max_tokens", "tools"]),
+    ]
+}
+
+
+def _cached_ask(model: str, **hint: Any) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "cacheControl": hint,
+    }
+
+
+@respx.mock
+def test_cache_control_reaches_openrouter_anthropic_models_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PC6: the client's mark rides as one request-level `cache_control`, which
+    OpenRouter places after the last message, to an `anthropic/*` model only. A
+    model that cannot carry it is sent none and the drop is said once."""
+    client, upstream = _serve(
+        _account(tmp_path), httpx.Response(200, json=_completion()), listing=CACHE_LISTING
+    )
+    with client, caplog.at_level("WARNING"):
+        _ready(client)
+        models = {m["id"]: m for m in client.get("/v1/info").json()["models"]}
+        for _ in range(2):
+            first = client.post("/v1/generate", json=_cached_ask("anthropic/claude-sonnet-4.5"))
+            second = client.post("/v1/generate", json=_cached_ask("openai/gpt-5", ttl="1h"))
+            assert first.status_code == 200 and second.status_code == 200, (first.text, second.text)
+    sent = {}
+    for call in upstream.calls:
+        body = json.loads(call.request.content)
+        sent.setdefault(body["model"], []).append(body)
+    claude, gpt = sent["anthropic/claude-sonnet-4.5"], sent["openai/gpt-5"]
+    assert all(b["cache_control"] == {"type": "ephemeral"} for b in claude)
+    assert all("cache_control" not in json.dumps(b["messages"]) for b in claude)
+    assert all("cache_control" not in b for b in gpt)
+    # Listed for the model that carries it, so the gateway can say what arrived.
+    assert (
+        "cacheControl" in models["anthropic/claude-sonnet-4.5"]["capabilities"]["supportedSettings"]
+    )
+    assert "cacheControl" not in models["openai/gpt-5"]["capabilities"]["supportedSettings"]
+    assert sum("`cache_control`" in r.getMessage() for r in caplog.records) == 1
+
+
+@respx.mock
+def test_the_cache_ttl_is_sent_with_the_mark(tmp_path: Path) -> None:
+    client, upstream = _serve(
+        _account(tmp_path), httpx.Response(200, json=_completion()), listing=CACHE_LISTING
+    )
+    with client:
+        _ready(client)
+        response = client.post(
+            "/v1/generate", json=_cached_ask("anthropic/claude-sonnet-4.5", ttl="1h")
+        )
+    assert response.status_code == 200, response.text
+    assert json.loads(upstream.calls[0].request.content)["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+
+
+@respx.mock
+def test_a_request_that_marked_nothing_sends_no_cache_control(tmp_path: Path) -> None:
+    """Carry the client's, add none."""
+    client, upstream = _serve(
+        _account(tmp_path), httpx.Response(200, json=_completion()), listing=CACHE_LISTING
+    )
+    with client:
+        _ready(client)
+        response = client.post(
+            "/v1/generate",
+            json={
+                "model": "anthropic/claude-sonnet-4.5",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert "cache_control" not in json.loads(upstream.calls[0].request.content)
+
+
+@respx.mock
+def test_a_stream_carries_the_mark_too(tmp_path: Path) -> None:
+    client, upstream = _serve(
+        _account(tmp_path),
+        _sse({"choices": [{"delta": {"content": "Red"}, "finish_reason": "stop"}]}),
+        listing=CACHE_LISTING,
+    )
+    with client:
+        _ready(client)
+        response = client.post(
+            "/v1/generate/stream", json=_cached_ask("anthropic/claude-sonnet-4.5", ttl="5m")
+        )
+    assert response.status_code == 200, response.text
+    assert json.loads(upstream.calls[0].request.content)["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+
+
+@respx.mock
+def test_openai_itself_drops_the_mark_with_a_warning(tmp_path: Path) -> None:
+    config = tmp_path / "openai.yaml"
+    config.write_text(
+        json.dumps({"provider": "openai", "apiKey": "sk-test", "modelId": "gpt-4o-mini"}), "utf-8"
+    )
+    respx.get(f"{OPENAI}/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "gpt-4o-mini", "object": "model"}]})
+    )
+    upstream = respx.post(f"{OPENAI}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_completion())
+    )
+    with TestClient(create_app(settings=Settings(config_file=config))) as client:
+        response = client.post("/v1/generate", json=_cached_ask("gpt-4o-mini"))
+        models = client.get("/v1/info").json()["models"]
+    assert response.status_code == 200, response.text
+    assert "cache_control" not in json.loads(upstream.calls[0].request.content)
+    assert all("cacheControl" not in m["capabilities"]["supportedSettings"] for m in models)
 
 
 # --------------------------------------------------------------------------- #

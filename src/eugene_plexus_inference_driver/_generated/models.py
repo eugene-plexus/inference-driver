@@ -1650,39 +1650,20 @@ class PathMapping(BaseModel):
     )
 
 
-class LibraryFolder(BaseModel):
+class LibraryFolderKind(StrEnum):
     """
-    One directory the library catalogues, and where other machines
-    find it (2026-09-14).
-
-    `path` is the directory as the library's own host spells it —
-    what the scanner walks, what a `ModelSummary.path` starts with,
-    the left-hand side of every rule that reaches it. `mounts` is
-    the same directory as **other** machines see it: a POSIX-shaped
-    entry is for Linux and macOS nodes, a Windows-shaped one (drive
-    letter or UNC) for Windows nodes, and a node takes the first
-    entry of its own shape. That is the whole of "how does node X
-    reach folder Y" for every node that mounts the share where the
-    folder says; a node that mounts it elsewhere carries one
-    override in its agent's `pathMappings`, and a node with no
-    mount of its shape opens `path` as written — the identical-mount
-    convention, and every single-host install.
-
-    The rule this replaces was per node per folder, on each node's
-    agent, and grew as nodes × folders with every row typed by hand.
-    This is per folder, stated once. Nothing is copied or cached:
-    the operator mounts the share, this says where.
+    What the library reads in a folder (CX9, 2026-10-20). `folder`:
+    model files, walked as they are. `ollama`: an Ollama model store
+    (the directory holding `blobs/` and `manifests/` or
+    `manifests-v2/`), read through its manifests and **never written
+    to** -- no download, provenance, prepared file or delete lands
+    there. Its models are Ollama's: one that Ollama removes goes
+    `missing`.
 
     """
 
-    path: str = Field(
-        ...,
-        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
-    )
-    mounts: list[str] | None = Field(
-        [],
-        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
-    )
+    folder = 'folder'
+    ollama = 'ollama'
 
 
 class DirectoryEntryKind(StrEnum):
@@ -1695,6 +1676,40 @@ class DirectoryEntryKind(StrEnum):
 
     directory = 'directory'
     file = 'file'
+
+
+class CacheTtl(StrEnum):
+    """
+    How long the client asked a cached prompt prefix to be kept:
+    Anthropic's `cache_control.ttl`. Absent means the provider's
+    own default, which is five minutes.
+
+    """
+
+    field_5m = '5m'
+    field_1h = '1h'
+
+
+class CacheControlHint(BaseModel):
+    """
+    The client marked part of the prompt for caching (Anthropic's
+    `cache_control`, on the request, the system prompt, a message, a
+    tool or a tool result). **Carry the client's, add none**
+    (`docs/design/prompt-cache.md`, PC6): a request whose client marked
+    nothing has no hint, and pays what it would pay upstream.
+
+    A hint, like `promptCacheKey`: never listed in `callerSettings`,
+    never a routing input. A backend that cannot carry it drops it
+    with a warning once. `capabilities.supportedSettings` names
+    `cacheControl` for each model whose adapter carries it, so the
+    gateway can say which of the client's marks arrived.
+
+    `ttl` is the longest the client sent on any mark; absent when no
+    mark named one.
+
+    """
+
+    ttl: CacheTtl | None = None
 
 
 class TokenCount(BaseModel):
@@ -2814,6 +2829,46 @@ class ConfigFieldStatus(BaseModel):
     text: str
 
 
+class LibraryFolder(BaseModel):
+    """
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
+
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
+
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
+
+    """
+
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
+    )
+    kind: LibraryFolderKind | None = 'folder'
+    found: bool | None = Field(
+        None,
+        description='Not in `modelRoots`: the library found it on its own machine\n(an Ollama store, CX9) and lists it while `findOllama` is on.\nAbsent or false for a folder someone added.\n',
+    )
+
+
 class DirectoryEntry(BaseModel):
     name: str
     path: str = Field(
@@ -3541,7 +3596,7 @@ class Capabilities(BaseModel):
 
     supportedSettings: list[str] | None = Field(
         None,
-        description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
+        description="Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n\nIt also names the hint `cacheControl` for each model whose\nadapter carries it (an OpenRouter `anthropic/*` model). A hint\nis never refused, so the name is not for routing: the gateway\nreads it to say, on its ignored-settings header, which of the\nclient's `cache_control` marks the answering backend did not\ncarry.\n",
     )
     settingsNotHonoured: list[SettingNotHonoured] | None = Field(
         None,
@@ -3798,7 +3853,7 @@ class GenerateRequest(BaseModel):
     )
     callerSettings: list[str] | None = Field(
         None,
-        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls; since P2c logprobs, logitBias,\nreasoningEffort, verbosity, prediction, webSearchOptions). `topLogprobs`\nrides with `logprobs`. The hints (`promptCacheKey`,\n`promptCacheRetention`, `serviceTier`, `safetyIdentifier`) are never\nlisted: a backend that cannot carry a hint drops it. The gateway preserves this\nlist on each fallback attempt, except `reasoningEffort` when the selected\nbackend does not support it: effort is a preference, omitted and named\nin the gateway's ignored-settings header. Drivers also omit unsupported\neffort without refusing a direct request, even when this list names it.\nAn adapter must refuse other known unsupported explicit settings with 400,\nrather than silently dropping them. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
+        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls; since P2c logprobs, logitBias,\nreasoningEffort, verbosity, prediction, webSearchOptions). `topLogprobs`\nrides with `logprobs`. The hints (`promptCacheKey`,\n`promptCacheRetention`, `serviceTier`, `safetyIdentifier`,\n`cacheControl`) are never\nlisted: a backend that cannot carry a hint drops it. The gateway preserves this\nlist on each fallback attempt, except `reasoningEffort` when the selected\nbackend does not support it: effort is a preference, omitted and named\nin the gateway's ignored-settings header. Drivers also omit unsupported\neffort without refusing a direct request, even when this list names it.\nAn adapter must refuse other known unsupported explicit settings with 400,\nrather than silently dropping them. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
     )
     completion: CompletionPrompt | None = None
     messages: list[Message] = Field(
@@ -3889,6 +3944,7 @@ class GenerateRequest(BaseModel):
     safetyIdentifier: str | None = Field(
         None, description='A hint, as `promptCacheKey`.'
     )
+    cacheControl: CacheControlHint | None = None
     conversationKey: str | None = Field(
         None,
         description="**Internal, from the gateway: never forwarded upstream** (CB4,\n2026-10-02). The conversation this turn continues, as the\ngateway's affinity table keys it. A driver with\n`slotPinning` on (llama-server only, set by the agent with\n`--no-cache-idle-slots`) keeps each conversation in one\nengine slot by `id_slot`, least recently used out, and\n**never names a slot that is busy**: a turn whose slot is\nbusy, or a new conversation when no slot is idle, waits in\nthe driver. Measured: pinning a request to a busy slot\nwedged llama-server b11211 for up to 30 minutes; waiting in\nfront of it, no stall in 1,224 turns. Absent, a turn takes\nany idle slot and keeps none.\n",
