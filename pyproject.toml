@@ -23,6 +23,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "av>=19,<20",
     "pillow>=12.3,<13",
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.32,<1",
