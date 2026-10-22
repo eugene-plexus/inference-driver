@@ -174,7 +174,9 @@ async def test_a_gateway_that_gave_up_cancels_the_generation() -> None:
 async def test_a_gateway_that_gave_up_cancels_the_embedding() -> None:
     adapter = _HangingAdapter()
     body = EmbedRequest(input=["hi"])
-    await _drive(adapter, lambda r: embed(r, body))
+    from fastapi import Response
+
+    await _drive(adapter, lambda r: embed(r, body, Response()))
     assert adapter.cancelled
     assert not adapter.finished
 

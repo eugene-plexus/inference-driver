@@ -241,7 +241,7 @@ def _cannot_count(reason: str, kind_label: str) -> HTTPException:
 
 
 @router.post("/v1/embed", response_model=EmbedResponse)
-async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
+async def embed(request: Request, body: EmbedRequest, response: Response) -> EmbedResponse:
     """Text in, vectors out, in the order the text arrived.
 
     **Refused, never substituted.** A backend that cannot embed gets a
@@ -289,9 +289,15 @@ async def embed(request: Request, body: EmbedRequest) -> EmbedResponse:
 
     token = request_id.set(str(body.requestId) if body.requestId else None)
     try:
+        kwargs: dict[str, Any] = {"model": body.model}
+        if body.dimensions is not None:
+            if kind_label == "gemini_api":
+                kwargs["dimensions"] = body.dimensions
+            else:
+                response.headers[IGNORED_SETTINGS_HEADER] = "dimensions"
         return await serve_while_connected(
             request,
-            cast(Any, engine).embed(list(body.input), model=body.model),
+            cast(Any, engine).embed(list(body.input), **kwargs),
             what="an embedding",
         )
     except ClientGone as e:

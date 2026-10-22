@@ -57,7 +57,14 @@ VOICES: tuple[str, ...] = (
 )  # fmt: skip
 
 #: Gemini's speech output: PCM, 24 kHz, 16-bit, mono (G5).
-SPEECH_FORMATS: tuple[SpeechFormat, ...] = (SpeechFormat.wav, SpeechFormat.pcm)
+SPEECH_FORMATS: tuple[SpeechFormat, ...] = (
+    SpeechFormat.mp3,
+    SpeechFormat.opus,
+    SpeechFormat.wav,
+    SpeechFormat.pcm,
+    SpeechFormat.aac,
+    SpeechFormat.flac,
+)
 
 #: What a chat setting is worth on the wire; the rest are refused (A2).
 CHAT_SETTINGS: tuple[str, ...] = (

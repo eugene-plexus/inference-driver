@@ -200,7 +200,7 @@ def test_the_listing_is_paged_and_mapped_to_surfaces_and_capabilities(tmp_path: 
     assert models["gemini-3.1-flash-image"]["surfaces"] == ["image"]
     speech = models["gemini-3.8-flash-tts"]
     assert speech["surfaces"] == ["speech"] and len(speech["voices"]) == 30
-    assert [f for f in speech["capabilities"]["speechFormats"]] == ["wav", "pcm"]
+    assert speech["capabilities"]["speechFormats"] == ["mp3", "opus", "wav", "pcm", "aac", "flac"]
     assert models["gemini-3.5-transcribe"]["surfaces"] == ["transcription"]
     assert models["gemini-embedding-001"]["surfaces"] == ["embeddings"]
     video = models["veo-3.1-generate-preview"]
@@ -1621,15 +1621,13 @@ def test_speech_is_a_complete_wav_made_from_geminis_pcm(tmp_path: Path) -> None:
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}},
         },
     }
-    assert default.headers["content-type"] == "audio/wav" and default.content[:4] == b"RIFF"
+    assert default.headers["content-type"] == "audio/mpeg" and len(default.content) > 0
     assert pcm.headers["content-type"] == "audio/pcm" and pcm.content == PCM
 
 
 @pytest.mark.parametrize(
     ("fields", "named"),
     [
-        ({"format": "mp3"}, "wav, pcm"),
-        ({"format": "opus"}, "wav, pcm"),
         ({"speed": 1.5}, "speed"),
         ({"instructions": "cheerful"}, "instructions"),
     ],
