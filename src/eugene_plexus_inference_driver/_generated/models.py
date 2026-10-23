@@ -22,6 +22,31 @@ class ToolChoice(StrEnum):
     required = 'required'
 
 
+class ModelRole(StrEnum):
+    """
+    An install-wide job assigned to models through the gateway's
+    `modelSlots`. A client requests `role:<ModelRole>` rather than
+    a particular model. The list is closed: a new role is a contract
+    change, and an unknown `role:` name is refused when saved.
+
+    These are routing roles, separate from a conversation's `Role`.
+    Capability checks warn; they never block role assignment.
+
+    """
+
+    chat = 'chat'
+    agentic = 'agentic'
+    vision = 'vision'
+    reads_pages = 'reads-pages'
+    image = 'image'
+    speech_to_text = 'speech-to-text'
+    text_to_speech = 'text-to-speech'
+    music = 'music'
+    embeddings = 'embeddings'
+    rerank = 'rerank'
+    decision = 'decision'
+
+
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -3134,6 +3159,11 @@ class EmbedRequest(BaseModel):
         None,
         description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
         min_length=1,
+    )
+    dimensions: int | None = Field(
+        None,
+        description='Optional requested vector width. Gemini passes it to\noutputDimensionality on each embedContent request, including\neach entry in batchEmbedContents. A provider refusal names\ndimensions and the observed cause. The driver never truncates\nor pads a vector to imitate this setting. Backends that cannot\napply it keep their native width and name dimensions in\nx-eugene-plexus-ignored-settings; the gateway preserves that\nheader. An untested capability alone never blocks an attempt.\n',
+        ge=1,
     )
     localOnly: bool | None = Field(
         False,

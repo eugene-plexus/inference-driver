@@ -14,7 +14,7 @@ signatures.
 * **A setting Gemini cannot honour is refused** (A2), never sent and ignored --
   except the one it merely does not obey, `parallel_tool_calls: false`, which has
   no field to go in: that is named (`settings_not_honoured`), not refused.
-* **Embeddings, images, Veo video, speech (WAV or PCM, G5) and transcription**
+* **Embeddings, images, Veo video, speech (PCM plus PyAV encodings) and transcription**
   through the routes the other media engines use.
 
 The key rides in `x-goog-api-key` and nowhere else: not in a URL, not in a
@@ -70,6 +70,7 @@ from .._generated.models import (
     VideoRequest,
 )
 from .._http import client_for
+from ..gemini_audio import encode as encode_audio
 from ..images_out import ImageRefusal, sniff
 from ..speech import SpeechRefusal, refuse_format
 from ..transcription import TranscriptionRefusal
@@ -140,8 +141,8 @@ class GeminiApiEngine:
     supports_embeddings = True
     serves_accounts = True
     follows_runtimes = False
-    #: What `/v1/speak` makes when no format is asked for (G5).
-    default_speech_format = SpeechFormat.wav
+    #: Row 58 closes G5: the OpenAI default is available through PyAV.
+    default_speech_format = SpeechFormat.mp3
     #: The settings this engine can carry at all (per model, the listing narrows it).
     supported_settings: ClassVar[list[str]] = list(wire.CHAT_SETTINGS)
 
@@ -732,14 +733,33 @@ class GeminiApiEngine:
             ),
         )
 
+    async def count_prompt_tokens(self, request: GenerateRequest) -> int:
+        target = self.resolve_model(request.model)
+        payload, _ = self._chat_body(request, target)
+        payload["model"] = f"models/{target.upstream}"
+        with self._guard("countTokens"):
+            response = await self._client().post(
+                f"/models/{target.upstream}:countTokens",
+                headers=self._headers(),
+                json={"generateContentRequest": payload},
+            )
+        if response.status_code >= 400:
+            raise self._failure(response, "countTokens")
+        try:
+            count = response.json()["totalTokens"]
+            if type(count) is not int or count < 0:
+                raise ValueError("totalTokens must be a nonnegative integer")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise CliError(f"Gemini countTokens returned invalid totalTokens: {exc}") from exc
+        return count
+
     # -- embeddings --------------------------------------------------------------
 
     async def embed(
         self, inputs: list[str], *, model: str | None = None, dimensions: int | None = None
     ) -> EmbedResponse:
         """`batchEmbedContents`, in batches of 100, vectors in input order.
-        `dimensions` is Google's `outputDimensionality`; the driver's embed
-        route carries none today."""
+        `dimensions` is Google's `outputDimensionality` on every batch entry."""
         started = time.perf_counter()
         target = self.resolve_model(model)
         self._surface(target, "embeddings", "embeddings")
@@ -763,7 +783,9 @@ class GeminiApiEngine:
                     json={"requests": requests},
                 )
             if response.status_code >= 400:
-                raise self._failure(response, "embeddings")
+                raise self._failure(
+                    response, "embeddings dimensions" if dimensions is not None else "embeddings"
+                )
             try:
                 body = response.json()
                 rows = body["embeddings"]
@@ -1057,8 +1079,7 @@ class GeminiApiEngine:
         return target
 
     async def speak(self, request: SpeakRequest) -> AsyncGenerator[bytes, None]:
-        """Speech by `generateContent` with an audio answer: PCM, served as WAV
-        or raw PCM and nothing else (G5)."""
+        """Gemini PCM, served raw, wrapped as WAV, or encoded with PyAV (row 58)."""
         target = self.resolve_speech(request.model)
         asked = request.format or self.default_speech_format
         refuse_format(asked, wire.SPEECH_FORMATS)
@@ -1107,8 +1128,12 @@ class GeminiApiEngine:
         has_header = raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"
         if asked is SpeechFormat.wav:
             yield raw if has_header else wire.wav_of(raw, rate)
-        else:
+        elif asked is SpeechFormat.pcm:
             yield raw[44:] if has_header else raw
+        else:
+            yield await asyncio.to_thread(
+                encode_audio, raw if has_header else wire.wav_of(raw, rate), asked.value
+            )
 
     # -- transcription ---------------------------------------------------------------
 
