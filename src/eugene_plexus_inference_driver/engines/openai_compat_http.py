@@ -610,6 +610,10 @@ _ENGINE_SETTINGS: tuple[str, ...] = (
 _ALL_ENGINE_SETTINGS = frozenset(_ENGINE_SETTINGS)
 
 
+def _float_or_none(value: float | None) -> float | None:
+    return None if value is None else float(value)
+
+
 def _logprobs_of(raw: Any) -> ChatLogprobs | None:
     """A choice's `logprobs`, OpenAI's shape (measured through OpenRouter,
     2026-09-28), or None when there is none or it is malformed. A bad
@@ -2030,51 +2034,35 @@ class OpenAiCompatibleHttpEngine:
         if request.maxTokens is not None:
             cap = self._dialect.max_tokens_field
             payload[cap] = request.maxTokens
-        if request.temperature is not None and not target.temperature_fixed:
-            payload["temperature"] = float(request.temperature)
-        # **Carried since 2026-09-19.** `GenerateRequest` had no field
-        # for either until then, so `gateway.yaml`'s promise that both
-        # were passed through to backends that support them was
-        # unfulfillable and nothing was logged. They ride through
-        # untouched, exactly as `temperature` does and for the same
-        # reason: the gateway owns every parameter that changes what
-        # the model says, and a driver never substitutes one.
+        # The sampling settings ride through untouched where the backend takes them: the
+        # gateway owns every parameter that changes what the model says, and a driver never
+        # substitutes one (`top_p` and `seed` since 2026-09-19, the five below them since
+        # 2026-09-23). `is not None` and not truthiness: **`seed=0` is a real seed**,
+        # `top_k: 0` disables the cut and `parallel_tool_calls: false` asks for one call a
+        # turn, and all three are falsy. An empty `stop` is no stop, and is not sent.
         #
-        # `top_p` is dropped by the same flag that drops `temperature`,
-        # and only by that flag. OpenAI's reasoning models reject both
-        # -- the sampler is not the caller's to tune there -- so
-        # sending it would be the 400 that flag exists to avoid. The
-        # seed is NOT dropped with them: those models accept it, and
-        # widening the drop to every sampling parameter because two
-        # travel together would be the over-correction.
-        if request.topP is not None and not target.temperature_fixed:
-            payload["top_p"] = float(request.topP)
-        elif request.topP is not None:
-            self._warn_dropped("top_p", target)
-        # `is not None` and not truthiness: **`seed=0` is a real seed**
-        # and a falsy one, and dropping it would answer a request for a
-        # reproducible result with a different answer every time --
-        # which is the whole of what this field was doing before today.
-        if request.seed is not None:
-            payload["seed"] = int(request.seed)
-        if request.stop:
-            payload["stop"] = list(request.stop)
-        # **Carried since 2026-09-23**, with no field for any of them
-        # before -- so the gateway refused all five with a 400, although
-        # llama.cpp accepted every one of them on the capture that
-        # scoped this change. `is not None` throughout, for the seed=0
-        # reason: `top_k: 0` disables the cut and `parallel_tool_calls:
-        # false` asks for one call a turn, and both are falsy.
+        # **One rule for all of them** (2026-11-06): what reaches here for a backend that
+        # cannot take one (`_unsupported_settings`) was not explicit (an explicit one was
+        # refused above), so it is omitted and said once. That is a fixed-sampler model's
+        # sampler and penalties (OpenAI's reasoning models reject them; not the seed, which
+        # they accept), a local engine's own fields elsewhere, and **whatever an OpenRouter
+        # model's listing leaves out**. The last is why `temperature`, `top_p`, `seed` and
+        # `stop` joined the rule: the gateway's default temperature arrives filled in, and a
+        # request that carries a setting the caller sent asks OpenRouter for
+        # `require_parameters`, so a temperature Claude 5.5's or GPT-6's listing leaves out
+        # left OpenRouter no provider to route to (its 404 "No endpoints found that can
+        # handle the requested parameters", measured by Knight Shift, 2026-11-05). Before,
+        # these four checked only `temperature_fixed`.
         #
-        # What reaches here for a backend that cannot take one was not
-        # explicit (an explicit one was refused above), so it is omitted
-        # and said once -- the `temperature` rule, applied to its
-        # neighbours. **The one exception** is a tool setting an OpenRouter
-        # model's listing leaves out (`_withheld_settings`): it is not refused,
-        # because a gap is named and not refused (Troy, 2026-10-12), so the
-        # explicit one is not delivered (it is left out, and said why once), and
-        # named on the header.
+        # **The one exception** is a tool setting an OpenRouter model's listing leaves out
+        # (`_withheld_settings`): it is not refused, because a gap is named and not refused
+        # (Troy, 2026-10-12), so the explicit one is not delivered (it is left out, and said
+        # why once), and named on the header.
         for field, key, value in (
+            ("temperature", "temperature", _float_or_none(request.temperature)),
+            ("topP", "top_p", _float_or_none(request.topP)),
+            ("seed", "seed", None if request.seed is None else int(request.seed)),
+            ("stop", "stop", list(request.stop) if request.stop else None),
             ("topK", "top_k", request.topK),
             ("minP", "min_p", request.minP),
             ("frequencyPenalty", "frequency_penalty", request.frequencyPenalty),
