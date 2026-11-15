@@ -608,8 +608,14 @@ class ConfigStore:
         self._started: dict[str, Any] = dict(self._values)
         self._master_key = master_key
 
-    def load(self) -> None:
-        """Load from the configured file, creating it with defaults if absent."""
+    def load(self, *, use_secrets: bool = True) -> None:
+        """Load from the configured file, creating it with defaults if absent.
+
+        `use_secrets=False` is for a read that only wants bootstrap settings
+        (log level, port): it skips every sealed field without a warning. A
+        load meant to use the secrets keeps the default and warns when a
+        sealed field has no key to open it.
+        """
         with self._lock:
             if self._path.exists():
                 raw = yaml.safe_load(self._path.read_text(encoding="utf-8")) or {}
@@ -620,7 +626,7 @@ class ConfigStore:
                     field = _FIELDS_BY_KEY.get(k)
                     if field is None:
                         continue
-                    value = self._decrypt_loaded(k, v)
+                    value = self._decrypt_loaded(k, v, warn=use_secrets)
                     # A null in the file is the default, as a PATCH of null
                     # is; an empty secret is no secret.
                     if _is_unset(field, value):
@@ -632,16 +638,20 @@ class ConfigStore:
                 self._write_locked()
             self._started = dict(self._values)
 
-    def _decrypt_loaded(self, key: str, value: Any) -> Any:
+    def _decrypt_loaded(self, key: str, value: Any, *, warn: bool = True) -> Any:
         """Resolve an on-disk value to its in-memory (plaintext) form.
 
         Plaintext-on-disk (v0.1 configs, non-sensitive fields): pass
         through unchanged. Envelope-shape values: decrypt if we have a
         key; otherwise log a warning and drop to None so the engine
         sees an unconfigured field rather than a raw envelope dict.
+        With `warn=False` a sealed field is skipped quietly (a bootstrap read
+        that never uses the secret).
         """
         if not security.is_envelope(value):
             return value
+        if not warn and self._master_key is None:
+            return None
         if self._master_key is None:
             log.warning(
                 "config field %r is encrypted on disk but no master key is "

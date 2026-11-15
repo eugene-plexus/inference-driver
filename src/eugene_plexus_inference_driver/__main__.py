@@ -41,7 +41,10 @@ def main() -> None:
     # owned by the agent now (or the default for standalone launch).
     bootstrap_store = ConfigStore(settings.config_file)
     if not settings.safe_mode:
-        bootstrap_store.load()
+        # Sealed fields stay sealed here: this read has no master key and
+        # never uses a secret, so it must not warn about one (the real load
+        # in app.py has the key and warns if it lacks it).
+        bootstrap_store.load(use_secrets=False)
 
     port = _resolve_port(bootstrap_store)
 

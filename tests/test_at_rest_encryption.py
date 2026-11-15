@@ -222,3 +222,68 @@ def test_plaintext_v01_config_loads_and_upgrades(tmp_path: Path) -> None:
     # And it still decrypts to the original.
     envelope = security.Envelope.from_dict(raw["apiKey"])
     assert security.open_envelope(envelope, key) == "sk-legacy"
+
+
+# --------------------------------------------------------------------------- #
+# The bootstrap read (inference-driver#12): no false "no master key" warning
+# --------------------------------------------------------------------------- #
+
+_NO_KEY_WARNING = "no master key"
+
+
+def _sealed_config(path: Path) -> None:
+    writer = ConfigStore(path, master_key=secrets.token_bytes(32))
+    writer.load()
+    writer.apply_patch(_patch({"provider": "openai", "apiKey": "sk-secret"}))
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert security.is_envelope(raw["apiKey"])
+
+
+def test_bootstrap_load_skips_a_sealed_field_without_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "config.yaml"
+    _sealed_config(path)
+
+    store = ConfigStore(path)
+    with caplog.at_level("WARNING"):
+        store.load(use_secrets=False)
+
+    assert _NO_KEY_WARNING not in caplog.text
+    assert store.get("apiKey") is None
+    assert store.get("provider") == "openai"  # the rest still loads
+
+
+def test_load_for_use_without_a_key_still_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "config.yaml"
+    _sealed_config(path)
+
+    store = ConfigStore(path)
+    with caplog.at_level("WARNING"):
+        store.load()
+
+    assert _NO_KEY_WARNING in caplog.text
+    assert "'apiKey'" in caplog.text
+
+
+def test_main_start_logs_no_key_warning_for_a_sealed_apikey(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`main()` reads the config once without a key to find the log level
+    and port. That read must stay quiet; the real load (app.py) has the key."""
+    from eugene_plexus_inference_driver import __main__ as entry
+    from eugene_plexus_inference_driver.settings import Settings
+
+    path = tmp_path / "config.yaml"
+    _sealed_config(path)
+    monkeypatch.setattr(entry, "load_settings", lambda: Settings(config_file=path))
+    monkeypatch.setattr(entry, "create_app", lambda settings: object())
+    monkeypatch.setattr(entry.uvicorn, "run", lambda *a, **k: None)
+    monkeypatch.delenv("EUGENE_PLEXUS_DRIVER_BIND_PORT", raising=False)
+
+    with caplog.at_level("WARNING"):
+        entry.main()
+
+    assert _NO_KEY_WARNING not in caplog.text
