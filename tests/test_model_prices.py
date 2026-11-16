@@ -2,13 +2,8 @@
 
 import datetime as dt
 
-from eugene_plexus_inference_driver._generated.models import DriverModel
 from eugene_plexus_inference_driver.engines._catalogue import from_openrouter
-from eugene_plexus_inference_driver.model_prices import (
-    openrouter_price,
-    priced,
-    table_price,
-)
+from eugene_plexus_inference_driver.model_prices import openrouter_price
 
 
 def test_an_openrouter_listing_is_priced_exactly():
@@ -47,15 +42,16 @@ def test_a_variable_or_missing_price_is_none_never_free():
     assert model.price is None
 
 
-def test_the_table_prices_an_openai_account_and_leaves_others_alone():
-    price = table_price("openai", "gpt-4o-mini")
-    assert price is not None
-    assert (price.inputPerMillionMicros, price.outputPerMillionMicros) == (150_000, 600_000)
-    assert price.source.value == "table" and price.asOf is not None
-    assert table_price("openai", "not-a-listed-model") is None
-    assert table_price("ollama_local", "gpt-4o-mini") is None
-    models = [DriverModel(id="gpt-4o-mini", surfaces=["chat"]), DriverModel(id="x", surfaces=[])]
-    first, second = priced(models, "openai")
-    assert first.price is not None and second.price is None
-    # A local engine's models never take a table price.
-    assert priced(models, "ollama_local")[0].price is None
+def test_no_built_in_table_prices_a_provider_that_reports_none():
+    """Prices come only from a provider's own listing: an OpenAI account's models,
+    whose listing carries no price, have none (unpriced, never a remembered price)."""
+    from eugene_plexus_inference_driver import model_prices
+    from eugene_plexus_inference_driver.engines._catalogue import EngineDefaults, from_openai_list
+
+    assert not hasattr(model_prices, "table_price")
+    listed = from_openai_list(
+        {"data": [{"id": "gpt-4o-mini", "object": "model"}]},
+        EngineDefaults(supported_settings=[], streaming=True, tool_calling=True),
+        classify=None,
+    )
+    assert [m.price for m in listed] == [None]

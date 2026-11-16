@@ -20,7 +20,6 @@ from .._generated.models import (
 )
 from ..config import ConfigStore
 from ..locality import engine_locality
-from ..model_prices import priced
 
 router = APIRouter(tags=["meta"])
 
@@ -66,9 +65,6 @@ async def info(request: Request, models: bool = True, model: str | None = None) 
         if served is not None and model is not None:
             # One candidate's entry, for the gateway's per-request re-check.
             served = [m for m in served if m.id == model]
-        if served is not None:
-            # Row 40: an OpenAI, Anthropic or Gemini account's prices from the table.
-            served = priced(served, provider_key)
         return DriverInfo(
             locality=engine_locality(engine),
             localOnlyEnforced=True,
