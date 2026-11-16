@@ -48,6 +48,7 @@ import httpx
 from .._generated.models import Capabilities, DriverCatalogue, DriverModel
 from .._private_files import write_private_text
 from ..images_out import openai_caps, openrouter_caps
+from ..model_prices import openrouter_price
 from ..speech import ALL_FORMATS, OPENROUTER_FORMATS, openai_voices
 from ..videos_out import openrouter_caps as openrouter_video_caps
 
@@ -231,6 +232,8 @@ def from_openrouter(body: Any) -> list[DriverModel]:
         models.append(
             DriverModel(
                 id=entry["id"],
+                # Row 40: the provider's price, as OpenRouter lists it today.
+                price=openrouter_price(entry, _dt.datetime.now(_dt.UTC).date().isoformat()),
                 name=entry.get("name") if isinstance(entry.get("name"), str) else None,
                 surfaces=surfaces,
                 inputModalities=inputs or None,

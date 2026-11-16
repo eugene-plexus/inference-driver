@@ -18,6 +18,9 @@
     "src/eugene_plexus_inference_driver/body_limit.py": {
       "sha256": "99f1503ae159cc1e138ea51cd54c55b5231a179758fe1a86099b2c798edc408c"
     },
+    "src/eugene_plexus_inference_driver/model_prices.json": {
+      "sha256": "d5bbb7d0edeed99e29e1d42662ec3b55489731ed8127b6682f6e32166cfeccb0"
+    },
     "src/eugene_plexus_inference_driver/security.py": {
       "sha256": "deda4bf520746046a6aab06a82e1b7e83b902cff748daf45c4d1df13299dd825"
     },
